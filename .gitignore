@@ -1,0 +1,49 @@
+# Environment
+.env
+.env.*
+*.env
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+
+# Cache
+ohlcv_cache/
+history_cache.db
+live_trading.db
+trading_system.db
+
+# Logs
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*secret*
+*password*
+*.pem
+*.key
+
+# Results (keep structure, ignore large outputs)
+/backtest_results/
+/reports/

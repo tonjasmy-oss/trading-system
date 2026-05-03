@@ -1,0 +1,61 @@
+{
+  "optimized_params": [
+    {
+      "symbol": "ETH/USDT",
+      "strategy": "RSIStrategy",
+      "rsi_period": 14,
+      "oversold": 28,
+      "overbought": 65,
+      "stop_loss": 0.02,
+      "take_profit": 0.04,
+      "total_return_pct": 24.93,
+      "sharpe_ratio": 2.03,
+      "max_drawdown_pct": 3.62,
+      "win_rate_pct": 66.67,
+      "updated_at": "2026-05-03T01:04:54.374429+00:00"
+    },
+    {
+      "symbol": "BTC/USDT",
+      "strategy": "RSIStrategy",
+      "rsi_period": 10,
+      "oversold": 18,
+      "overbought": 65,
+      "stop_loss": 0.04,
+      "take_profit": 0.08,
+      "total_return_pct": 20.11,
+      "sharpe_ratio": 1.76,
+      "max_drawdown_pct": 4.98,
+      "win_rate_pct": 83.33,
+      "updated_at": "2026-05-03T01:06:17.508150+00:00"
+    },
+    {
+      "symbol": "SOL/USDT",
+      "strategy": "RSIStrategy",
+      "rsi_period": 10,
+      "oversold": 20,
+      "overbought": 65,
+      "stop_loss": 0.015,
+      "take_profit": 0.04,
+      "total_return_pct": 15.53,
+      "sharpe_ratio": 0.0,
+      "max_drawdown_pct": 3.86,
+      "win_rate_pct": 55.56,
+      "updated_at": "2026-05-03T01:10:40.745560+00:00"
+    },
+    {
+      "symbol": "SUI/USDT",
+      "strategy": "RSIStrategy",
+      "rsi_period": 6,
+      "oversold": 22,
+      "overbought": 70,
+      "stop_loss": 0.04,
+      "take_profit": 0.08,
+      "total_return_pct": 33.49,
+      "sharpe_ratio": 0.0,
+      "max_drawdown_pct": 25.63,
+      "win_rate_pct": 50.0,
+      "updated_at": "2026-05-03T05:06:32.319201+00:00"
+    }
+  ],
+  "updated_at": "2026-05-03T05:06:32.319228+00:00"
+}
