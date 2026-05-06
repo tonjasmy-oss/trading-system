@@ -224,6 +224,130 @@ async def health():
 
 
 # ================================================================
+# P3 股票 K线 API（支持 A股/港股/美股）
+# ================================================================
+
+@app.get("/api/stock/chart")
+async def get_stock_chart_data(
+    codes: str = "600000.SH",
+    start_date: str = "2024-01-01",
+    end_date: str = "2025-01-01",
+    strategy: str = "ma_cross",
+    fast: int = 20,
+    slow: int = 60,
+):
+    """
+    获取股票 K线 + 回测信号图表数据
+    codes: 逗号分隔代码，如 600000.SH,000001.SZ
+    返回: OHLCV K线, Equity Curve, 买卖点, 指标
+    """
+    try:
+        import pandas as pd
+        from vibe_integration.stock_backtest import fetch_stock_data, SimpleMASignal, RSISignal
+        code_list = [c.strip() for c in codes.split(",")]
+
+        # 加载数据
+        data_map = fetch_stock_data(code_list, start_date, end_date)
+        if not data_map:
+            raise HTTPException(status_code=404, detail="数据获取失败")
+
+        # 生成信号
+        if strategy == "rsi":
+            sig_gen = RSISignal(period=14, oversold=30.0, overbought=70.0)
+        else:
+            sig_gen = SimpleMASignal(fast=fast, slow=slow)
+        signal_map = sig_gen.generate(data_map)
+
+        # 只返回第一个标的的 K线（前端单标的图表）
+        first_code = code_list[0]
+        if first_code not in data_map:
+            first_code = list(data_map.keys())[0]
+        df = data_map[first_code]
+
+        # OHLCV
+        ohlc = [
+            {
+                "t": int(pd.Timestamp(ts).timestamp()),
+                "o": round(float(r["open"]), 2),
+                "h": round(float(r["high"]), 2),
+                "l": round(float(r["low"]), 2),
+                "c": round(float(r["close"]), 2),
+            }
+            for ts, r in df.iterrows()
+        ]
+
+        # Equity curve（简化模拟）
+        equity_curve = []
+        equity = 1000000.0
+        in_pos = False
+        entry_price = 0.0
+        sigs = signal_map.get(first_code, pd.Series(0, index=df.index))
+        for (ts, row), sig_val in zip(df.iterrows(), sigs):
+            ts_sec = int(pd.Timestamp(ts).timestamp())
+            if in_pos:
+                pnl = (row["close"] - entry_price) / entry_price
+                if pnl <= -0.05:
+                    equity *= (1 + pnl * 0.5)
+                    in_pos = False
+                elif pnl >= 0.10:
+                    equity *= (1 + pnl * 0.9)
+                    in_pos = False
+            if sig_val == 1 and not in_pos:
+                in_pos = True
+                entry_price = row["close"]
+            equity_curve.append({"t": ts_sec, "v": round(equity, 2)})
+
+        # 买卖点
+        buy_markers = []
+        sell_markers = []
+        entry_p = 0.0
+        for (ts, row), sig_val in zip(df.iterrows(), sigs):
+            ts_sec = int(pd.Timestamp(ts).timestamp())
+            if sig_val == 1:
+                buy_markers.append({"t": ts_sec, "price": round(float(row["close"]), 2)})
+                entry_p = float(row["close"])
+            elif sig_val == -1:
+                sell_markers.append({"t": ts_sec, "price": round(float(row["close"]), 2)})
+
+        # 均线指标
+        indicators_out = {}
+        if strategy == "ma_cross" or strategy == "ma":
+            ma_fast_vals = df["close"].rolling(fast).mean()
+            ma_slow_vals = df["close"].rolling(slow).mean()
+            indicators_out["ma_fast"] = [
+                {"t": int(pd.Timestamp(ts).timestamp()), "v": round(float(v), 2)}
+                for ts, v in zip(df.index, ma_fast_vals) if not pd.isna(v)
+            ]
+            indicators_out["ma_slow"] = [
+                {"t": int(pd.Timestamp(ts).timestamp()), "v": round(float(v), 2)}
+                for ts, v in zip(df.index, ma_slow_vals) if not pd.isna(v)
+            ]
+        elif strategy == "rsi":
+            delta = df["close"].diff()
+            gain = delta.clip(lower=0).rolling(14).mean()
+            loss = (-delta.clip(upper=0)).rolling(14).mean()
+            rs = gain / loss.replace(0, 1e-10)
+            rsi = 100 - (100 / (1 + rs))
+            indicators_out["rsi"] = [
+                {"t": int(pd.Timestamp(ts).timestamp()), "v": round(float(v), 2)}
+                for ts, v in zip(df.index, rsi) if not pd.isna(v)
+            ]
+
+        return {
+            "code": first_code,
+            "ohlc": ohlc,
+            "equity_curve": equity_curve,
+            "buy_markers": buy_markers,
+            "sell_markers": sell_markers,
+            "indicators": indicators_out,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取股票图表失败: {str(e)}")
+
+
+# ================================================================
 # P2 回测图表 API（Equity Curve + 买卖点标注）
 # ================================================================
 

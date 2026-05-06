@@ -59,7 +59,7 @@ SYMBOL_MAP = {
 }
 
 # ccxt 支持的交易所 ID（均为公开接口，无需 API Key 即可获取行情）
-SUPPORTED_EXCHANGES = ["binance", "gateio", "kraken", "bitfinex", "okx", "bybit", "bitget", "hyperliquid"]
+SUPPORTED_EXCHANGES = ["binance", "gateio", "kraken", "bitfinex", "okx", "bybit", "bitget", "hyperliquid", "weex"]
 
 # 各交易所所需认证字段（ccxt.exchange.requiredCredentials）
 _EXCHANGE_REAUTH = {

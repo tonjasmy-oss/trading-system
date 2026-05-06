@@ -563,5 +563,79 @@ def main():
     return result
 
 
+# ============================================================
+# 股票回测入口（支持 A股 / 港股 / 美股）
+# ============================================================
+
+def main_stock():
+    """股票回测 CLI 入口，调用 vibe_integration"""
+    try:
+        from vibe_integration import run_stock_backtest, generate_stock_report
+    except ImportError:
+        print("错误: 请先安装 vibe_integration 模块")
+        print("  cd /root/.openclaw/workspace/trading-system")
+        print("  pip install akshare yfinance pandas numpy")
+        sys.exit(1)
+
+    import argparse
+    p = argparse.ArgumentParser(description="股票回测 (A股/港股/美股)")
+    p.add_argument("--codes", type=str, required=True,
+                   help="逗号分隔代码: 600000.SH,000001.SZ 或 00700.HK 或 AAPL,TSLA")
+    p.add_argument("--start", type=str, default="2024-01-01")
+    p.add_argument("--end",   type=str, default="2025-01-01")
+    p.add_argument("--strategy", type=str, default="ma_cross",
+                   choices=["ma_cross", "rsi"])
+    p.add_argument("--fast",  type=int, default=20)
+    p.add_argument("--slow",  type=int, default=60)
+    p.add_argument("--rsi-period",    type=int, default=14)
+    p.add_argument("--rsi-oversold",   type=float, default=30.0)
+    p.add_argument("--rsi-overbought", type=float, default=70.0)
+    p.add_argument("--capital", type=float, default=1000000.0)
+    p.add_argument("--engine", type=str, default="auto",
+                   choices=["auto", "china_a", "global_equity"])
+    p.add_argument("--output", default="backtest_results")
+    args = p.parse_args()
+
+    codes = [c.strip() for c in args.codes.split(",")]
+    params = {"fast": args.fast, "slow": args.slow} if args.strategy == "ma_cross" else \
+             {"period": args.rsi_period, "oversold": args.rsi_oversold, "overbought": args.rsi_overbought}
+
+    result = run_stock_backtest(
+        codes=codes, start_date=args.start, end_date=args.end,
+        strategy=args.strategy, signal_params=params,
+        initial_cash=args.capital, engine=args.engine,
+    )
+
+    if "error" in result:
+        print(f"错误: {result['error']}")
+        sys.exit(1)
+
+    print("\n" + "=" * 60)
+    print(f"  股票回测  {', '.join(codes)}")
+    print("=" * 60)
+    print(f"  策略       : {result.get('strategy')}")
+    print(f"  数据区间   : {result.get('start_date')} ~ {result.get('end_date')}")
+    print(f"  总收益率   : {result.get('total_return_pct', 0):+.2f}%")
+    print(f"  夏普比率   : {result.get('sharpe_ratio', 0):.2f}")
+    print(f"  最大回撤   : {result.get('max_drawdown_pct', 0):.2f}%")
+    print(f"  交易次数   : {result.get('total_trades', 0)}")
+    print(f"  胜率       : {result.get('win_rate_pct', 0):.2f}%")
+    print(f"  总手续费   : ¥{result.get('total_commission', 0):.2f}")
+    print("=" * 60)
+
+    report_path = generate_stock_report(result, output_dir=args.output)
+    print(f"\n📄 完整报告: {report_path}")
+
+
 if __name__ == "__main__":
-    main()
+    # 根据参数判断是加密货币还是股票回测
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        main()
+    elif len(sys.argv) > 1 and ("SH" in sys.argv[1] or "SZ" in sys.argv[1] or
+                               "HK" in sys.argv[1] or sys.argv[1] in ("--codes",)):
+        # 股票模式
+        sys.argv[0] = sys.argv[0].replace("backtest.py", "stock_backtest.py")
+        main_stock()
+    else:
+        main()
