@@ -170,9 +170,14 @@ _last_mode_change = {"time": 0, "cooldown_seconds": 10}
 @app.post("/api/trading/mode")
 async def set_trading_mode(req: ModeRequest):
     """切换实盘/模拟模式 - 必须提供有效token，且有10秒冷却"""
-    # 1. Token 验证
+    # 1. Token 验证 — 必须设置了 AGENT_TOKEN 才能切换实盘
     expected_token = os.getenv("AGENT_TOKEN")
-    if not expected_token or req.token != expected_token:
+    if not expected_token:
+        raise HTTPException(
+            status_code=503,
+            detail="系统未配置 AGENT_TOKEN，无法切换实盘模式（安全保护）"
+        )
+    if req.token != expected_token:
         raise HTTPException(status_code=403, detail="无效Token，拒绝切换")
 
     # 2. 冷却保护：防止重复快速切换
