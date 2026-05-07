@@ -2,13 +2,14 @@
 Web Dashboard 模块 - 交易监控系统
 所有功能集成到 Web 界面
 """
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
 import asyncio
 import os
+import time
 
 from portfolio import Portfolio
 from monitor import quick_price_check
@@ -24,7 +25,7 @@ try:
     from agent_gateway.fastapi_routes import agent_router
     app.include_router(agent_router)
     print("[Dashboard] Agent Gateway /api/agent/v1 mounted")
-except ImportError as e:
+except Exception as e:
     print(f"[Dashboard] Agent Gateway not available: {e}")
 
 portfolio = Portfolio()
@@ -55,6 +56,7 @@ class MonitorAction(BaseModel):
 
 class ModeRequest(BaseModel):
     mode: str  # 'live' or 'sim'
+    token: str  # 必须提供 AGENT_TOKEN 才能切换
 
 # ========== API 接口 ==========
 
@@ -162,18 +164,35 @@ async def trade_api(req: TradeRequest):
     
     return {"success": success, "message": message}
 
+# 实盘切换保护状态（内存中，不能完全防重启擦除，但能防误操作）
+_last_mode_change = {"time": 0, "cooldown_seconds": 10}
+
 @app.post("/api/trading/mode")
 async def set_trading_mode(req: ModeRequest):
-    """切换实盘/模拟模式"""
+    """切换实盘/模拟模式 - 必须提供有效token，且有10秒冷却"""
+    # 1. Token 验证
+    expected_token = os.getenv("AGENT_TOKEN")
+    if not expected_token or req.token != expected_token:
+        raise HTTPException(status_code=403, detail="无效Token，拒绝切换")
+
+    # 2. 冷却保护：防止重复快速切换
+    now = time.time()
+    if now - _last_mode_change["time"] < _last_mode_change["cooldown_seconds"]:
+        elapsed = round(now - _last_mode_change["time"], 1)
+        raise HTTPException(
+            status_code=429,
+            detail=f"切换过于频繁，请 {round(_last_mode_change['cooldown_seconds'] - elapsed)} 秒后再试"
+        )
+
     if req.mode not in ("live", "sim"):
         raise HTTPException(status_code=400, detail="模式必须是 'live' 或 'sim'")
-    
-    # 更新config中的LIVE_TRADING_ENABLED
+
     import config
     config.LIVE_TRADING_ENABLED = (req.mode == "live")
-    
+    _last_mode_change["time"] = now
+
     return {
-        "success": True, 
+        "success": True,
         "mode": req.mode,
         "message": f"已切换到{'实盘' if req.mode == 'live' else '模拟'}模式"
     }
@@ -268,14 +287,31 @@ async def get_stock_chart_data(
     获取股票 K线 + 回测信号图表数据
     codes: 逗号分隔代码，如 600000.SH,000001.SZ
     返回: OHLCV K线, Equity Curve, 买卖点, 指标
+    注意: 耗时的数据获取在线程池中执行，超时30秒
     """
+    async def _heavy_fetch(
+        code_list: list, start_date: str, end_date: str
+    ):
+        """在线程池中运行阻塞型数据获取"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,  # 默认 ThreadPoolExecutor
+            lambda: fetch_stock_data(code_list, start_date, end_date)
+        )
+
     try:
         import pandas as pd
         from vibe_integration.stock_backtest import fetch_stock_data, SimpleMASignal, RSISignal
-        code_list = [c.strip() for c in codes.split(",")]
 
-        # 加载数据
-        data_map = fetch_stock_data(code_list, start_date, end_date)
+        # 最多等待30秒，超时则返回504
+        code_list = [c.strip() for c in codes.split(",")]
+        try:
+            data_map = await asyncio.wait_for(
+                _heavy_fetch(code_list, start_date, end_date),
+                timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="数据获取超时（>30秒），请减少标的数量或稍后重试")
         if not data_map:
             raise HTTPException(status_code=404, detail="数据获取失败")
 

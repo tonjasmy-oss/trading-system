@@ -27,6 +27,7 @@ trading_system.db
 # Logs
 *.log
 logs/
+nohup.out
 
 # IDE
 .vscode/
