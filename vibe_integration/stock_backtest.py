@@ -142,51 +142,153 @@ def _fetch_akshare_us(codes: List[str], start_date: str, end_date: str) -> Dict[
     return result
 
 
-def fetch_stock_data(codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
-    """统一数据获取入口，自动路由到正确数据源
+def _get_cache_path() -> Path:
+    cache_dir = Path(__file__).parent.parent / "ohlcv_cache"
+    cache_dir.mkdir(exist_ok=True)
+    return cache_dir / "ohlcv_cache.db"
 
-    优先使用 stock_data/stock_api.py 的现有接口（统一数据层），
-    若该接口失败则回退到 akshare/yfinance 直接调用。
-    """
+
+def _read_from_cache(
+    codes: List[str], start_date: str, end_date: str
+) -> Dict[str, pd.DataFrame]:
+    """从 SQLite 缓存读取 K线数据，TTL=1天"""
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    sd = datetime.strptime(start_date[:10], "%Y-%m-%d")
+    ed = datetime.strptime(end_date[:10], "%Y-%m-%d")
+    ttl_cutoff = int((datetime.now() - timedelta(days=1)).timestamp())
+
+    cache_path = _get_cache_path()
+    if not cache_path.exists():
+        return {}
+
+    result = {}
+    try:
+        conn = sqlite3.connect(str(cache_path))
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        for code in codes:
+            cur.execute(
+                """
+                SELECT timestamp, open, high, low, close, volume
+                FROM ohlcv_cache
+                WHERE symbol=? AND timeframe='1d' AND timestamp>=? AND timestamp<=?
+                AND created_at > ?
+                ORDER BY timestamp ASC
+                """,
+                (code, int(sd.timestamp()), int(ed.timestamp()), ttl_cutoff),
+            )
+            rows = cur.fetchall()
+            if rows:
+                df = pd.DataFrame(rows)
+                df["date"] = pd.to_datetime(df["timestamp"], unit="s")
+                df = df.set_index("date").sort_index()
+                result[code] = df[["open", "high", "low", "close", "volume"]]
+        conn.close()
+    except Exception as e:
+        logging.debug("Cache read failed: %s", e)
+    return result
+
+
+def _write_to_cache(code: str, df: pd.DataFrame):
+    """写入 K线数据到缓存"""
+    import sqlite3
+
+    if df is None or df.empty:
+        return
+    cache_path = _get_cache_path()
+    try:
+        conn = sqlite3.connect(str(cache_path))
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ohlcv_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT, timeframe TEXT DEFAULT '1d',
+                timestamp INTEGER, open REAL, high REAL,
+                low REAL, close REAL, volume REAL,
+                created_at INTEGER DEFAULT (strftime('%s','now'))
+            )
+            """
+        )
+        for ts, row in df.iterrows():
+            ts_sec = int(pd.Timestamp(ts).timestamp())
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO ohlcv_cache
+                (symbol, timeframe, timestamp, open, high, low, close, volume, created_at)
+                VALUES (?, '1d', ?, ?, ?, ?, ?, ?, strftime('%s','now'))
+                """,
+                (code, ts_sec, row["open"], row["high"], row["low"], row["close"], row["volume"]),
+            )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logging.debug("Cache write failed for %s: %s", code, e)
+
+
+def fetch_stock_data(codes: List[str], start_date: str, end_date: str) -> Dict[str, pd.DataFrame]:
+    """统一数据获取入口，自动路由到正确数据源，带1天TTL缓存"""
+    merged = {}
+
+    # 1. 优先从缓存读取
+    cached = _read_from_cache(codes, start_date, end_date)
+    fetched_codes = set(cached.keys())
+    merged.update(cached)
+
+    # 2. 补充未命中缓存的标的（从网络获取并写入缓存）
+    remaining = [c for c in codes if c not in fetched_codes]
+    if not remaining:
+        return merged
+
     by_market: Dict[str, List[str]] = {}
-    for c in codes:
+    for c in remaining:
         m = _detect_market(c)
         by_market.setdefault(m, []).append(c)
 
-    merged = {}
-
-    # 优先用 stock_data/stock_api.py 的统一接口
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    # 转换日期格式: YYYY-MM-DD -> YYYYMMDD (stock_api 期望的格式)
+    # 转换日期格式: YYYY-MM-DD -> YYYYMMDD
     sd_fmt = start_date.replace("-", "").replace("/", "")
     ed_fmt = end_date.replace("-", "").replace("/", "")
+
+    # 2a. 优先用 stock_data/stock_api.py 的统一接口
+    sys.path.insert(0, str(Path(__file__).parent.parent))
     try:
         from stock_data.stock_api import get_stock_ohlcv
-        for code in codes:
+        for code in remaining:
             try:
                 df = get_stock_ohlcv(code, start_date=sd_fmt, end_date=ed_fmt)
                 if df is not None and not df.empty:
                     merged[code] = df
+                    _write_to_cache(code, df)
             except Exception as e:
                 logging.debug("stock_api get_stock_ohlcv failed for %s: %s", code, e)
     except ImportError:
-        pass  # 回退到 akshare/yfinance
+        pass
 
-    # 补充未覆盖的市场（回退方案）
+    # 2b. 回退方案：akshare/yfinance 直接调用
     fetched_codes = set(merged.keys())
-    remaining = [c for c in codes if c not in fetched_codes]
-
-    if remaining:
+    still_missing = [c for c in remaining if c not in fetched_codes]
+    if still_missing:
         for_market: Dict[str, List[str]] = {}
-        for c in remaining:
+        for c in still_missing:
             m = _detect_market(c)
             for_market.setdefault(m, []).append(c)
         if "a_share" in for_market:
-            merged.update(_fetch_akshare_a_share(for_market["a_share"], start_date, end_date))
+            result = _fetch_akshare_a_share(for_market["a_share"], start_date, end_date)
+            for code, df in result.items():
+                merged[code] = df
+                _write_to_cache(code, df)
         if "hk_equity" in for_market:
-            merged.update(_fetch_akshare_hk(for_market["hk_equity"], start_date, end_date))
+            result = _fetch_akshare_hk(for_market["hk_equity"], start_date, end_date)
+            for code, df in result.items():
+                merged[code] = df
+                _write_to_cache(code, df)
         if "us_equity" in for_market:
-            merged.update(_fetch_yfinance_us(for_market["us_equity"], start_date, end_date))
+            result = _fetch_yfinance_us(for_market["us_equity"], start_date, end_date)
+            for code, df in result.items():
+                merged[code] = df
+                _write_to_cache(code, df)
 
     return merged
 
