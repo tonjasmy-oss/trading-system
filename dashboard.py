@@ -18,6 +18,15 @@ from database import init_db, get_positions, get_trades, get_alerts
 from config import PRICE_CHECK_INTERVAL
 
 app = FastAPI(title="交易监控系统", version="2.0.0")
+
+# Agent Gateway路由
+try:
+    from agent_gateway.fastapi_routes import agent_router
+    app.include_router(agent_router)
+    print("[Dashboard] Agent Gateway /api/agent/v1 mounted")
+except ImportError as e:
+    print(f"[Dashboard] Agent Gateway not available: {e}")
+
 portfolio = Portfolio()
 
 # 全局监控状态
@@ -43,6 +52,9 @@ class AlertRequest(BaseModel):
 
 class MonitorAction(BaseModel):
     action: str  # start, stop
+
+class ModeRequest(BaseModel):
+    mode: str  # 'live' or 'sim'
 
 # ========== API 接口 ==========
 
@@ -149,6 +161,22 @@ async def trade_api(req: TradeRequest):
         message = f"卖出 {req.symbol} {req.quantity} @ {req.price}"
     
     return {"success": success, "message": message}
+
+@app.post("/api/trading/mode")
+async def set_trading_mode(req: ModeRequest):
+    """切换实盘/模拟模式"""
+    if req.mode not in ("live", "sim"):
+        raise HTTPException(status_code=400, detail="模式必须是 'live' 或 'sim'")
+    
+    # 更新config中的LIVE_TRADING_ENABLED
+    import config
+    config.LIVE_TRADING_ENABLED = (req.mode == "live")
+    
+    return {
+        "success": True, 
+        "mode": req.mode,
+        "message": f"已切换到{'实盘' if req.mode == 'live' else '模拟'}模式"
+    }
 
 @app.get("/api/price/{market}/{symbol}")
 async def get_price_api(symbol: str, market: str):
@@ -469,12 +497,15 @@ async def get_backtest_chart_data(strategy_name: str):
                 })
                 in_pos = False
 
-    # 指标线
+    # 指标线（修复：indicator数组可能比candles_show长，用min防止越界）
     indicators_out = {}
+    n_candles_show = len(candles_show)
     for k, v in indicators.items():
+        if len(v) <= start:
+            continue
         valid = [x for x in v[start:] if x != 0]
         if valid:
-            indicators_out[k] = [{"t": timestamps[i] // 1000, "v": round(val, 4)}
+            indicators_out[k] = [{"t": candles_show[min(i, n_candles_show - 1)]["timestamp"] // 1000, "v": round(val, 4)}
                                   for i, val in enumerate(v[start:]) if val != 0]
 
     # 策略投票权重
@@ -541,28 +572,108 @@ DASHBOARD_HTML = """
         .tab-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
         .tab { padding: 10px 20px; background: #16213e; border: none; border-radius: 8px; color: #888; cursor: pointer; }
         .tab.active { background: #00d4ff; color: #000; font-weight: bold; }
+        .market-tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
+        .market-tab { padding: 12px 24px; background: #0f3460; border: 2px solid #1a2a3a; border-radius: 10px; color: #888; cursor: pointer; font-size: 16px; font-weight: bold; transition: all 0.3s; display: flex; align-items: center; gap: 8px; }
+        .market-tab:hover { border-color: #00d4ff; color: #fff; }
+        .market-tab.active { border-color: #00d4ff; color: #00d4ff; background: #0f3460; }
+        .market-tab.cn.active { border-color: #ff4444; color: #ff4444; }
+        .market-tab.hk.active { border-color: #00b140; color: #00b140; }
+        .market-tab.us.active { border-color: #0066cc; color: #0066cc; }
+        .market-tab.crypto.active { border-color: #f7931a; color: #f7931a; }
+        .mode-toggle { display: flex; gap: 10px; margin-left: auto; align-items: center; }
+        .mode-btn { padding: 8px 16px; border: 2px solid #333; border-radius: 8px; background: #16213e; color: #888; cursor: pointer; font-weight: bold; transition: all 0.3s; }
+        .mode-btn:hover { border-color: #00d4ff; }
+        .mode-btn.active { border-color: #00d4ff; background: #00d4ff; color: #000; }
+        .mode-btn.live.active { border-color: #00c853; background: #00c853; }
+        .index-card { display: flex; align-items: center; gap: 15px; padding: 15px; background: #0f3460; border-radius: 10px; margin-bottom: 10px; }
+        .index-icon { font-size: 28px; }
+        .index-info { flex: 1; }
+        .index-name { color: #888; font-size: 12px; }
+        .index-value { font-size: 20px; font-weight: bold; color: #fff; }
+        .index-change { font-size: 14px; }
+        .price-up { color: #00e676; }
+        .price-down { color: #ff1744; }
         .tab-content { display: none; }
         .tab-content.active { display: block; }
         .refresh-info { text-align: right; color: #666; font-size: 12px; margin-top: 10px; }
         .actions { display: flex; gap: 10px; margin: 15px 0; flex-wrap: wrap; }
+        /* 系统状态卡片 */
+        .sys-stat-card { background: #0f3460; border-radius: 10px; padding: 14px 16px; border-left: 3px solid #00d4ff; transition: all 0.3s; }
+        .sys-stat-card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.3); }
+        .sys-stat-card.running { border-left-color: #00c853; }
+        .sys-stat-card.warning { border-left-color: #ff9800; }
+        .sys-stat-card.danger { border-left-color: #ff1744; }
+        .sys-stat-label { font-size: 11px; color: #888; margin-bottom: 6px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
+        .sys-stat-value { font-size: 14px; font-weight: bold; }
+        .sys-stat-card .status-badge { font-size: 11px; padding: 4px 10px; }
+        /* 运行时间等统计 */
+        #uptime-display { font-family: 'Courier New', monospace; }
     </style>
     <script src="https://unpkg.com/lightweight-charts@4.1.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
     <div class="container">
-        <h1>📊 交易监控系统 v2.0 <span id="live-badge" style="font-size:14px;color:#ff9800;display:none;">● 实盘模式</span></h1>
+        <h1>📊 交易监控系统 v2.0</h1>
+        
+        <!-- 市场切换 Tab -->
+        <div class="market-tabs">
+            <button class="market-tab cn active" onclick="switchMarket('CN')" id="tab-cn">
+                🇨🇳 A股
+            </button>
+            <button class="market-tab hk" onclick="switchMarket('HK')" id="tab-hk">
+                🇭🇰 港股
+            </button>
+            <button class="market-tab us" onclick="switchMarket('US')" id="tab-us">
+                🇺🇸 美股
+            </button>
+            <button class="market-tab crypto" onclick="switchMarket('CRYPTO')" id="tab-crypto">
+                ₿ 加密货币
+            </button>
+            <div class="mode-toggle">
+                <button class="mode-btn active" id="btn-sim" onclick="setMode('sim')">🟡 模拟</button>
+                <button class="mode-btn live" id="btn-live" onclick="setMode('live')">🟢 实盘</button>
+            </div>
+        </div>
+        
+        <!-- 指数行情卡片 -->
+        <div class="card">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                <h2 style="margin:0;">📊 市场指数</h2>
+                <span id="market-time" style="color:#666;font-size:12px;">--</span>
+            </div>
+            <div id="index-cards" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;">
+                <!-- 动态加载 -->
+            </div>
+        </div>
         
         <!-- 系统状态 -->
         <div class="card">
-            <h2>系统状态</h2>
-            <div class="grid">
-                <div>
-                    <p>行情监控: <span id="monitor-status" class="status-badge status-stopped">检测中...</span></p>
-                    <p>实盘状态: <span id="live-status" class="status-badge" style="background:#555;color:#fff;">模拟模式</span></p>
-                    <p>门下省: <span id="menxia-status" class="status-badge" style="background:#555;color:#fff;">离线</span></p>
-                    <p>尚书省: <span id="shangshu-status" class="status-badge" style="background:#555;color:#fff;">离线</span></p>
+            <h2>🏛 系统状态</h2>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:15px;">
+                <div class="sys-stat-card" id="stat-monitor">
+                    <div class="sys-stat-label">📡 行情监控</div>
+                    <div class="sys-stat-value"><span id="monitor-status" class="status-badge status-stopped">检测中...</span></div>
                 </div>
-                <div class="actions">
+                <div class="sys-stat-card" id="stat-mode">
+                    <div class="sys-stat-label">🎯 交易模式</div>
+                    <div class="sys-stat-value"><span id="live-status" class="status-badge" style="background:#555;color:#fff;">模拟模式</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-menxia">
+                    <div class="sys-stat-label">📋 门下省</div>
+                    <div class="sys-stat-value"><span id="menxia-status" class="status-badge" style="background:#555;color:#fff;">离线</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-shangshu">
+                    <div class="sys-stat-label">⚙️ 尚书省</div>
+                    <div class="sys-stat-value"><span id="shangshu-status" class="status-badge" style="background:#555;color:#fff;">离线</span></div>
+                </div>
+            </div>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
+                <div style="font-size:12px;color:#888;">
+                    <span id="uptime-display">⏱ 运行时间: --</span>
+                    <span style="margin-left:20px;">📊 今日交易: <span id="daily-trades-count" style="color:#00d4ff;">0</span> 笔</span>
+                    <span style="margin-left:20px;">💰 持仓: <span id="position-count" style="color:#00d4ff;">0</span> 个</span>
+                </div>
+                <div class="actions" style="margin:0;">
                     <button class="btn btn-success" onclick="controlMonitor('start')">▶ 启动监控</button>
                     <button class="btn btn-danger" onclick="controlMonitor('stop')">■ 停止监控</button>
                     <button class="btn btn-primary" onclick="testAlert()">🔔 测试告警</button>
@@ -582,7 +693,7 @@ DASHBOARD_HTML = """
         <!-- 实时行情 -->
         <div id="tab-market" class="tab-content active">
             <div class="card">
-                <h2>实时行情</h2>
+                <h2 id="market-title">📈 A股实时行情</h2>
                 <div id="market-prices">加载中...</div>
                 <p class="refresh-info">自动刷新间隔: 30秒 | <button class="btn btn-primary" onclick="loadAll()">🔄 手动刷新</button></p>
             </div>
@@ -607,16 +718,16 @@ DASHBOARD_HTML = """
                 <div class="form-row">
                     <div>
                         <label>市场</label>
-                        <select id="trade-market">
-                            <option value="CN">A股</option>
-                            <option value="HK">港股</option>
-                            <option value="US">美股</option>
-                            <option value="CRYPTO">加密货币</option>
+                        <select id="trade-market" onchange="syncMarketFromTrade()">
+                            <option value="CN" ${currentMarket==='CN'?'selected':''}>🇨🇳 A股 (¥)</option>
+                            <option value="HK" ${currentMarket==='HK'?'selected':''}>🇭🇰 港股 (HK$)</option>
+                            <option value="US" ${currentMarket==='US'?'selected':''}>🇺🇸 美股 ($)</option>
+                            <option value="CRYPTO" ${currentMarket==='CRYPTO'?'selected':''}>₿ 加密货币 (₿)</option>
                         </select>
                     </div>
                     <div>
                         <label>代码</label>
-                        <input type="text" id="trade-symbol" placeholder="如: BTC, AAPL, 600000">
+                        <input type="text" id="trade-symbol" placeholder="输入代码，如: 600000, 00700, AAPL, BTC">
                     </div>
                     <div>
                         <label>数量</label>
@@ -698,8 +809,165 @@ DASHBOARD_HTML = """
     </div>
     
     <script>
+        // ========== 全局状态 ==========
+        let currentMarket = 'CN';  // CN, HK, US, CRYPTO
+        let currentMode = 'sim';   // sim, live
+        
+        // 市场配置
+        const MARKET_CONFIG = {
+            CN: {
+                name: 'A股',
+                currency: '¥',
+                currencySymbol: '¥',
+                icon: '🇨🇳',
+                indices: [
+                    {symbol: '000001', name: '上证指数', suffix: ''},
+                    {symbol: '399001', name: '深证成指', suffix: ''},
+                    {symbol: '600519', name: '贵州茅台', suffix: ''},
+                ],
+                symbols: ['600000', '000001', '000002', '600519']
+            },
+            HK: {
+                name: '港股',
+                currency: 'HK$',
+                currencySymbol: 'HK$',
+                icon: '🇭🇰',
+                indices: [
+                    {symbol: 'HSI', name: '恒生指数', suffix: ''},
+                    {symbol: '00700', name: '腾讯控股', suffix: ''},
+                    {symbol: '09988', name: '阿里巴巴', suffix: ''},
+                ],
+                symbols: ['00700', '09988', '03690']
+            },
+            US: {
+                name: '美股',
+                currency: '$',
+                currencySymbol: '$',
+                icon: '🇺🇸',
+                indices: [
+                    {symbol: '^GSPC', name: '标普500', suffix: ''},
+                    {symbol: '^DJI', name: '道琼斯', suffix: ''},
+                    {symbol: 'AAPL', name: '苹果', suffix: ''},
+                ],
+                symbols: ['AAPL', 'TSLA', 'NVDA', 'MSFT']
+            },
+            CRYPTO: {
+                name: '加密货币',
+                currency: '₿',
+                currencySymbol: '₿',
+                icon: '₿',
+                indices: [
+                    {symbol: 'BTC', name: '比特币', suffix: ''},
+                    {symbol: 'ETH', name: '以太坊', suffix: ''},
+                    {symbol: 'BNB', name: '币安币', suffix: ''},
+                ],
+                symbols: ['BTC', 'ETH', 'BNB', 'SOL']
+            }
+        };
+        
+        // ========== 市场切换 ==========
+        async function switchMarket(market) {
+            currentMarket = market;
+            
+            // 更新Tab样式
+            document.querySelectorAll('.market-tab').forEach(t => t.classList.remove('active'));
+            document.getElementById('tab-' + market.toLowerCase()).classList.add('active');
+            
+            // 更新标题
+            const config = MARKET_CONFIG[market];
+            document.getElementById('market-title').textContent = `📈 ${config.name}实时行情`;
+            
+            // 并行加载指数和行情（不再串行等待）
+            Promise.all([loadIndexCards(market), loadMarketPrices()]);
+        }
+        
+        // ========== 模式切换 ==========
+        function setMode(mode) {
+            currentMode = mode;
+            document.getElementById('btn-sim').classList.toggle('active', mode === 'sim');
+            document.getElementById('btn-live').classList.toggle('active', mode === 'live');
+            
+            const statusEl = document.getElementById('live-status');
+            if (mode === 'live') {
+                statusEl.textContent = '实盘';
+                statusEl.style.background = '#00c853';
+                statusEl.style.color = '#000';
+            } else {
+                statusEl.textContent = '模拟模式';
+                statusEl.style.background = '#555';
+                statusEl.style.color = '#fff';
+            }
+            
+            // 调用API切换实盘/模拟模式
+            fetch('/api/trading/mode', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode: mode})
+            }).then(res => res.json()).then(data => {
+                console.log('模式切换:', data.message || ('已切换到' + (mode === 'live' ? '实盘' : '模拟') + '模式'));
+            }).catch(err => {
+                console.error('模式切换失败:', err);
+            });
+        }
+        
+        // ========== 同步交易表单市场 ==========
+        function syncMarketFromTrade() {
+            const market = document.getElementById('trade-market').value;
+            switchMarket(market);
+        }
+        
+        // 更新交易表单的市场选择
+        function updateTradeMarketSelect() {
+            const select = document.getElementById('trade-market');
+            if (select) {
+                select.value = currentMarket;
+            }
+        }
+        
+        // ========== 加载指数卡片 ==========
+        async function loadIndexCards(market) {
+            const config = MARKET_CONFIG[market];
+            const container = document.getElementById('index-cards');
+            const marketKey = market.toLowerCase() === 'crypto' ? 'CRYPTO' : market;
+            
+            // 并行获取所有指数数据（替代串行fetch）
+            const indexPromises = config.indices.map(idx => {
+                const symbol = idx.symbol + idx.suffix;
+                return fetch(`/api/price/${marketKey}/${symbol}`)
+                    .then(res => res.ok ? res.json() : null)
+                    .catch(() => null);
+            });
+            
+            const results = await Promise.all(indexPromises);
+            
+            let html = '';
+            for (let i = 0; i < config.indices.length; i++) {
+                const idx = config.indices[i];
+                const data = results[i];
+                const price = data ? (data.price || '--') : '--';
+                const changePct = data ? (data.change_pct || '--') : '--';
+                const change = data ? (data.change || '--') : '--';
+                const isUp = parseFloat(changePct) >= 0;
+                const cls = isUp ? 'price-up' : 'price-down';
+                const sign = isUp ? '+' : '';
+                
+                html += `<div class="index-card">
+                    <span class="index-icon">${config.icon}</span>
+                    <div class="index-info">
+                        <div class="index-name">${idx.name}</div>
+                        <div class="index-value">${config.currencySymbol}${price}</div>
+                        <div class="index-change ${cls}">${sign}${changePct}%</div>
+                    </div>
+                </div>`;
+            }
+            
+            container.innerHTML = html || '<div style="color:#666;">暂无数据</div>';
+            document.getElementById('market-time').textContent = new Date().toLocaleTimeString();
+        }
+        
         // 加载所有数据
         async function loadAll() {
+            await loadIndexCards(currentMarket);
             await loadMarketPrices();
             await loadPositions();
             await loadPortfolioValue();
@@ -732,26 +1000,33 @@ DASHBOARD_HTML = """
 
                 // 门下省状态
                 const mxEl = document.getElementById('menxia-status');
+                const mxCard = document.getElementById('stat-menxia');
                 if (data.menxia_available) {
                     const mx = data.menxia || {};
                     const levelColors = {'normal': '#00c853', 'caution': '#ff9800', 'warning': '#ff5722', 'locked': '#ff1744'};
-                    mxEl.textContent = mx.level ? `正常(${mx.level})` : '正常';
+                    const levelCls = {'normal': '', 'caution': 'warning', 'warning': 'danger', 'locked': 'danger'};
+                    mxEl.textContent = mx.level ? `${mx.level}` : '正常';
                     mxEl.style.background = levelColors[mx.level] || '#00c853';
                     mxEl.style.color = '#000';
+                    mxCard.className = 'sys-stat-card ' + (levelCls[mx.level] || 'running');
                 } else {
                     mxEl.textContent = '未启用';
                     mxEl.style.background = '#555';
+                    mxCard.className = 'sys-stat-card';
                 }
 
                 // 尚书省状态
                 const ssEl = document.getElementById('shangshu-status');
+                const ssCard = document.getElementById('stat-shangshu');
                 if (data.shangshu_available && data.live_trading) {
                     ssEl.textContent = data.exchange || '已连接';
                     ssEl.style.background = '#00c853';
                     ssEl.style.color = '#000';
+                    ssCard.className = 'sys-stat-card running';
                 } else {
                     ssEl.textContent = '离线';
                     ssEl.style.background = '#555';
+                    ssCard.className = 'sys-stat-card';
                 }
             } catch(e) { console.error('三省六部状态加载失败:', e); }
         }
@@ -764,6 +1039,8 @@ DASHBOARD_HTML = """
                 const el = document.getElementById('monitor-status');
                 el.textContent = status === 'running' ? '运行中' : '已停止';
                 el.className = 'status-badge ' + (status === 'running' ? 'status-running' : 'status-stopped');
+                const monCard = document.getElementById('stat-monitor');
+                monCard.className = 'sys-stat-card ' + (status === 'running' ? 'running' : 'danger');
             } catch(e) { console.error(e); }
         }
         
@@ -783,11 +1060,23 @@ DASHBOARD_HTML = """
             try {
                 const res = await fetch('/api/market/prices');
                 const prices = await res.json();
-                if (prices && prices.length) {
+                const config = MARKET_CONFIG[currentMarket];
+                
+                // 过滤当前市场的数据
+                const marketPrices = prices.filter(p => {
+                    if (currentMarket === 'CRYPTO') return p.market === 'CRYPTO';
+                    if (currentMarket === 'CN') return p.market === 'CN';
+                    if (currentMarket === 'HK') return p.market === 'HK';
+                    if (currentMarket === 'US') return p.market === 'US';
+                    return true;
+                });
+                
+                if (marketPrices && marketPrices.length) {
+                    const currencySymbol = config.currencySymbol;
                     document.getElementById('market-prices').innerHTML = `
                         <table>
-                            <tr><th>市场</th><th>代码</th><th>名称</th><th>最新价</th><th>涨跌</th><th>24h高</th><th>24h低</th><th>成交量</th></tr>
-                            ${prices.map(p => {
+                            <tr><th>代码</th><th>名称</th><th>最新价</th><th>涨跌</th><th>24h高</th><th>24h低</th><th>成交量</th></tr>
+                            ${marketPrices.map(p => {
                                 const chg = p.change_pct || 0;
                                 const cls = chg >= 0 ? 'price-up' : 'price-down';
                                 const sign = chg >= 0 ? '+' : '';
@@ -795,19 +1084,18 @@ DASHBOARD_HTML = """
                                 const volNum = parseFloat(vol) || 0;
                                 const volStr = volNum > 1e8 ? (volNum/1e8).toFixed(2) + '亿' : volNum > 1e4 ? (volNum/1e4).toFixed(2) + '万' : volNum.toFixed(2);
                                 return `<tr>
-                                    <td>${p.market}</td>
                                     <td><b>${p.symbol}</b></td>
                                     <td>${p.name || '-'}</td>
-                                    <td class="${cls}">¥${(p.price||0).toLocaleString()}</td>
+                                    <td class="${cls}">${currencySymbol}${(p.price||0).toLocaleString()}</td>
                                     <td class="${cls}">${sign}${chg.toFixed(2)}%</td>
-                                    <td>¥${(p.high_24h||p.high||0).toLocaleString()}</td>
-                                    <td>¥${(p.low_24h||p.low||0).toLocaleString()}</td>
+                                    <td>${currencySymbol}${(p.high_24h||p.high||0).toLocaleString()}</td>
+                                    <td>${currencySymbol}${(p.low_24h||p.low||0).toLocaleString()}</td>
                                     <td>${volStr}</td>
                                 </tr>`;
                             }).join('')}
                         </table>`;
                 } else {
-                    document.getElementById('market-prices').innerHTML = '<p>暂无行情数据</p>';
+                    document.getElementById('market-prices').innerHTML = `<p>暂无${config.name}行情数据</p>`;
                 }
             } catch(e) { document.getElementById('market-prices').innerHTML = '<p>加载失败: ' + e.message + '</p>'; }
         }
@@ -1047,6 +1335,85 @@ DASHBOARD_HTML = """
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     return DASHBOARD_HTML
+
+# ============================================================
+# 股票交易接口 (A股/港股/美股)
+# ============================================================
+
+from stock_trading import StockTrader, SimulatedStockTrader
+
+# 全局模拟交易器
+_sim_traders = {}
+
+@app.get("/api/stock/connect")
+async def stock_connect(market: str = "us", broker: str = "auto", paper: bool = True):
+    """连接股票券商"""
+    try:
+        trader = StockTrader(market=market, broker=broker, paper=paper)
+        return {
+            "success": True,
+            "market": market,
+            "broker": broker,
+            "connected": trader.is_connected(),
+            "mode": "paper" if paper else "live"
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/stock/account/{market}")
+async def get_stock_account(market: str):
+    """获取股票账户信息"""
+    trader = StockTrader.get_trader(market)
+    if trader:
+        return trader.get_account()
+    return {"status": "not_initialized", "cash": 0, "portfolio_value": 0}
+
+@app.get("/api/stock/positions/{market}")
+async def get_stock_positions(market: str):
+    """获取股票持仓"""
+    trader = StockTrader.get_trader(market)
+    if trader:
+        return trader.get_positions()
+    return []
+
+@app.post("/api/stock/order")
+async def place_stock_order(
+    market: str,
+    symbol: str,
+    action: str,  # "buy" or "sell"
+    quantity: int,
+    order_type: str = "market",
+    limit_price: float = None
+):
+    """下单接口"""
+    trader = StockTrader.get_trader(market)
+    if not trader:
+        # 使用模拟交易
+        if market not in _sim_traders:
+            _sim_traders[market] = SimulatedStockTrader()
+        sim = _sim_traders[market]
+        if action == "buy":
+            result = sim.buy(symbol, quantity, limit_price)
+        else:
+            result = sim.sell(symbol, quantity, limit_price)
+        return {"mode": "simulated", **result}
+    
+    if action == "buy":
+        result = trader.buy(symbol, quantity, order_type, limit_price)
+    else:
+        result = trader.sell(symbol, quantity, order_type, limit_price)
+    return {"mode": "live", **result}
+
+@app.get("/api/stock/order/{market}")
+async def get_stock_order_status(market: str, order_id: str):
+    """查询订单状态"""
+    trader = StockTrader.get_trader(market)
+    if trader:
+        # 实际实现需要查询券商API
+        return {"order_id": order_id, "status": "filled"}
+    return {"order_id": order_id, "status": "unknown"}
+
+
 
 def run_server(host: str = "0.0.0.0", port: int = 8081):
     """启动 Web 服务"""
