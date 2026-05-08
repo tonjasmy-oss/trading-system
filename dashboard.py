@@ -1079,9 +1079,9 @@ DASHBOARD_HTML = """
                 currencySymbol: '¥',
                 icon: '🇨🇳',
                 indices: [
-                    {symbol: '000001', name: '上证指数', suffix: ''},
-                    {symbol: '399001', name: '深证成指', suffix: ''},
-                    {symbol: '600519', name: '贵州茅台', suffix: ''},
+                    {symbol: 'sh000001', name: '上证指数', suffix: ''},
+                    {symbol: 'sz399001', name: '深证成指', suffix: ''},
+                    {symbol: 'sz399006', name: '创业板指', suffix: ''},
                 ],
                 symbols: ['600000', '000001', '000002', '600519']
             },
@@ -1103,8 +1103,8 @@ DASHBOARD_HTML = """
                 currencySymbol: '$',
                 icon: '🇺🇸',
                 indices: [
-                    {symbol: '^GSPC', name: '标普500', suffix: ''},
-                    {symbol: '^DJI', name: '道琼斯', suffix: ''},
+                    {symbol: 'ixic', name: '纳斯达克', suffix: ''},
+                    {symbol: 'dji', name: '道琼斯', suffix: ''},
                     {symbol: 'AAPL', name: '苹果', suffix: ''},
                 ],
                 symbols: ['AAPL', 'TSLA', 'NVDA', 'MSFT']
@@ -1633,7 +1633,7 @@ DASHBOARD_HTML = """
                     document.getElementById('replay-heatmap').innerHTML = '<p style="color:#888;">暂无热力图数据</p>';
                     return;
                 }
-                const strategies = [...new Set(Object.values(data).flatMap(v => Object.keys(v))];
+                const strategies = [...new Set(Object.values(data).flatMap(v => Object.keys(v)))];
                 let html = '<table style="min-width:400px;"><thead><tr><th>策略 \\ 市场</th>';
                 for (const s of strategies) html += `<th>${s}</th>`;
                 html += '</tr></thead><tbody>';
