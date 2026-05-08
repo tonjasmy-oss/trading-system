@@ -15,6 +15,9 @@ from portfolio import Portfolio
 from monitor import quick_price_check
 from feishu_alert import FeishuAlert
 feishu_alert = FeishuAlert()
+from trade_history import TradeHistory
+from components.market_regime import MarketRegime
+from components.auditor import Auditor
 from database import init_db, get_positions, get_trades, get_alerts
 from config import PRICE_CHECK_INTERVAL
 
@@ -33,6 +36,138 @@ portfolio = Portfolio()
 # 全局监控状态
 _monitor_status = {"status": "stopped", "message": "未启动"}
 _start_time = None
+
+# 复盘模块实例（全工作线程共享，避免重复初始化）
+_replay_th = None
+_replay_mr = None
+_replay_auditor = None
+
+def _get_replay_modules():
+    global _replay_th, _replay_mr, _replay_auditor
+    if _replay_th is None:
+        _replay_th = TradeHistory()
+    if _replay_mr is None:
+        _replay_mr = MarketRegime()
+    if _replay_auditor is None:
+        _replay_auditor = Auditor()
+    return _replay_th, _replay_mr, _replay_auditor
+
+
+# ================================================================
+# P3 交易复盘 API
+# ================================================================
+
+@app.get("/api/replay/stats")
+async def get_replay_stats():
+    """综合绩效统计：胜率/盈亏比/期望值/最大回撤"""
+    try:
+        th, mr, _ = _get_replay_modules()
+        stats = th.get_performance_stats()
+        # 补充市场状态分布（通过 MarketRegime 查询）
+        try:
+            recent = mr.get_historical_regime(symbol="BTC/USDT", hours_back=720)
+            trend_counts = {}
+            for r in recent:
+                t = r.get("trend") or "unknown"
+                trend_counts[t] = trend_counts.get(t, 0) + 1
+            regime_dist = [{"regime": k, "count": v} for k, v in trend_counts.items()]
+        except Exception:
+            regime_dist = []
+        return {**stats, "regime_distribution": regime_dist}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/replay/trades")
+async def get_replay_trades(limit: int = 50):
+    """交易历史列表（含市场状态标注）"""
+    try:
+        th, mr, _ = _get_replay_modules()
+        trades = th.get_recent_trades(limit)
+        enriched = []
+        for t in trades:
+            entry_time = t.get("opened_at") or t.get("open_time") or ""
+            if entry_time:
+                regime = mr.get_regime_at(str(entry_time)[:19])
+                t["market_trend"] = regime.get("trend", "unknown") if regime else "unknown"
+                t["market_volatility"] = regime.get("volatility", "unknown") if regime else "unknown"
+                t["market_volume"] = regime.get("volume", "unknown") if regime else "unknown"
+            else:
+                t["market_trend"] = "unknown"
+                t["market_volatility"] = "unknown"
+                t["market_volume"] = "unknown"
+            enriched.append(t)
+        return enriched
+    except Exception as e:
+        return []
+
+
+@app.get("/api/replay/heatmap")
+async def get_replay_heatmap():
+    """策略 × 市场状态 热力图"""
+    try:
+        th, _, _ = _get_replay_modules()
+        heatmap = th.get_pnl_by_market_regime()
+        return heatmap if heatmap else {}
+    except Exception as e:
+        return {}
+
+
+@app.get("/api/replay/exit_analysis")
+async def get_replay_exit_analysis():
+    """按出场原因分析：止损/止盈/其他"""
+    try:
+        th, _, _ = _get_replay_modules()
+        return th.get_pnl_by_exit_reason()
+    except Exception as e:
+        return {}
+
+
+@app.get("/api/replay/audit")
+async def get_replay_audit_report():
+    """最新审计报告"""
+    try:
+        _, _, auditor = _get_replay_modules()
+        report = auditor.run_audit(days_back=30)
+        return report
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/replay/run-audit")
+async def run_replay_audit():
+    """手动触发审计并保存报告"""
+    try:
+        _, _, auditor = _get_replay_modules()
+        report = auditor.run_audit_and_save(days_back=30)
+        return {"success": True, "report": report}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+# ================================================================
+# P2 回测图表 API（Equity Curve + 买卖点标注）
+# ================================================================
+
+@app.get("/api/signal/review")
+async def get_signal_review():
+    """返回信号复盘统计"""
+    try:
+        from signal_review import get_review
+        review = get_review()
+        summary = review.get_recent_summary(20)
+        patterns = review.get_error_patterns(5)
+        return {
+            "quality_score": review.get_signal_quality_score(),
+            "accuracy": summary["accuracy"],
+            "avg_confidence": summary["avg_confidence"],
+            "total_reviewed": summary["total"],
+            "error_patterns": [{"pattern": p, "count": c} for p, c in patterns],
+            "recommendation": "proceed" if summary["accuracy"] >= 0.5 else "caution"
+        }
+    except Exception as e:
+        return {"error": str(e), "quality_score": 0.5, "recommendation": "unknown"}
+
 
 # ========== 数据模型 ==========
 
@@ -420,6 +555,25 @@ async def get_stock_chart_data(
 # P2 回测图表 API（Equity Curve + 买卖点标注）
 # ================================================================
 
+@app.get("/api/signal/review")
+async def get_signal_review():
+    """返回信号复盘统计"""
+    try:
+        from signal_review import get_review
+        review = get_review()
+        summary = review.get_recent_summary(20)
+        patterns = review.get_error_patterns(5)
+        return {
+            "quality_score": review.get_signal_quality_score(),
+            "accuracy": summary["accuracy"],
+            "avg_confidence": summary["avg_confidence"],
+            "total_reviewed": summary["total"],
+            "error_patterns": [{"pattern": p, "count": c} for p, c in patterns],
+            "recommendation": "proceed" if summary["accuracy"] >= 0.5 else "caution"
+        }
+    except Exception as e:
+        return {"error": str(e), "quality_score": 0.5, "recommendation": "unknown"}
+
 @app.get("/api/backtest/chart/{strategy_name}")
 async def get_backtest_chart_data(strategy_name: str):
     """
@@ -464,6 +618,7 @@ async def get_backtest_chart_data(strategy_name: str):
             name="RSI40%+SMA30%+MACD30%",
         )
         strategy = vote
+        use_confidence = True
     elif strategy_name in BUILTIN_FORMULAS:
         strategy = FormulaStrategy(
             formula=BUILTIN_FORMULAS[strategy_name],
@@ -471,20 +626,26 @@ async def get_backtest_chart_data(strategy_name: str):
             timeframe="4h",
             stop_loss=0.05, take_profit=0.10,
         )
+        use_confidence = False
     else:
         raise HTTPException(status_code=404, detail=f"未知策略: {strategy_name}")
-
-    # 计算指标
-    indicators = strategy.populate_indicators(candles)
-    entry_signals = strategy.populate_entry_trend(candles)
-    try:
-        exit_signals = strategy.populate_exit_trend(candles)
-    except Exception:
-        exit_signals = [0] * len(candles)
 
     # 简化指标序列（只返回最后 200 个，前 100 个数据不足）
     n_show = min(250, n)
     start = max(0, n - n_show)
+
+    # 计算指标
+    indicators = strategy.populate_indicators(candles)
+    if use_confidence:
+        entry_signals, confidences = strategy.populate_signals_with_confidence(candles)
+        confidence_map = {start + i: confidences[i] for i in range(len(confidences))}
+    else:
+        entry_signals = strategy.populate_entry_trend(candles)
+        confidence_map = {}
+    try:
+        exit_signals = strategy.populate_exit_trend(candles)
+    except Exception:
+        exit_signals = [0] * len(candles)
     candles_show = candles[start:]
     timestamps = [c["timestamp"] for c in candles_show]
     closes = [c["close"] for c in candles_show]
@@ -520,10 +681,13 @@ async def get_backtest_chart_data(strategy_name: str):
     for i in range(len(candles_show)):
         idx = start + i
         if entry_signals[idx] == 1:
+            conf = confidence_map.get(idx, 0.0)
+            conf_label = "🟢" if conf >= 0.7 else ("🟡" if conf >= 0.4 else "🔴")
             buy_markers.append({
                 "t": candles_show[i]["timestamp"] // 1000,
                 "price": candles_show[i]["close"],
-                "label": "买入",
+                "label": f"买入 {conf_label}{conf:.2f}",
+                "confidence": conf,
             })
         if exit_signals[idx] == -1 or (exit_signals[idx] == 0 and entry_signals[idx] == 0 and i > 0 and entry_signals[idx - 1] == 1):
             # 简化：每次持仓结束视为卖出
@@ -563,6 +727,12 @@ async def get_backtest_chart_data(strategy_name: str):
         "sell_markers": sell_markers,
         "indicators": indicators_out,
         "weights": strategy_weights,
+        "confidence_enabled": use_confidence,
+        "signal_stats": {
+            "total_signals": sum(1 for s in entry_signals if s != 0),
+            "high_conf": sum(1 for c in confidences if c >= 0.7) if use_confidence else 0,
+            "low_conf": sum(1 for c in confidences if 0 < c < 0.4) if use_confidence else 0,
+        }
     }
 
 
@@ -729,6 +899,7 @@ DASHBOARD_HTML = """
             <button class="tab" onclick="switchTab('trade')">💰 交易操作</button>
             <button class="tab" onclick="switchTab('alerts')">🔔 告警记录</button>
             <button class="tab" onclick="switchTab('backtest')">📊 回测图表</button>
+            <button class="tab" onclick="switchTab('replay')">🔍 交易复盘</button>
         </div>
         
         <!-- 实时行情 -->
@@ -845,6 +1016,52 @@ DASHBOARD_HTML = """
 
                 <!-- 信号统计 -->
                 <div id="bt-stats" style="margin-top:10px;font-size:13px;color:#aaa;"></div>
+            </div>
+        </div>
+
+        <!-- 交易复盘 P3 -->
+        <div id="tab-replay" class="tab-content">
+            <!-- KPI 绩效卡片 -->
+            <div class="card">
+                <h2>📊 综合绩效统计</h2>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:15px;" id="replay-kpi"></div>
+            </div>
+
+            <!-- 策略×市场热力图 -->
+            <div class="card">
+                <h2>🔥 策略 × 市场状态 热力图</h2>
+                <div id="replay-heatmap" style="overflow-x:auto;"></div>
+            </div>
+
+            <!-- 出场原因分析 -->
+            <div class="card">
+                <h2>📋 出场原因分析</h2>
+                <div id="replay-exits" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;"></div>
+            </div>
+
+            <!-- 交易历史 -->
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                    <h2 style="margin:0;">📜 交易历史</h2>
+                    <div style="display:flex;gap:8px;">
+                        <select id="replay-trade-limit" onchange="loadReplayTrades()" style="width:auto;margin:0;">
+                            <option value="20">最近20笔</option>
+                            <option value="50" selected>最近50笔</option>
+                            <option value="100">最近100笔</option>
+                        </select>
+                        <button class="btn btn-primary" onclick="loadReplayTrades()" style="margin:0;">🔄 刷新</button>
+                    </div>
+                </div>
+                <div id="replay-trades" style="overflow-x:auto;"></div>
+            </div>
+
+            <!-- 审计洞察 -->
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                    <h2 style="margin:0;">🧠 Reflection Agent 审计报告</h2>
+                    <button class="btn btn-primary" onclick="runReplayAudit()" style="margin:0;">▶ 重新审计</button>
+                </div>
+                <div id="replay-audit"></div>
             </div>
         </div>
     </div>
@@ -1268,6 +1485,7 @@ DASHBOARD_HTML = """
             document.querySelector(`.tab[onclick="switchTab('${tab}')"]`).classList.add('active');
             document.getElementById('tab-' + tab).classList.add('active');
             if (tab === 'backtest') loadBacktestChart();
+            if (tab === 'replay') loadReplayAll();
         }
 
         // ================================================================
@@ -1290,10 +1508,14 @@ DASHBOARD_HTML = """
                 const data = await res.json();
 
                 // 显示权重
+                // 显示投票权重
                 if (data.weights && Object.keys(data.weights).length > 0) {
                     const wParts = Object.entries(data.weights).map(([k, v]) => `${k} ${(v*100).toFixed(0)}%`).join(' + ');
+                    const confInfo = data.confidence_enabled
+                        ? ` | 信号数：${data.signal_stats.total_signals} | 高置信度🟢${data.signal_stats.high_conf} | 低置信度🔴${data.signal_stats.low_conf}`
+                        : '';
                     weightsDiv.style.display = 'block';
-                    weightsDiv.innerHTML = `投票权重：${wParts}（阈值=${strategy === 'MultiVote' ? '0.3' : '-'})`;
+                    weightsDiv.innerHTML = `投票权重：${wParts}${confInfo}`;
                 } else {
                     weightsDiv.style.display = 'none';
                 }
@@ -1325,10 +1547,15 @@ DASHBOARD_HTML = """
                 const candleSeries = candleChart.addCandlestickSeries({ upColor: '#00e676', downColor: '#ff1744', borderVisible: false });
                 candleSeries.setData(data.ohlc.map(d => ({ time: d.t, open: d.o, high: d.h, low: d.l, close: d.c })));
 
-                // 买标记
+                // 买标记（显示置信度）
                 if (data.buy_markers && data.buy_markers.length > 0) {
-                    candleSeries.createPriceLine({
-                        price: data.buy_markers[0].price, color: '#00e676', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '买入'
+                    data.buy_markers.forEach(m => {
+                        const conf = m.confidence || 0;
+                        const color = conf >= 0.7 ? '#00c853' : (conf >= 0.4 ? '#ff9800' : '#ff1744');
+                        candleSeries.createPriceLine({
+                            price: m.price, color: color, lineWidth: 1, lineStyle: 2, axisLabelVisible: true,
+                            title: m.label || '买入'
+                        });
                     });
                 }
                 candleChart.timeScale().fitContent();
@@ -1363,6 +1590,232 @@ DASHBOARD_HTML = """
             } catch(e) {
                 statsDiv.innerHTML = `<span style="color:#ff1744;">图表加载失败: ${e.message}</span>`;
             }
+        }
+
+        // ================================================================
+        // P3 交易复盘
+        // ================================================================
+
+        async function loadReplayKPI() {
+            try {
+                const res = await fetch('/api/replay/stats');
+                const data = await res.json();
+                if (data.error) { document.getElementById('replay-kpi').innerHTML = '<p style="color:#888;">暂无交易数据</p>'; return; }
+                const winRate = ((data.win_rate || 0) * 100).toFixed(1);
+                const profitFactor = (data.profit_factor || 0).toFixed(2);
+                const expectancy = (data.expectancy || 0).toFixed(4);
+                const maxDD = ((data.max_drawdown_pct || 0) * 100).toFixed(2);
+                const totalTrades = data.total_trades || 0;
+                const kpi = [
+                    { label: '总交易次数', value: totalTrades, color: '#00d4ff' },
+                    { label: '胜率', value: winRate + '%', color: winRate >= 50 ? '#00c853' : '#ff1744' },
+                    { label: '盈亏比', value: profitFactor, color: '#ff9800' },
+                    { label: '期望值/笔', value: expectancy, color: '#00d4ff' },
+                    { label: '最大回撤', value: maxDD + '%', color: maxDD > 10 ? '#ff1744' : '#ff9800' },
+                    { label: '总盈利', value: (data.total_pnl || 0).toFixed(2), color: '#00c853' },
+                ];
+                document.getElementById('replay-kpi').innerHTML = kpi.map(k =>
+                    `<div class="sys-stat-card" style="border-left-color:${k.color};">
+                        <div class="sys-stat-label">${k.label}</div>
+                        <div class="sys-stat-value" style="font-size:22px;color:${k.color};">${k.value}</div>
+                    </div>`
+                ).join('');
+            } catch(e) {
+                document.getElementById('replay-kpi').innerHTML = `<p style="color:#ff1744;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        async function loadReplayHeatmap() {
+            try {
+                const res = await fetch('/api/replay/heatmap');
+                const data = await res.json();
+                if (!data || Object.keys(data).length === 0) {
+                    document.getElementById('replay-heatmap').innerHTML = '<p style="color:#888;">暂无热力图数据</p>';
+                    return;
+                }
+                const strategies = [...new Set(Object.values(data).flatMap(v => Object.keys(v))];
+                let html = '<table style="min-width:400px;"><thead><tr><th>策略 \\ 市场</th>';
+                for (const s of strategies) html += `<th>${s}</th>`;
+                html += '</tr></thead><tbody>';
+                for (const [regime, stratMap] of Object.entries(data)) {
+                    html += `<tr><td style="font-weight:bold;color:#00d4ff;">${regime}</td>`;
+                    for (const s of strategies) {
+                        const cell = stratMap[s];
+                        if (cell) {
+                            const wr = (cell.win_rate * 100).toFixed(0) + '%';
+                            const clr = cell.win_rate >= 0.5 ? '#00c853' : (cell.win_rate >= 0.3 ? '#ff9800' : '#ff1744');
+                            html += `<td style="text-align:center;">
+                                <div style="background:${clr}22;border:1px solid ${clr};border-radius:6px;padding:6px 8px;">
+                                    <div style="font-size:16px;font-weight:bold;color:${clr};">${wr}</div>
+                                    <div style="font-size:11px;color:#888;">${(cell.total_pnl || 0).toFixed(2)}</div>
+                                </div>
+                            </td>`;
+                        } else {
+                            html += `<td style="text-align:center;color:#444;">—</td>`;
+                        }
+                    }
+                    html += '</tr>';
+                }
+                html += '</tbody></table>';
+                html += '<p style="font-size:11px;color:#666;margin-top:8px;">格内数字：胜率 / 总盈亏 | 绿色=胜率≥50% 橙色=30-50% 红色=<30%</p>';
+                document.getElementById('replay-heatmap').innerHTML = html;
+            } catch(e) {
+                document.getElementById('replay-heatmap').innerHTML = `<p style="color:#ff1744;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        async function loadReplayExits() {
+            try {
+                const res = await fetch('/api/replay/exit_analysis');
+                const data = await res.json();
+                if (!data || Object.keys(data).length === 0) {
+                    document.getElementById('replay-exits').innerHTML = '<p style="color:#888;">暂无出场数据</p>';
+                    return;
+                }
+                const labels = { stop_loss: '🔴 止损', take_profit: '🟢 止盈', exit: '⚪ 其他' };
+                const colors = { stop_loss: '#ff1744', take_profit: '#00c853', exit: '#888' };
+                document.getElementById('replay-exits').innerHTML = Object.entries(data).map(([k, v]) => {
+                    const label = labels[k] || k;
+                    const color = colors[k] || '#00d4ff';
+                    const pnl = (v.total_pnl || 0).toFixed(2);
+                    const wr = ((v.win_rate || 0) * 100).toFixed(1);
+                    const cls = parseFloat(pnl) >= 0 ? 'profit' : 'loss';
+                    return `<div class="sys-stat-card" style="border-left-color:${color};">
+                        <div class="sys-stat-label">${label}</div>
+                        <div style="font-size:18px;font-weight:bold;color:${color};">${v.count || 0} 笔</div>
+                        <div style="font-size:13px;color:#aaa;margin-top:4px;">
+                            胜率: ${wr}% | 盈亏: <span class="${cls}">¥${pnl}</span>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch(e) {
+                document.getElementById('replay-exits').innerHTML = `<p style="color:#ff1744;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        async function loadReplayTrades() {
+            const limit = parseInt(document.getElementById('replay-trade-limit').value) || 50;
+            try {
+                const res = await fetch(`/api/replay/trades?limit=${limit}`);
+                const trades = await res.json();
+                if (!trades || trades.length === 0) {
+                    document.getElementById('replay-trades').innerHTML = '<p style="color:#888;">暂无交易记录</p>';
+                    return;
+                }
+                const trendBadge = { uptrend: '🟢', downtrend: '🔴', ranging: '🟡', unknown: '⚪' };
+                const volColor = { high: '#ff9800', medium: '#00d4ff', low: '#888', unknown: '#444' };
+                let html = `<table style="min-width:900px;">
+                    <thead><tr>
+                        <th>时间</th><th>策略</th><th>标的</th><th>方向</th>
+                        <th>入场价</th><th>出场价</th><th>持仓时长</th>
+                        <th>市场趋势</th><th>波动率</th><th>盈亏</th><th>出场原因</th>
+                    </tr></thead><tbody>`;
+                for (const t of trades) {
+                    const side = t.get('side') || t.get('action') || 'buy';
+                    const pnl = t.get('pnl') || 0;
+                    const exit = t.get('exit_reason') || 'unknown';
+                    const trend = t.get('market_trend') || 'unknown';
+                    const vol = t.get('market_volatility') || 'unknown';
+                    const duration = t.get('holding_hours');
+                    const durationStr = duration != null ? duration.toFixed(1) + 'h' : '—';
+                    const cls = pnl >= 0 ? 'profit' : 'loss';
+                    const sideLabel = side === 'sell' ? '🔴 做空' : '🟢 做多';
+                    const exitLabels = { stop_loss: '🔴止损', take_profit: '🟢止盈', signal_end: '📊信号结束', manual_close: '🔧手动', unknown: '—' };
+                    const badge = trendBadge[trend] || '⚪';
+                    html += `<tr>
+                        <td>${(t.get('opened_at') || t.get('open_time') || '—').toString().slice(0, 19)}</td>
+                        <td><b>${t.get('strategy') || '—'}</b></td>
+                        <td>${t.get('symbol') || '—'}</td>
+                        <td>${sideLabel}</td>
+                        <td>¥${(t.get('entry_price') || 0).toFixed(4)}</td>
+                        <td>¥${(t.get('exit_price') || 0).toFixed(4)}</td>
+                        <td>${durationStr}</td>
+                        <td>${badge} ${trend}</td>
+                        <td style="color:${volColor[vol] || '#888'};">${vol}</td>
+                        <td class="${cls}">¥${pnl.toFixed(2)}</td>
+                        <td>${exitLabels[exit] || exit}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                document.getElementById('replay-trades').innerHTML = html;
+            } catch(e) {
+                document.getElementById('replay-trades').innerHTML = `<p style="color:#ff1744;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        async function loadReplayAudit() {
+            try {
+                const res = await fetch('/api/replay/audit');
+                const data = await res.json();
+                if (data.error) {
+                    document.getElementById('replay-audit').innerHTML = `<p style="color:#888;">暂无审计数据: ${data.error}</p>`;
+                    return;
+                }
+                let html = `<div style="margin-bottom:15px;font-size:12px;color:#888;">`;
+                if (data.period) html += `审计周期: ${data.period.start} ~ ${data.period.end} | `;
+                if (data.total_trades != null) html += `总交易: ${data.total_trades} 笔 | `;
+                if (data.overall_win_rate != null) html += `整体胜率: ${(data.overall_win_rate * 100).toFixed(1)}%`;
+                html += `</div>`;
+
+                // 策略排名
+                if (data.strategy_rankings && data.strategy_rankings.length > 0) {
+                    html += `<h3 style="color:#00d4ff;margin:10px 0 8px 0;">🏆 策略表现排名</h3>`;
+                    html += `<table style="margin-bottom:15px;">
+                        <thead><tr><th>#</th><th>策略</th><th>次数</th><th>胜率</th><th>总盈亏</th><th>期望值</th></tr></thead><tbody>`;
+                    data.strategy_rankings.forEach((s, i) => {
+                        const wr = ((s.win_rate || 0) * 100).toFixed(1) + '%';
+                        const pnl = (s.total_pnl || 0).toFixed(2);
+                        const cls = parseFloat(pnl) >= 0 ? 'profit' : 'loss';
+                        html += `<tr>
+                            <td>${i + 1}</td><td><b>${s.strategy}</b></td>
+                            <td>${s.count}</td>
+                            <td style="color:${s.win_rate >= 0.5 ? '#00c853' : '#ff1744'};">${wr}</td>
+                            <td class="${cls}">¥${pnl}</td>
+                            <td>${(s.expectancy || 0).toFixed(4)}</td>
+                        </tr>`;
+                    });
+                    html += '</tbody></table>';
+                }
+
+                // 洞察
+                if (data.insights && data.insights.length > 0) {
+                    html += `<h3 style="color:#00d4ff;margin:10px 0 8px 0;">💡 审计洞察</h3>`;
+                    const severityColor = { high: '#ff1744', medium: '#ff9800', low: '#00d4ff' };
+                    data.insights.forEach(ins => {
+                        const color = severityColor[ins.severity] || '#888';
+                        html += `<div style="background:#0f3460;border-left:3px solid ${color};border-radius:6px;padding:10px 14px;margin-bottom:8px;">
+                            <div style="font-weight:bold;color:${color};margin-bottom:4px;">[${(ins.severity || 'info').toUpperCase()}] ${ins.description || ins}</div>
+                            <div style="color:#aaa;font-size:13px;">📌 建议: ${ins.recommendation || '—'}</div>
+                        </div>`;
+                    });
+                } else {
+                    html += `<p style="color:#888;">暂无洞察数据</p>`;
+                }
+                document.getElementById('replay-audit').innerHTML = html;
+            } catch(e) {
+                document.getElementById('replay-audit').innerHTML = `<p style="color:#ff1744;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        async function runReplayAudit() {
+            const btn = document.querySelector('[onclick="runReplayAudit()"]');
+            if (btn) { btn.disabled = true; btn.textContent = '⏳ 审计中...'; }
+            try {
+                const res = await fetch('/api/replay/run-audit', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    await loadReplayAudit();
+                    await loadReplayKPI();
+                } else {
+                    alert('审计失败: ' + (data.error || '未知错误'));
+                }
+            } finally {
+                if (btn) { btn.disabled = false; btn.textContent = '▶ 重新审计'; }
+            }
+        }
+
+        async function loadReplayAll() {
+            await Promise.all([loadReplayKPI(), loadReplayHeatmap(), loadReplayExits(), loadReplayTrades(), loadReplayAudit()]);
         }
 
         // 初始化

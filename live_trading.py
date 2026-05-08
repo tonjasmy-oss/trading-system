@@ -73,6 +73,31 @@ try:
 except ImportError:
     ShangshuSheng = None
 
+try:
+    from trade_history import TradeHistory, get_history
+    _TRADE_HISTORY_AVAILABLE = True
+except ImportError:
+    TradeHistory = None
+    get_history = None
+    _TRADE_HISTORY_AVAILABLE = False
+
+# 多信号候选路由（Agent-S Best-of-N 借鉴）
+try:
+    from components.signal_router import SignalRouter, CandidateSignal
+    _SIGNAL_ROUTER_AVAILABLE = True
+except ImportError:
+    SignalRouter = None
+    CandidateSignal = None
+    _SIGNAL_ROUTER_AVAILABLE = False
+
+# 市场状态标注（MarketRegime）
+try:
+    from components.market_regime import MarketRegime
+    _MARKET_REGIME_AVAILABLE = True
+except ImportError:
+    MarketRegime = None
+    _MARKET_REGIME_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # 飞书主动推送
@@ -234,6 +259,44 @@ class TradingAgent:
         self.menxia = menxia            # 门下省（风控审核）
         self.shangshu = shangshu        # 尚书省（执行调度）
 
+        # 交易记忆（TradeHistory — Agent-S Outcome Memory 借鉴）
+        self._trade_history: Optional["TradeHistory"] = None
+        if _TRADE_HISTORY_AVAILABLE:
+            try:
+                self._trade_history = get_history(
+                    db_dir=os.path.dirname(os.path.abspath(__file__))
+                )
+                logger.info(f"[{agent_id}] TradeHistory 已连接")
+            except Exception as e:
+                logger.warning(f"[{agent_id}] TradeHistory 初始化失败: {e}")
+
+        # 多信号候选路由器（Agent-S Best-of-N 借鉴）
+        self._signal_router: Optional["SignalRouter"] = None
+        if _SIGNAL_ROUTER_AVAILABLE:
+            try:
+                self._signal_router = SignalRouter(
+                    menxia=menxia,
+                    trade_history=self._trade_history,
+                )
+                logger.info(f"[{agent_id}] SignalRouter 已连接")
+            except Exception as e:
+                logger.warning(f"[{agent_id}] SignalRouter 初始化失败: {e}")
+
+        # 市场状态标注（MarketRegime）
+        self._market_regime: Optional["MarketRegime"] = None
+        if _MARKET_REGIME_AVAILABLE:
+            try:
+                self._market_regime = MarketRegime(
+                    db_dir=os.path.dirname(os.path.abspath(__file__))
+                )
+                logger.info(f"[{agent_id}] MarketRegime 已连接")
+            except Exception as e:
+                logger.warning(f"[{agent_id}] MarketRegime 初始化失败: {e}")
+
+        # 当前交易的 trade_uid（关联开仓/平仓）
+        self._current_trade_id: Optional[int] = None
+        self._current_regime: Dict = {}  # 当前市场状态（供 record_open 使用）
+
         # 兼容旧 GlobalRiskManager（如果调用方仍传入则走旧路径）
         self.risk_manager: Optional["GlobalRiskManager"] = None
 
@@ -311,6 +374,77 @@ class TradingAgent:
 
     # -------------------- 数据获取 --------------------
 
+    def _build_multi_strategy_candidates(
+        self, candles: List[Dict], current_price: float, quantity: float
+    ) -> List["CandidateSignal"]:
+        """
+        为 SignalRouter 构建多策略候选列表。
+        当前 Agent 只配了单一策略时，从 K线数据生成其他策略候选信号，
+        让路由器能够做跨策略评分比较（Best-of-N）。
+        """
+        candidates: List["CandidateSignal"] = []
+        closes = [c["close"] for c in candles]
+
+        strategy_configs = [
+            ("RSI", RSIStrategy(
+                StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+                rsi_period=self.rsi_period, oversold=self.oversold, overbought=self.overbought,
+            )),
+            ("MACD", MACDStrategy(
+                StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+            )),
+            ("BOLLINGER", BollingerBandsStrategy(
+                StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+                period=20, std_dev=2.0,
+            )),
+        ]
+
+        for name, strat in strategy_configs:
+            try:
+                if isinstance(strat, (RSIStrategy, MACDStrategy, BollingerBandsStrategy)):
+                    indicators = strat.populate_indicators(candles) if hasattr(strat, "populate_indicators") else {}
+                else:
+                    indicators = {}
+
+                # 估算置信度（基于指标值与策略阈值的关系）
+                confidence = self._estimate_confidence(strat, candles)
+
+                candidates.append(CandidateSignal(
+                    symbol=self.symbol,
+                    strategy=name,
+                    confidence=confidence,
+                    side="BUY",
+                    price=current_price,
+                    quantity=quantity,
+                    timeframe=self.timeframe,
+                    agent_id=self.agent_id,
+                    indicators=indicators,
+                ))
+            except Exception:
+                pass
+
+        return candidates
+
+    def _estimate_confidence(self, strategy, candles: List[Dict]) -> float:
+        """估算策略信号的置信度（0~1）"""
+        try:
+            closes = [c["close"] for c in candles]
+            rsi_vals = compute_rsi(closes, self.rsi_period)
+            current_rsi = rsi_vals[-1]
+
+            if isinstance(strategy, RSIStrategy):
+                if current_rsi < self.oversold:
+                    return 0.7 + (self.oversold - current_rsi) / 50
+                elif current_rsi > self.overbought:
+                    return 0.7 + (current_rsi - self.overbought) / 50
+            elif isinstance(strategy, MACDStrategy):
+                return 0.65
+            elif isinstance(strategy, BollingerBandsStrategy):
+                return 0.60
+            return 0.5
+        except Exception:
+            return 0.5
+
     def _fetch_candles(self, limit: int = 50) -> Optional[List[Dict]]:
         """获取 K线数据（根据交易所自动选择）"""
         if self.exchange == "hyperliquid":
@@ -370,11 +504,12 @@ class TradingAgent:
 
         # ── 多策略投票 ──
         if isinstance(self.strategy_obj, MultiStrategyVote):
-            entry_signals = self.strategy_obj.populate_entry_trend(candles)
+            # 获取信号和置信度
+            entry_signals, confidences = self.strategy_obj.populate_signals_with_confidence(candles)
             last_entry = entry_signals[-1] if entry_signals else 0
+            last_conf = confidences[-1] if confidences else 0.0
             if isinstance(last_entry, Signal):
                 last_entry = last_entry.value
-            # 同时检查 RSI 值用于显示
             closes = [c["close"] for c in candles]
             rsi = compute_rsi(closes, self.rsi_period)
             current_rsi = rsi[-1]
@@ -503,6 +638,29 @@ class TradingAgent:
         if self.menxia:
             self.menxia.record_open(self.symbol, exec_price, quantity, stop_loss, take_profit)
 
+        # ── TradeHistory 记录开仓 ──
+        if self._trade_history:
+            try:
+                self._current_trade_id = self._trade_history.record_open(
+                    symbol=self.symbol,
+                    signal_price=price,          # 中书省发出信号时的价格
+                    exec_price=exec_price,        # 实际成交价（含滑点）
+                    entry_time=timestamp,
+                    quantity=quantity,
+                    strategy=self.strategy_name,
+                    timeframe=self.timeframe,
+                    agent_id=self.agent_id,
+                    exchange=self.exchange,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    signal_confidence=0.5,
+                    ai_verdict=ai_verdict or "",
+                    is_live=self.shangshu is not None and LIVE_TRADING_ENABLED,
+                    order_id=result.order_id if self.shangshu else None,
+                )
+            except Exception as e:
+                logger.warning(f"[{self.agent_id}] TradeHistory 开仓记录失败: {e}")
+
         # 飞书推送：开仓通知
         if _feishu and self._feishu_enabled:
             _feishu.send_position_alert(
@@ -572,6 +730,24 @@ class TradingAgent:
         # 通知门下省更新每日亏损
         if self.menxia:
             self.menxia.record_close(self.symbol, pnl_pct)
+
+        # ── TradeHistory 记录平仓 ──
+        if self._trade_history and self._current_trade_id is not None:
+            try:
+                entry_ts = self.position["entry_time"] if self.position else timestamp
+                holding_hours = (timestamp - entry_ts) / 3600.0
+                self._trade_history.record_close(
+                    trade_id=self._current_trade_id,
+                    exit_price=exec_price,
+                    exit_time=timestamp,
+                    exit_reason=reason,
+                    pnl_pct=pnl_pct,
+                    pnl_abs=pnl_abs,
+                    holding_hours=holding_hours,
+                )
+                self._current_trade_id = None
+            except Exception as e:
+                logger.warning(f"[{self.agent_id}] TradeHistory 平仓记录失败: {e}")
 
         # 飞书推送：平仓通知
         if _feishu and self._feishu_enabled:
@@ -653,6 +829,30 @@ class TradingAgent:
         rsi = compute_rsi(closes, self.rsi_period)[-1]
         result["rsi"] = rsi
 
+        # ── MarketRegime 市场状态标注 ──
+        regime_info: Dict = {}
+        if self._market_regime:
+            try:
+                closes_list = [c["close"] for c in candles]
+                volumes_list = [c.get("volume", 0) for c in candles]
+                regime_state = self._market_regime.get_current_regime(
+                    symbol=self.symbol,
+                    timeframe=self.timeframe,
+                    closes=closes_list,
+                    volumes=volumes_list,
+                    save=True,
+                )
+                self._current_regime = regime_state
+                regime_info = {
+                    "trend": regime_state.get("trend", "unknown"),
+                    "volatility": regime_state.get("volatility", "unknown"),
+                    "volume": regime_state.get("volume", "unknown"),
+                    "confidence": regime_state.get("confidence", 0.0),
+                }
+                result["market_regime"] = regime_info
+            except Exception as e:
+                logger.warning(f"[{self.agent_id}] MarketRegime 获取失败: {e}")
+
         # 获取 24h 数据用于 AI 过滤器
         price_data = self._fetch_price()
         price_change_24h_pct = 0.0
@@ -712,15 +912,76 @@ class TradingAgent:
                         entry_price=current_price,
                         quantity=(self.capital * 1.0) / current_price,
                         agent_id=self.agent_id,
+                        signal_confidence=last_conf if 'last_conf' in dir() else 0.5,
+                        indicators={'rsi': current_rsi} if 'current_rsi' in dir() else {},
                     )
                     can_open = review.approved
                     reason = review.reason
+
+                # ── SignalRouter 多候选评分（Agent-S Best-of-N）──
+                routing_info: Dict = {}
+                if self._signal_router and can_open:
+                    try:
+                        quantity = (self.capital * 1.0) / current_price
+                        # 当前策略候选
+                        primary = CandidateSignal(
+                            symbol=self.symbol,
+                            strategy=self.strategy_name,
+                            confidence=last_conf if 'last_conf' in dir() else 0.5,
+                            side="BUY",
+                            price=current_price,
+                            quantity=quantity,
+                            timeframe=self.timeframe,
+                            agent_id=self.agent_id,
+                            indicators={"rsi": current_rsi} if 'current_rsi' in dir() else {},
+                        )
+                        # 从配置扩展多策略候选（如果有额外策略可用）
+                        candidates = self._build_multi_strategy_candidates(
+                            candles, current_price, quantity
+                        )
+                        if primary not in candidates:
+                            candidates.insert(0, primary)
+
+                        mx_status = self.menxia.get_status()
+                        exposure = mx_status.get("total_exposure_pct", 0) / 100.0
+                        route_result = self._signal_router.route(
+                            candidates=candidates,
+                            exposure_pct=exposure,
+                            market_trend="unknown",     # P2: market_regime
+                            market_volatility="unknown",
+                        )
+                        routing_info = {
+                            "routing_reason": route_result.routing_reason,
+                            "chosen_strategy": route_result.chosen.strategy if route_result.chosen else None,
+                            "chosen_score": route_result.chosen.score if route_result.chosen else None,
+                            "alternatives": [
+                                {"strategy": c.strategy, "score": c.score,
+                                 "breakdown": c.score_breakdown}
+                                for c in route_result.alternatives
+                            ],
+                        }
+                        if route_result.chosen:
+                            can_open = True
+                            logger.info(
+                                f"[{self.agent_id}] SignalRouter 选中 "
+                                f"{route_result.chosen.strategy}（评分 {route_result.chosen.score:.1f}）"
+                            )
+                        else:
+                            can_open = False
+                            reason = f"全部 {len(route_result.rejected)} 个候选被否决"
+                    except Exception as e:
+                        logger.warning(f"[{self.agent_id}] SignalRouter 异常: {e}")
+
                 if not can_open:
-                    logger.warning(f"[{self.agent_id}] 门下省否决开仓: {reason}")
-                    result["signal"] = f"门下省否决({reason})"
+                    logger.warning(f"[{self.agent_id}] 门校省否决开仓: {reason}")
+                    result["signal"] = f"门校省否决({reason})"
+                    if routing_info:
+                        result["routing"] = routing_info
                 else:
                     await self._open_position(current_price, current_ts, rsi, ai_verdict)
                     result["signal"] = "BUY"
+                    if routing_info:
+                        result["routing"] = routing_info
             elif filtered_sig == Signal.HOLD and signal_val == Signal.BUY:
                 result["signal"] = "HOLD（AI否决）"
         else:

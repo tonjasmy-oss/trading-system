@@ -29,3 +29,24 @@ from .position_manager import (
     Position,
     PnLResult,
 )
+
+from .signal_router import (
+    SignalRouter,
+    CandidateSignal,
+    RoutingResult,
+    SignalScorer,
+)
+
+from .auditor import (
+    Auditor,
+    Insight,
+    run_audit_and_save,
+)
+
+from .market_regime import (
+    MarketRegime,
+    detect_trend,
+    detect_volatility,
+    detect_volume,
+    backfill_regime,
+)

@@ -227,7 +227,9 @@ class MenxiaSheng:
 
     def review_open(self, symbol: str, entry_price: float,
                     quantity: float, agent_id: str = "default",
-                    order_id: Optional[str] = None) -> ReviewResult:
+                    order_id: Optional[str] = None,
+                    signal_confidence: float = 0.5,
+                    indicators: Dict = None) -> ReviewResult:
         """
         审核开仓请求（所有新开仓必须经过此审核）
         Returns ReviewResult — approved=True 表示可以执行
@@ -287,6 +289,25 @@ class MenxiaSheng:
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"风险等级{self._risk_level.value}，禁止开仓",
                                self._risk_level, rules_triggered, entry_price)
+
+        # R8: 信号质量/置信度拦截（来自历史复盘的错误模式）
+        try:
+            from signal_review import get_review
+            review = get_review()
+            # 提取当前 indicator（如果有传入的话，这里用占位，后续可扩展）
+            blocked, block_reason = review.should_block_signal(
+                signal_type=1,
+                confidence=signal_confidence,
+                strategy_name=agent_id,
+                indicators=indicators or {},
+            )
+            if blocked:
+                rules_triggered.append(f"R8_信号质量:{block_reason}")
+                return self._reject(symbol, quantity, agent_id, order_id,
+                                   f"信号质量拦截({block_reason})",
+                                   self._risk_level, rules_triggered, entry_price)
+        except Exception:
+            pass  # 信号复盘模块不可用时跳过
 
         # 审核通过
         logger.info(f"[门下省] ✅ 审核通过: {symbol} 数量{quantity} "

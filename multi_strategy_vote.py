@@ -123,10 +123,6 @@ class MultiStrategyVote(Strategy):
         return self._threshold(votes)
 
     def populate_all_signals(self, candles: List[Dict]) -> List[int]:
-        """
-        返回聚合后的综合信号（entry + exit 合并）。
-        同时考虑买入和卖出，取最终决策。
-        """
         n = len(candles)
         votes = [0.0] * n
 
@@ -136,18 +132,61 @@ class MultiStrategyVote(Strategy):
                 try:
                     exit_s = strategy.populate_exit_trend(candles)
                 except Exception:
-                    exit_s = [-x for x in entry]  # 无 exit 用反向 entry
+                    exit_s = [-x for x in entry]
 
                 for i in range(n):
                     entry_sig = int(entry[i]) if not isinstance(entry[i], Signal) else int(entry[i].value)
                     exit_sig  = int(exit_s[i])  if not isinstance(exit_s[i],  Signal) else int(exit_s[i].value)
-                    # 综合信号：买入=1，卖出=-1，其他=0
                     combined = entry_sig if abs(entry_sig) > abs(exit_sig) else exit_sig
                     votes[i] += combined * weight
             except Exception:
                 continue
 
         return self._threshold(votes)
+
+    def populate_signals_with_confidence(self, candles: List[Dict]) -> tuple[List[int], List[float]]:
+        """
+        返回 (signals, confidences) 元组。
+        signals: 同 populate_all_signals（1买入/-1卖出/0无信号）
+        confidences: 每个信号位置的置信度 0~1（基于投票幅度归一化到 threshold）
+        置信度 ≥0.7 视为强信号，0.4~0.7 弱信号，<0.4 噪音丢弃
+        """
+        n = len(candles)
+        votes = [0.0] * n
+        total_weight = sum(w for _, w in self.strategies)
+
+        for strategy, weight in self.strategies:
+            try:
+                entry = strategy.populate_entry_trend(candles)
+                try:
+                    exit_s = strategy.populate_exit_trend(candles)
+                except Exception:
+                    exit_s = [-x for x in entry]
+
+                for i in range(n):
+                    entry_sig = int(entry[i]) if not isinstance(entry[i], Signal) else int(entry[i].value)
+                    exit_sig  = int(exit_s[i])  if not isinstance(exit_s[i],  Signal) else int(exit_s[i].value)
+                    combined = entry_sig if abs(entry_sig) > abs(exit_sig) else exit_sig
+                    votes[i] += combined * weight
+            except Exception:
+                continue
+
+        signals = self._threshold(votes)
+        confidences = []
+        for i, v in enumerate(votes):
+            sig = signals[i]
+            if sig == 0:
+                confidences.append(0.0)
+            else:
+                # 当 threshold=0 时，v=0 会导致 conf=0 但信号=BUY
+                # 因此用 min_vote = 0.5 作为最小有效投票单位，避免 conf=0 的边界问题
+                min_vote = 0.5
+                if abs(v) < min_vote:
+                    conf = abs(v) / min_vote  # 信号存在但很弱
+                else:
+                    conf = min(1.0, abs(v) / max(abs(self.threshold) * 2, 0.5))
+                confidences.append(round(min(1.0, conf), 3))
+        return signals, confidences
 
     def _threshold(self, votes: List[float]) -> List[int]:
         """将加权投票值映射为 [-1, 0, 1] 信号"""
