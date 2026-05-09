@@ -60,6 +60,10 @@ GRID_OVERBOUGHT = [65, 70, 73, 75, 78]
 GRID_STOP_LOSS = [0.015, 0.02, 0.025, 0.03, 0.04]
 GRID_TAKE_PROFIT = [0.03, 0.04, 0.05, 0.06, 0.08]
 
+# 高波动标的扩展参数空间（SUI 等 meme/altcoin）
+GRID_STOP_LOSS_VOLATILE = [0.01, 0.012, 0.015, 0.02, 0.025, 0.03, 0.04]
+GRID_TAKE_PROFIT_VOLATILE = [0.02, 0.025, 0.03, 0.04, 0.05, 0.06, 0.08]
+
 # ============================================================
 # 数据类
 # ============================================================
@@ -85,6 +89,7 @@ class BacktestConfig:
             capital_pct=self.capital_pct,
             stop_loss=self.stop_loss,
             take_profit=self.take_profit,
+            trade_direction="long",
         )
 
     def make_strategy(self) -> Strategy:
@@ -198,17 +203,22 @@ class BatchBacktester:
         遍历所有参数组合，找出最优配置
         结果按 score 排序，保存到 grid_search_report.json
         """
+        # 高波动标的自动切换扩展参数空间
+        is_volatile = symbol.upper().startswith("SUI")
+        sl_grid = GRID_STOP_LOSS_VOLATILE if is_volatile else GRID_STOP_LOSS
+        tp_grid = GRID_TAKE_PROFIT_VOLATILE if is_volatile else GRID_TAKE_PROFIT
+
         logger.info(f"开始 Grid Search: {symbol} 策略={strategy}")
         logger.info(
             f"参数空间: RSI_period={GRID_RSI_PERIOD}, oversold={GRID_OVERSOLD}, "
-            f"overbought={GRID_OVERBOUGHT}, SL={GRID_STOP_LOSS}, TP={GRID_TAKE_PROFIT}"
+            f"overbought={GRID_OVERBOUGHT}, SL={sl_grid}, TP={tp_grid}"
         )
 
         # 生成所有组合
         configs = []
         for rp, os_val, ob_val, sl, tp in itertools.product(
             GRID_RSI_PERIOD, GRID_OVERSOLD, GRID_OVERBOUGHT,
-            GRID_STOP_LOSS, GRID_TAKE_PROFIT,
+            sl_grid, tp_grid,
         ):
             configs.append(BacktestConfig(
                 symbol=symbol,

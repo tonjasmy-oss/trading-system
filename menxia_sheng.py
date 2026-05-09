@@ -194,6 +194,10 @@ class MenxiaSheng:
     MAX_HOLDING_HOURS        = 72     # R6: 72h 超时预警
     EQUITY_DROP_TRIGGER     = 0.05   # R7: 回落 5% → 升级
     EQUITY_RECOVER_TRIGGER  = 0.03   # R8: 恢复 3% → 降级
+    MAX_CONSECUTIVE_LOSSES  = 5      # R9: 连续亏损 5 笔 → 熔断
+    MAX_POS_DRAWDOWN_PCT    = 0.15   # R10: 单仓浮亏 15% → 强制平仓
+    MIN_ORDER_NOTIONAL      = 10.0   # R11: 最低下单金额（USDT）
+    MAX_ORDER_RATIO         = 0.5    # R11: 单笔下单不超过资金 50%
 
     def __init__(self, initial_capital: float = 10000.0,
                  db_path: str = "trading_system.db",
@@ -219,6 +223,9 @@ class MenxiaSheng:
 
         # 刑部（违规记录）
         self._xingbu = XingBuJustice(db_path)
+
+        # 连续亏损计数（R9 熔断）
+        self._consecutive_losses: int = 0
 
         self._check_day_reset()
         logger.info(f"[门下省] 初始化完成，初始资金 ${initial_capital:.2f}")
@@ -266,6 +273,36 @@ class MenxiaSheng:
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"单日开仓次数{self._daily_trades}次已达上限",
                                self._risk_level, rules_triggered, entry_price)
+
+        # R9: 连续亏损熔断
+        if self._consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
+            rules_triggered.append(f"R9_连续亏损:{self._consecutive_losses}笔")
+            return self._reject(symbol, quantity, agent_id, order_id,
+                               f"连续亏损{self._consecutive_losses}笔，触发熔断",
+                               RiskLevel.LOCKED, rules_triggered, entry_price)
+
+        # R11: 下单量合理性
+        order_value = quantity * entry_price
+        if order_value < self.MIN_ORDER_NOTIONAL:
+            rules_triggered.append(f"R11_金额过小:${order_value:.2f}")
+            return self._reject(symbol, quantity, agent_id, order_id,
+                               f"下单金额${order_value:.2f}低于最低限额${self.MIN_ORDER_NOTIONAL}",
+                               self._risk_level, rules_triggered, entry_price)
+        if quantity * entry_price > self.current_capital * self.MAX_ORDER_RATIO:
+            rules_triggered.append(f"R11_金额过大:${order_value:.2f}")
+            return self._reject(symbol, quantity, agent_id, order_id,
+                               f"下单金额${order_value:.2f}超过资金{self.MAX_ORDER_RATIO*100:.0f}%",
+                               self._risk_level, rules_triggered, entry_price)
+
+        # R10: 已有持仓的浮亏检查
+        if symbol in self._positions:
+            pos = self._positions[symbol]
+            unrealized = (entry_price - pos["entry_price"]) / pos["entry_price"]
+            if unrealized < -self.MAX_POS_DRAWDOWN_PCT:
+                rules_triggered.append(f"R10_浮亏:{unrealized*100:.1f}%")
+                return self._reject(symbol, quantity, agent_id, order_id,
+                                   f"当前持仓浮亏{unrealized*100:.1f}%，禁止加仓",
+                                   self._risk_level, rules_triggered, entry_price)
 
         # R3: 总暴露度
         total_exp = self._calc_total_exposure(symbol, entry_price, quantity)
@@ -384,8 +421,17 @@ class MenxiaSheng:
             del self._positions[symbol]
         if pnl_pct < 0:
             self._daily_loss += abs(pnl_pct) / 100.0 * capital_fraction
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
+                self._risk_level = RiskLevel.LOCKED
+                self._lock_reason = f"连续亏损{self._consecutive_losses}笔，触发熔断"
+                self._maybe_alert_risk(level="lock", msg=self._lock_reason)
+                logger.warning(f"[门下省] R9熔断: {self._lock_reason}")
+        else:
+            self._consecutive_losses = max(0, self._consecutive_losses - 1)
         logger.info(f"[门下省] 平仓记录: {symbol} 盈亏{pnl_pct:+.2f}% "
-                    f"资金比例{capital_fraction*100:.0f}% 累计日亏{self._daily_loss*100:.4f}%")
+                    f"资金比例{capital_fraction*100:.0f}% "
+                    f"连续亏损{self._consecutive_losses}笔 累计日亏{self._daily_loss*100:.4f}%")
 
     def update_equity(self, equity: float):
         """更新当前 equity，自动调整风险等级（R7/R8）"""

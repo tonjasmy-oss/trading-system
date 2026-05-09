@@ -47,13 +47,14 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TradeRecord:
     """单笔交易记录"""
-    entry_time:    int   # 入场时间戳（毫秒）
-    entry_price:   float # 入场价格
-    exit_time:     int   # 出场时间戳（毫秒）
-    exit_price:    float # 出场价格
-    quantity:      float # 成交数量
-    pnl_pct:       float # 盈亏比例（%）
-    exit_reason:   str   # 出场原因：'signal' | 'stop_loss' | 'take_profit'
+    entry_time:    int    # 入场时间戳（毫秒）
+    entry_price:   float  # 入场价格
+    exit_time:     int    # 出场时间戳（毫秒）
+    exit_price:    float  # 出场价格
+    quantity:      float  # 成交数量
+    pnl_pct:       float  # 盈亏比例（%）
+    exit_reason:   str    # 出场原因：'signal' | 'stop_loss' | 'take_profit'
+    side:          str    = "long"  # 方向：'long' | 'short'
 
 
 @dataclass
@@ -78,7 +79,8 @@ class BacktestResult:
     capital_pct:      float          # 资金比例配置
     commission_pct:   float          # 手续费率配置
     slippage_pct:     float          # 滑点率配置
-    equity_curve:     List[Tuple[int, float]]  # (timestamp, equity) 时间序列
+    trade_direction:  str            = "long"   # 交易方向
+    equity_curve:     List[Tuple[int, float]] = field(default_factory=list)  # (timestamp, equity) 时间序列
     trades:           List[TradeRecord] = field(default_factory=list)
 
 
@@ -91,29 +93,29 @@ class BacktestEngine:
     回测引擎：逐根 K线模拟策略交易行为
     """
 
-    def __init__(self, strategy: Strategy, initial_capital: float = 10000.0):
+    def __init__(self, strategy: Strategy, initial_capital: float = 10000.0,
+                 trade_direction: str = "long"):
         """
         Args:
             strategy:        策略实例（须已配置好 config）
             initial_capital: 初始资金（默认 10000 USDT）
+            trade_direction: 交易方向: "long" | "short" | "both"
         """
         self.strategy = strategy
         self.initial_capital = initial_capital
         self.config = strategy.get_config()
         self.commission_pct = getattr(self.config, 'commission_pct', 0.001)
         self.slippage_pct   = getattr(self.config, 'slippage_pct', 0.0005)
+        self.trade_direction = trade_direction or getattr(self.config, 'trade_direction', 'long')
 
         # 运行状态
         self.candles: List[Dict] = []
         self.entry_signal: List[int] = []
         self.exit_signal:  List[int] = []
 
-        # 持仓状态
-        self.in_position: bool = False
-        self.entry_price: float = 0.0
-        self.entry_time: int   = 0
-        self.stop_loss:   float = 0.0
-        self.take_profit: float = 0.0
+        # 持仓状态 — 支持独立多/空持仓
+        self._long_pos: Dict[str, Any] = {}   # {entry_price, entry_time, stop_loss, take_profit}
+        self._short_pos: Dict[str, Any] = {}
 
         # 结果收集
         self.trades: List[TradeRecord] = []
@@ -172,97 +174,110 @@ class BacktestEngine:
 
     def run(self) -> BacktestResult:
         """
-        执行回测主循环
-
-        逻辑：
-          - 按时间顺序遍历每根 K线
-          - 入场信号且空仓 → 开多（用 config.capital_pct 比例资金买入）
-          - 出场信号（-1）或触发止损/止盈 → 平多
-          - 每根 K线末记录当前权益（equity）
+        执行回测主循环 — 支持 long / short / both 三种方向
         """
         if not self.candles:
             raise RuntimeError("请先调用 load_data() 加载数据")
 
-        stop_loss_pct  = self.config.stop_loss
-        take_profit_pct = self.config.take_profit
-        capital_pct    = self.config.capital_pct
+        sl = self.config.stop_loss
+        tp = self.config.take_profit
+        cp = self.config.capital_pct
+        td = self.trade_direction
 
         equity = self.initial_capital
         self.equity_curve = []
 
+        allow_long = td in ("long", "both")
+        allow_short = td in ("short", "both")
+
         for i, candle in enumerate(self.candles):
             ts    = candle["timestamp"]
             close = candle["close"]
-
-            # ----- 记录权益 -----
             self.equity_curve.append((ts, equity))
 
-            # ----- 如有持仓，检测止损/止盈 -----
-            if self.in_position:
-                pnl_pct = (close - self.entry_price) / self.entry_price
-
-                if pnl_pct <= -stop_loss_pct:
-                    # 触发止损
-                    self._close_trade(ts, close, "stop_loss", equity, capital_pct)
-                    equity = self._calc_equity(equity, capital_pct, pnl_pct, stop_loss=True)
-                    self.in_position = False
+            # ── 多头持仓止损/止盈 ──
+            lp = self._long_pos
+            if lp:
+                long_pnl = (close - lp["entry_price"]) / lp["entry_price"]
+                if long_pnl <= -sl:
+                    equity = self._close_pos("long", lp, ts, close, "stop_loss", equity, cp, long_pnl)
+                    self._long_pos = {}
+                    continue
+                if long_pnl >= tp:
+                    equity = self._close_pos("long", lp, ts, close, "take_profit", equity, cp, long_pnl)
+                    self._long_pos = {}
                     continue
 
-                if pnl_pct >= take_profit_pct:
-                    # 触发止盈
-                    self._close_trade(ts, close, "take_profit", equity, capital_pct)
-                    equity = self._calc_equity(equity, capital_pct, pnl_pct, stop_loss=False)
-                    self.in_position = False
+            # ── 空头持仓止损/止盈 ──
+            sp = self._short_pos
+            if sp:
+                short_pnl = (sp["entry_price"] - close) / sp["entry_price"]
+                if short_pnl <= -sl:
+                    equity = self._close_pos("short", sp, ts, close, "stop_loss", equity, cp, short_pnl)
+                    self._short_pos = {}
+                    continue
+                if short_pnl >= tp:
+                    equity = self._close_pos("short", sp, ts, close, "take_profit", equity, cp, short_pnl)
+                    self._short_pos = {}
                     continue
 
-            # ----- 检测入场信号 -----
-            if not self.in_position and self.entry_signal[i] == Signal.BUY:
-                self.in_position = True
-                self.entry_price = close * (1 + self.slippage_pct)
-                self.entry_time  = ts
-                self.stop_loss   = close * (1 - stop_loss_pct)
-                self.take_profit  = close * (1 + take_profit_pct)
+            buy_sig  = self.entry_signal[i] == Signal.BUY
+            sell_sig = self.exit_signal[i]  == Signal.SELL
 
-            # ----- 检测出场信号 -----
-            elif self.in_position and self.exit_signal[i] == Signal.SELL:
-                self._close_trade(ts, close, "signal", equity, capital_pct)
-                pnl_pct = (close - self.entry_price) / self.entry_price
-                equity = self._calc_equity(equity, capital_pct, pnl_pct)
-                self.in_position = False
+            # ── 多头入场 ──
+            if allow_long and not self._long_pos and buy_sig:
+                self._long_pos = {
+                    "entry_price": close * (1 + self.slippage_pct),
+                    "entry_time": ts,
+                }
 
-        # 最后如仍持仓，以最后收盘价结算
-        if self.in_position and self.candles:
-            last = self.candles[-1]
-            pnl_pct = (last["close"] - self.entry_price) / self.entry_price
-            equity = self._calc_equity(equity, capital_pct, pnl_pct)
-            self.equity_curve[-1] = (last["timestamp"], equity)
-            self.in_position = False
+            # ── 多头出场 ──
+            elif self._long_pos and sell_sig:
+                long_pnl = (close - self._long_pos["entry_price"]) / self._long_pos["entry_price"]
+                equity = self._close_pos("long", self._long_pos, ts, close, "signal", equity, cp, long_pnl)
+                self._long_pos = {}
+
+            # ── 空头入场 ──
+            if allow_short and not self._short_pos and sell_sig:
+                self._short_pos = {
+                    "entry_price": close * (1 - self.slippage_pct),
+                    "entry_time": ts,
+                }
+
+            # ── 空头出场 ──
+            elif self._short_pos and buy_sig:
+                short_pnl = (self._short_pos["entry_price"] - close) / self._short_pos["entry_price"]
+                equity = self._close_pos("short", self._short_pos, ts, close, "signal", equity, cp, short_pnl)
+                self._short_pos = {}
+
+        # 最后结算未平仓
+        if self.candles:
+            last_close = self.candles[-1]["close"]
+            last_ts = self.candles[-1]["timestamp"]
+            if self._long_pos:
+                long_pnl = (last_close - self._long_pos["entry_price"]) / self._long_pos["entry_price"]
+                equity = self._close_pos("long", self._long_pos, last_ts, last_close, "force_close", equity, cp, long_pnl)
+            if self._short_pos:
+                short_pnl = (self._short_pos["entry_price"] - last_close) / self._short_pos["entry_price"]
+                equity = self._close_pos("short", self._short_pos, last_ts, last_close, "force_close", equity, cp, short_pnl)
+            self.equity_curve[-1] = (last_ts, equity)
 
         return self._build_result(equity)
 
     # -------------------- 私有辅助 --------------------
 
-    def _close_trade(self, exit_time: int, exit_price: float,
-                     reason: str, equity: float, capital_pct: float):
-        """记录一笔成交"""
-        pnl_pct = (exit_price - self.entry_price) / self.entry_price
-        qty = (equity * capital_pct) / self.entry_price
+    def _close_pos(self, side: str, pos: dict, exit_time: int, exit_price: float,
+                   reason: str, equity: float, capital_pct: float, pnl_pct: float) -> float:
+        """平仓并返回新权益"""
+        pnl = pnl_pct * 100  # 转为百分号形式
+        qty = (equity * capital_pct) / pos["entry_price"]
         self.trades.append(TradeRecord(
-            entry_time   = self.entry_time,
-            entry_price  = self.entry_price,
-            exit_time    = exit_time,
-            exit_price   = exit_price,
-            quantity     = qty,
-            pnl_pct      = pnl_pct * 100,
-            exit_reason  = reason,
+            entry_time=pos["entry_time"], entry_price=pos["entry_price"],
+            exit_time=exit_time, exit_price=exit_price,
+            quantity=qty, pnl_pct=pnl, exit_reason=reason, side=side,
         ))
-
-    def _calc_equity(self, equity: float, capital_pct: float,
-                     pnl_pct: float, stop_loss: bool = False) -> float:
-        """计算平仓后权益（含手续费）"""
         trade_value = equity * capital_pct
         gross_pl = trade_value * pnl_pct
-        # 双向手续费（开仓 + 平仓）
         commission = trade_value * self.commission_pct * 2
         return equity + gross_pl - commission
 
@@ -332,6 +347,7 @@ class BacktestEngine:
             capital_pct        = self.config.capital_pct * 100,
             commission_pct     = self.commission_pct * 100,
             slippage_pct       = self.slippage_pct * 100,
+            trade_direction    = self.trade_direction,
             equity_curve       = self.equity_curve,
             trades             = trades,
         )
@@ -386,10 +402,11 @@ def generate_report(result: BacktestResult, output_dir: str = "backtest_results"
         exit_dt   = datetime.fromtimestamp(t.exit_time   / 1000).strftime("%Y-%m-%d %H:%M")
         holding_h = (t.exit_time - t.entry_time) / 3600000
         pnl_emoji = "🟢" if t.pnl_pct > 0 else "🔴"
+        side_tag = "📈多" if t.side == "long" else "📉空"
         trade_lines.append(
             f"| {i} | {entry_dt} | {exit_dt} | "
             f"{t.entry_price:.4f} | {t.exit_price:.4f} | "
-            f"{t.quantity:.6f} | {t.pnl_pct:+.2f}% | "
+            f"{t.quantity:.6f} | {side_tag} | {t.pnl_pct:+.2f}% | "
             f"{t.exit_reason} |"
         )
 
@@ -404,6 +421,7 @@ def generate_report(result: BacktestResult, output_dir: str = "backtest_results"
 | **策略名称** | {result.strategy_name} |
 | **交易对** | {result.symbol} |
 | **K线周期** | {result.timeframe} |
+| **交易方向** | {result.trade_direction} |
 | **数据区间** | {result.start_date} ~ {result.end_date} |
 | **止损比例** | {result.stop_loss_pct:.1f}% |
 | **止盈比例** | {result.take_profit_pct:.1f}% |
@@ -431,8 +449,8 @@ def generate_report(result: BacktestResult, output_dir: str = "backtest_results"
 
 ## 交易明细
 
-| # | 入场时间 | 出场时间 | 入场价 | 出场价 | 数量 | 盈亏 | 出场原因 |
-|---|---------|---------|-------|-------|-----|------|---------|
+| # | 入场时间 | 出场时间 | 入场价 | 出场价 | 数量 | 方向 | 盈亏 | 出场原因 |
+|---|---------|---------|-------|-------|-----|----|------|---------|
 {trades_table}
 
 ---
@@ -453,6 +471,7 @@ def print_summary(result: BacktestResult):
     print(f"  回测结果摘要  {result.symbol} {result.timeframe}")
     print("=" * 55)
     print(f"  策略          : {result.strategy_name}")
+    print(f"  交易方向      : {result.trade_direction}")
     print(f"  数据区间      : {result.start_date} ~ {result.end_date}")
     print(f"  总收益率      : {result.total_return_pct:+.2f}%")
     print(f"  夏普比率      : {result.sharpe_ratio:.2f}")
@@ -484,6 +503,8 @@ def parse_args():
     parser.add_argument("--initial-capital",type=float, default=10000.0,help="初始资金（USDT）")
     parser.add_argument("--commission",     type=float, default=0.1,  help="手续费率(%%)，默认 0.1")
     parser.add_argument("--slippage",       type=float, default=0.05, help="滑点率(%%)，默认 0.05")
+    parser.add_argument("--direction",      type=str, default="long",
+                        choices=["long", "short", "both"], help="交易方向（默认 long）")
     parser.add_argument("--output-dir",     default="backtest_results", help="报告输出目录")
     parser.add_argument("--formula",       type=str, default=None,
                         help="通达信公式字符串（支持内置名如 KDJ/MACD/RSI/BOLL/WR/MA_CROSS）")
@@ -564,7 +585,8 @@ def main():
     init_cache_db()
 
     # 执行回测
-    engine = BacktestEngine(strategy, initial_capital=args.initial_capital)
+    engine = BacktestEngine(strategy, initial_capital=args.initial_capital,
+                           trade_direction=args.direction)
     if not engine.load_data():
         logger.error("数据加载失败，退出")
         sys.exit(1)

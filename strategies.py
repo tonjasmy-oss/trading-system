@@ -39,6 +39,7 @@ class StrategyConfig:
     take_profit:     float = 0.10         # 止盈比例（10%）
     commission_pct:  float = 0.001        # 手续费率（默认 0.1% = 现货 taker fee）
     slippage_pct:    float = 0.0005       # 滑点率（默认 0.05%）
+    trade_direction: str   = "long"       # 交易方向: "long" | "short" | "both"
 
 
 # ============================================================
@@ -827,11 +828,159 @@ class BollingerBandsStrategy(Strategy):
 # 策略注册表 — 新策略在此一行注册，自动接入回测和实盘
 # ============================================================
 
+# ============================================================
+# KDJ 随机指标策略（FormulaStrategy 包装）
+# ============================================================
+
+class KDJStrategy(Strategy):
+    """
+    KDJ 随机指标策略
+
+    规则：
+      - K 线从下穿越 D 线且 J < 20（超卖区金叉）→ 买入
+      - K 线从上穿越 D 线且 J > 80（超买区死叉）→ 卖出
+
+    参数：
+      - k_period: K 值周期（默认 9）
+      - d_period: D 值平滑周期（默认 3）
+      - j_period: J 值周期（默认 3）
+    """
+    def __init__(self, config=None, k_period=9, d_period=3, j_period=3):
+        super().__init__(config)
+        self.k_period = k_period
+        self.d_period = d_period
+        self.j_period = j_period
+
+    def _compute_kdj(self, candles):
+        n = len(candles)
+        k_vals = [50.0] * n
+        d_vals = [50.0] * n
+        j_vals = [50.0] * n
+        _k, _d = 50.0, 50.0
+
+        for i in range(self.k_period, n):
+            highest = max(c["high"] for c in candles[i - self.k_period + 1:i + 1])
+            lowest = min(c["low"] for c in candles[i - self.k_period + 1:i + 1])
+            rsv = (candles[i]["close"] - lowest) / (highest - lowest) * 100 if highest != lowest else 50.0
+            _k = (_k * (self.d_period - 1) + rsv) / self.d_period
+            _d = (_d * (self.d_period - 1) + _k) / self.d_period
+            _j = 3 * _k - 2 * _d
+            k_vals[i] = _k
+            d_vals[i] = _d
+            j_vals[i] = _j
+
+        return k_vals, d_vals, j_vals
+
+    def populate_indicators(self, candles):
+        k, d, j = self._compute_kdj(candles)
+        self._indicators = {"k": k, "d": d, "j": j, "close": [c["close"] for c in candles]}
+        return self._indicators
+
+    def populate_entry_trend(self, candles):
+        k = self._indicators.get("k", [])
+        d = self._indicators.get("d", [])
+        j = self._indicators.get("j", [])
+        if not k:
+            self.populate_indicators(candles)
+            k, d, j = self._indicators["k"], self._indicators["d"], self._indicators["j"]
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            if k[i] > d[i] and k[i - 1] <= d[i - 1] and j[i] < 20:
+                signals[i] = Signal.BUY
+        return signals
+
+    def populate_exit_trend(self, candles):
+        k = self._indicators.get("k", [])
+        d = self._indicators.get("d", [])
+        j = self._indicators.get("j", [])
+        if not k:
+            self.populate_indicators(candles)
+            k, d, j = self._indicators["k"], self._indicators["d"], self._indicators["j"]
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            if k[i] < d[i] and k[i - 1] >= d[i - 1] and j[i] > 80:
+                signals[i] = Signal.SELL
+        return signals
+
+
+# ============================================================
+# ATR 动态止损策略（均线趋势 + ATR 止损）
+# ============================================================
+
+class ATRStopStrategy(Strategy):
+    """
+    ATR 动态止损策略
+
+    规则：
+      - 价格站上 EMA 且 ATR 扩大（波动突破）→ 买入
+      - 价格跌破 EMA 或触发 ATR 止损 → 卖出
+      - 止损使用 2×ATR 动态计算
+
+    参数：
+      - ema_period: EMA 周期（默认 20）
+      - atr_period: ATR 周期（默认 14）
+      - atr_multiplier: ATR 止损倍数（默认 2.0）
+    """
+    def __init__(self, config=None, ema_period=20, atr_period=14, atr_multiplier=2.0):
+        super().__init__(config)
+        self.ema_period = ema_period
+        self.atr_period = atr_period
+        self.atr_multiplier = atr_multiplier
+
+    def populate_indicators(self, candles):
+        closes = [c["close"] for c in candles]
+        ema = self.EMA(closes, self.ema_period)
+        atr = compute_atr(candles, self.atr_period)
+        self._indicators = {"ema": ema, "atr": atr, "close": closes}
+        return self._indicators
+
+    def populate_entry_trend(self, candles):
+        ema = self._indicators.get("ema", [])
+        atr = self._indicators.get("atr", [])
+        closes = self._indicators.get("close", [])
+        if not ema:
+            self.populate_indicators(candles)
+            ema, atr, closes = self._indicators["ema"], self._indicators["atr"], self._indicators["close"]
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(2, len(candles)):
+            if ema[i] == 0 or ema[i - 1] == 0:
+                continue
+            price_cross_up = closes[i] > ema[i] and closes[i - 1] <= ema[i - 1]
+            atr_expanding = atr[i] > atr[i - 1]
+            if price_cross_up and atr_expanding:
+                signals[i] = Signal.BUY
+        return signals
+
+    def populate_exit_trend(self, candles):
+        ema = self._indicators.get("ema", [])
+        closes = self._indicators.get("close", [])
+        if not ema:
+            self.populate_indicators(candles)
+            ema, closes = self._indicators["ema"], self._indicators["close"]
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            if ema[i] == 0:
+                continue
+            if closes[i] < ema[i] and closes[i - 1] >= ema[i - 1]:
+                signals[i] = Signal.SELL
+        return signals
+
+
+# ============================================================
+# 策略注册表 — 新策略在此一行注册，自动接入回测和实盘
+# ============================================================
+
 STRATEGY_REGISTRY: Dict[str, type] = {
     "RSI": RSIStrategy,
     "SMA": SMAcrossStrategy,
     "MACD": MACDStrategy,
     "BOLLINGER": BollingerBandsStrategy,
+    "KDJ": KDJStrategy,
+    "ATRSTOP": ATRStopStrategy,
 }
 
 

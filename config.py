@@ -71,7 +71,7 @@ OPTIMAL_PARAMS = {
     "BTC/USDT": dict(rsi_period=10, oversold=18.0, overbought=65.0, stop_loss=0.040, take_profit=0.080),
     "ETH/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
     "SOL/USDT":  dict(rsi_period=10, oversold=20.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
-    "SUI/USDT":  dict(rsi_period=6,  oversold=22.0, overbought=70.0, stop_loss=0.040, take_profit=0.080),  # Grid Search 2026-05-03 Score=5.66 Ret=33.49% DD=25.63% WR=50.0%
+    "SUI/USDT":  dict(rsi_period=10, oversold=25.0, overbought=65.0, stop_loss=0.012, take_profit=0.025),  # Grid Search 2026-05-09 Score=5.30 Ret=10.54% DD=14.83% WR=43.5%
     # KYVE/USDT, PYTH/USDT: 无交易所历史数据（数据不足0条），暂沿用全局默认值 stop_loss=0.025 take_profit=0.050
 }
 
