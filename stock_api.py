@@ -56,10 +56,13 @@ def _parse_sina_cn_stock(fields: list, symbol: str) -> Optional[Dict]:
 
 
 def get_a_stock(symbol: str) -> Optional[Dict]:
-    """获取A股实时行情（新浪财经）"""
+    """获取A股实时行情（新浪财经），支持交易所指数如sh000001/sz399001"""
     try:
+        # 指数代码直接使用（已经是完整代码如sh000001/sz399001）
+        if symbol.startswith(("sh", "sz")):
+            sina_symbol = symbol
         # 判断交易所：6开头沪市（sh），0/3开头深市（sz）
-        if symbol.startswith("6"):
+        elif symbol.startswith("6"):
             sina_symbol = f"sh{symbol}"
         else:
             sina_symbol = f"sz{symbol}"
@@ -188,16 +191,22 @@ def get_us_stock(symbol: str) -> Optional[Dict]:
         return None
 
 def get_hk_stock(symbol: str) -> Optional[Dict]:
-    """获取港股实时行情（新浪财经）"""
+    """获取港股实时行情（新浪财经），支持HSI恒生指数"""
     try:
-        # 港股需要在代码前加0补齐5位: 00700
-        if len(symbol) == 4:
-            symbol = symbol.zfill(5)
-        elif len(symbol) == 3:
-            symbol = symbol.zfill(5)
+        # 恒生指数HSI使用特殊格式 hkHSI
+        if symbol.upper() == "HSI":
+            sina_symbol = "hkHSI"
+        elif symbol.isdigit():
+            # 港股需要在代码前加0补齐5位: 00700
+            if len(symbol) == 4:
+                symbol = symbol.zfill(5)
+            elif len(symbol) == 3:
+                symbol = symbol.zfill(5)
+            sina_symbol = f"hk{symbol}"
+        else:
+            # 如果是非数字代码（如指数代码），直接拼接
+            sina_symbol = f"hk{symbol}"
         
-        # 新浪港股格式: hk00700
-        sina_symbol = f"hk{symbol}"
         url = f"{SINA_BASE}/list={sina_symbol}"
         headers = {"Referer": "https://finance.sina.com.cn"}
         resp = requests.get(url, headers=headers, timeout=10)

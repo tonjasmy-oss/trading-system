@@ -76,6 +76,8 @@ class BacktestResult:
     stop_loss_pct:    float          # 止损比例配置
     take_profit_pct:  float          # 止盈比例配置
     capital_pct:      float          # 资金比例配置
+    commission_pct:   float          # 手续费率配置
+    slippage_pct:     float          # 滑点率配置
     equity_curve:     List[Tuple[int, float]]  # (timestamp, equity) 时间序列
     trades:           List[TradeRecord] = field(default_factory=list)
 
@@ -98,6 +100,8 @@ class BacktestEngine:
         self.strategy = strategy
         self.initial_capital = initial_capital
         self.config = strategy.get_config()
+        self.commission_pct = getattr(self.config, 'commission_pct', 0.001)
+        self.slippage_pct   = getattr(self.config, 'slippage_pct', 0.0005)
 
         # 运行状态
         self.candles: List[Dict] = []
@@ -214,7 +218,7 @@ class BacktestEngine:
             # ----- 检测入场信号 -----
             if not self.in_position and self.entry_signal[i] == Signal.BUY:
                 self.in_position = True
-                self.entry_price = close
+                self.entry_price = close * (1 + self.slippage_pct)
                 self.entry_time  = ts
                 self.stop_loss   = close * (1 - stop_loss_pct)
                 self.take_profit  = close * (1 + take_profit_pct)
@@ -253,11 +257,14 @@ class BacktestEngine:
             exit_reason  = reason,
         ))
 
-    @staticmethod
-    def _calc_equity(equity: float, capital_pct: float,
+    def _calc_equity(self, equity: float, capital_pct: float,
                      pnl_pct: float, stop_loss: bool = False) -> float:
-        """计算平仓后权益"""
-        return equity + equity * capital_pct * pnl_pct
+        """计算平仓后权益（含手续费）"""
+        trade_value = equity * capital_pct
+        gross_pl = trade_value * pnl_pct
+        # 双向手续费（开仓 + 平仓）
+        commission = trade_value * self.commission_pct * 2
+        return equity + gross_pl - commission
 
     def _build_result(self, final_equity: float) -> BacktestResult:
         """从交易记录计算绩效指标"""
@@ -323,6 +330,8 @@ class BacktestEngine:
             stop_loss_pct      = self.config.stop_loss * 100,
             take_profit_pct    = self.config.take_profit * 100,
             capital_pct        = self.config.capital_pct * 100,
+            commission_pct     = self.commission_pct * 100,
+            slippage_pct       = self.slippage_pct * 100,
             equity_curve       = self.equity_curve,
             trades             = trades,
         )
@@ -399,6 +408,8 @@ def generate_report(result: BacktestResult, output_dir: str = "backtest_results"
 | **止损比例** | {result.stop_loss_pct:.1f}% |
 | **止盈比例** | {result.take_profit_pct:.1f}% |
 | **下单资金比例** | {result.capital_pct:.1f}% |
+| **手续费率** | {result.commission_pct:.2f}% |
+| **滑点率** | {result.slippage_pct:.2f}% |
 
 ---
 
@@ -471,6 +482,8 @@ def parse_args():
     parser.add_argument("--rsi-oversold",   type=float, default=30.0,   help="RSI 超卖阈值（仅 RSIStrategy）")
     parser.add_argument("--rsi-overbought",  type=float, default=70.0,  help="RSI 超买阈值（仅 RSIStrategy）")
     parser.add_argument("--initial-capital",type=float, default=10000.0,help="初始资金（USDT）")
+    parser.add_argument("--commission",     type=float, default=0.1,  help="手续费率（%），默认 0.1")
+    parser.add_argument("--slippage",       type=float, default=0.05, help="滑点率（%），默认 0.05")
     parser.add_argument("--output-dir",     default="backtest_results", help="报告输出目录")
     parser.add_argument("--formula",       type=str, default=None,
                         help="通达信公式字符串（支持内置名如 KDJ/MACD/RSI/BOLL/WR/MA_CROSS）")
@@ -502,11 +515,13 @@ def main():
     if formula_src:
         # 通达信公式策略
         config = StrategyConfig(
-            symbol      = args.symbol,
-            timeframe   = args.timeframe,
-            capital_pct = args.capital_pct,
-            stop_loss   = args.stop_loss,
-            take_profit = args.take_profit,
+            symbol         = args.symbol,
+            timeframe      = args.timeframe,
+            capital_pct    = args.capital_pct,
+            stop_loss      = args.stop_loss,
+            take_profit    = args.take_profit,
+            commission_pct = args.commission / 100.0,
+            slippage_pct   = args.slippage / 100.0,
         )
         strategy = FormulaStrategy(
             formula    = formula_src,
@@ -519,11 +534,13 @@ def main():
     else:
         # 构建策略配置
         config = StrategyConfig(
-            symbol      = args.symbol,
-            timeframe   = args.timeframe,
-            capital_pct = args.capital_pct,
-            stop_loss   = args.stop_loss,
-            take_profit = args.take_profit,
+            symbol         = args.symbol,
+            timeframe      = args.timeframe,
+            capital_pct    = args.capital_pct,
+            stop_loss      = args.stop_loss,
+            take_profit    = args.take_profit,
+            commission_pct = args.commission / 100.0,
+            slippage_pct   = args.slippage / 100.0,
         )
         # 实例化内置策略
         if args.strategy == "SMAcrossStrategy":

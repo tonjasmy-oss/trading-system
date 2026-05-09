@@ -371,14 +371,21 @@ class MenxiaSheng:
         self._daily_trades += 1
         logger.info(f"[门下省] 开仓记录: {symbol} ${entry_price:.4f} × {quantity}")
 
-    def record_close(self, symbol: str, pnl_pct: float):
-        """记录平仓（尚书省执行完毕后回调，更新每日盈亏统计）"""
+    def record_close(self, symbol: str, pnl_pct: float, capital_fraction: float = 1.0):
+        """记录平仓（尚书省执行完毕后回调，更新每日盈亏统计）
+
+        Args:
+            symbol: 交易对
+            pnl_pct: 单笔交易盈亏百分比 (如 -3.5 表示亏损 3.5%)
+            capital_fraction: 该笔交易所用资金占总资金比例 (默认 1.0 = 全仓)
+        """
         self._check_day_reset()
         if symbol in self._positions:
             del self._positions[symbol]
         if pnl_pct < 0:
-            self._daily_loss += abs(pnl_pct) / 100.0
-        logger.info(f"[门下省] 平仓记录: {symbol} 盈亏{pnl_pct:+.2f}%")
+            self._daily_loss += abs(pnl_pct) / 100.0 * capital_fraction
+        logger.info(f"[门下省] 平仓记录: {symbol} 盈亏{pnl_pct:+.2f}% "
+                    f"资金比例{capital_fraction*100:.0f}% 累计日亏{self._daily_loss*100:.4f}%")
 
     def update_equity(self, equity: float):
         """更新当前 equity，自动调整风险等级（R7/R8）"""

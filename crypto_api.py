@@ -3,11 +3,50 @@
 支持 Binance / Gate.io / Bitget / OKX / Bybit / Kraken / Bitfinex 等主流交易所
 保留原有 Gate.io API 作为降级方案
 """
+import time
 import requests
 import logging
-from typing import Optional, Dict, List, TYPE_CHECKING
+from typing import Optional, Dict, List, TYPE_CHECKING, Callable
 from datetime import datetime
-from functools import lru_cache
+from functools import lru_cache, wraps
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# HTTP 重试装饰器（指数退避，最多 3 次）
+# ============================================================
+
+def retry_on_network_error(max_retries: int = 3, base_delay: float = 1.0):
+    """装饰器：对网络/超时错误自动重试，指数退避；耗尽后返回 None"""
+    def decorator(func: Callable):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except (requests.exceptions.Timeout,
+                        requests.exceptions.ConnectionError,
+                        requests.exceptions.HTTPError) as e:
+                    if attempt < max_retries:
+                        delay = base_delay * (2 ** attempt)
+                        logger.warning(
+                            f"[重试 {attempt+1}/{max_retries}] {func.__name__} "
+                            f"失败({type(e).__name__})，{delay:.1f}s后重试: {e}"
+                        )
+                        time.sleep(delay)
+                    else:
+                        logger.error(
+                            f"[重试耗尽] {func.__name__} 已重试{max_retries}次，返回 None: {e}"
+                        )
+                        return None
+                except Exception as e:
+                    # 非网络错误不重试
+                    logger.error(f"{func.__name__} 非网络错误: {e}")
+                    return None
+            return None
+        return wrapper
+    return decorator
 
 # ccxt 延迟导入（仅在需要时加载，ccxt 未安装时 get_crypto_price 等功能仍可用）
 try:
@@ -24,8 +63,6 @@ from config import (
     CRYPTO_API_SECRET,
     BITGET_API_PASSPHRASE,
 )
-
-logger = logging.getLogger(__name__)
 
 # ============================================================
 # 交易所实例管理（ccxt 统一适配）
@@ -162,6 +199,10 @@ def _gateio_api_tunnel(symbol: str) -> Optional[Dict]:
             "volume_24h": float(ticker.get("quote_volume", 0)),
             "timestamp": datetime.now().isoformat(),
         }
+    except requests.exceptions.Timeout:
+        raise
+    except requests.exceptions.ConnectionError:
+        raise
     except Exception as e:
         logger.error(f"隧道获取 {symbol} 失败: {e}")
         return None
@@ -290,6 +331,7 @@ _INTERVAL_MS = {
 }
 
 
+@retry_on_network_error(max_retries=3)
 def _gateio_get_ohlcv(
     symbol: str,
     timeframe: str = "1h",
@@ -350,8 +392,9 @@ def _gateio_get_ohlcv(
         return candles if candles else None
 
     except requests.exceptions.Timeout:
-        logger.warning(f"Gate.io OHLCV 请求超时: {symbol} {timeframe}")
-        return None
+        raise  # 让重试装饰器处理
+    except requests.exceptions.ConnectionError:
+        raise  # 让重试装饰器处理
     except Exception as e:
         logger.error(f"Gate.io OHLCV 获取失败: {symbol} {timeframe}: {e}")
         return None
@@ -437,6 +480,10 @@ def _gateio_fallback(symbol: str) -> Optional[Dict]:
             "volume_24h": float(ticker.get("quote_volume", 0)),
             "timestamp": datetime.now().isoformat(),
         }
+    except requests.exceptions.Timeout:
+        raise
+    except requests.exceptions.ConnectionError:
+        raise
     except Exception as e:
         logger.error(f"Gate.io 降级获取 {symbol} 失败: {e}")
         return None
@@ -540,6 +587,7 @@ def set_hyperliquid_wallet(address: str):
     logger.info(f"Hyperliquid 钱包地址已设置: {address[:6]}...{address[-4:]}")
 
 
+@retry_on_network_error(max_retries=2)
 def _hyperliquid_request(method: str, endpoint: str, params: dict = None) -> Optional[dict]:
     """Hyperliquid API 请求"""
     import requests
@@ -552,6 +600,10 @@ def _hyperliquid_request(method: str, endpoint: str, params: dict = None) -> Opt
             logger.error(f"Hyperliquid API Error: {data['error']}")
             return None
         return data.get("result")
+    except requests.exceptions.Timeout:
+        raise
+    except requests.exceptions.ConnectionError:
+        raise
     except Exception as e:
         logger.error(f"Hyperliquid 请求失败: {e}")
         return None

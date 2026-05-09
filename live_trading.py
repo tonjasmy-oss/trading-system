@@ -36,7 +36,7 @@ from config import (
     HYPERLIQUID_WALLET_ADDRESS,
     CRYPTO_EXCHANGE, CRYPTO_API_KEY, CRYPTO_API_SECRET,
     LIVE_TRADING_ENABLED, LIVE_EXCHANGE, LIVE_API_KEY, LIVE_API_SECRET,
-    LIVE_TESTNET, LIVE_ORDER_CAPITAL_PCT, LIVE_INITIAL_CAPITAL,
+    LIVE_TESTNET, LIVE_INITIAL_CAPITAL,
     RISK_MAX_DAILY_LOSS_PCT, RISK_MAX_DAILY_LOSS_LOCK,
     RISK_MAX_TOTAL_EXPOSURE, RISK_MAX_POSITION_PER_SYMBOL,
     RISK_MAX_DAILY_TRADES, RISK_MAX_HOLDING_HOURS,
@@ -51,8 +51,8 @@ from crypto_api import (
 )
 from strategies import (
     Signal, AISignalFilter, AIModel, MarketContext,
-    RSIStrategy, SMAcrossStrategy, StrategyConfig,
-    MACDStrategy, BollingerBandsStrategy,
+    StrategyConfig, build_strategy, STRATEGY_REGISTRY,
+    compute_rsi,
 )
 from multi_strategy_vote import MultiStrategyVote
 
@@ -172,43 +172,6 @@ def init_trading_db():
 
 
 # ============================================================
-# RSI 计算
-# ============================================================
-
-def compute_rsi(closes: List[float], period: int = 14) -> List[float]:
-    """计算RSI"""
-    if len(closes) < period + 1:
-        return [50.0] * len(closes)
-
-    deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0.0 for d in deltas]
-    losses = [-d if d < 0 else 0.0 for d in deltas]
-
-    result = [50.0] * (period + 1)
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-
-    if avg_loss == 0:
-        result.append(100.0)
-    else:
-        rs = avg_gain / avg_loss
-        result.append(100 - 100 / (1 + rs))
-
-    for i in range(period + 1, len(deltas) + 1):
-        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
-        if avg_loss == 0:
-            result.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            result.append(100 - 100 / (1 + rs))
-
-    while len(result) < len(closes):
-        result.insert(0, 50.0)
-    return result
-
-
-# ============================================================
 # 单个 Agent（Per-Symbol 独立引擎）
 # ============================================================
 
@@ -297,9 +260,6 @@ class TradingAgent:
         self._current_trade_id: Optional[int] = None
         self._current_regime: Dict = {}  # 当前市场状态（供 record_open 使用）
 
-        # 兼容旧 GlobalRiskManager（如果调用方仍传入则走旧路径）
-        self.risk_manager: Optional["GlobalRiskManager"] = None
-
         # 飞书主动推送开关（可配置）
         self._feishu_enabled = os.getenv("FEISHU_PUSH_ENABLED", "true").lower() == "true"
 
@@ -327,50 +287,38 @@ class TradingAgent:
                    f"尚书省:{'✓' if shangshu else '✗'}")
 
     def _build_strategy(self, strategy_type: str):
-        """根据策略类型构建策略实例"""
+        """根据策略类型构建策略实例（通过注册表）"""
         config = StrategyConfig(symbol=self.symbol, timeframe=self.timeframe)
-        if strategy_type == "RSI":
-            return RSIStrategy(
-                config=config,
-                rsi_period=self.rsi_period,
-                oversold=self.oversold,
-                overbought=self.overbought,
-            )
-        elif strategy_type == "SMA":
-            return SMAcrossStrategy(config=config, fast_period=10, slow_period=30)
-        elif strategy_type == "MACD":
-            return MACDStrategy(config=config)
-        elif strategy_type == "BOLLINGER":
-            return BollingerBandsStrategy(config=config, period=20, std_dev=2.0)
-        elif strategy_type == "VOTE":
-            # 多策略加权投票：RSI(40%) + MACD(30%) + Bollinger(30%)
-            rsi_strat = RSIStrategy(
-                config=config,
-                rsi_period=self.rsi_period,
-                oversold=self.oversold,
-                overbought=self.overbought,
-            )
-            macd_strat = MACDStrategy(config=config)
-            boll_strat = BollingerBandsStrategy(config=config, period=20, std_dev=2.0)
+
+        # 多策略投票
+        if strategy_type == "VOTE":
+            rsi_s = build_strategy("RSI", config, rsi_period=self.rsi_period,
+                                   oversold=self.oversold, overbought=self.overbought)
+            macd_s = build_strategy("MACD", config)
+            boll_s = build_strategy("BOLLINGER", config, period=20, std_dev=2.0)
             return MultiStrategyVote(
-                strategies=[(rsi_strat, 0.4), (macd_strat, 0.3), (boll_strat, 0.3)],
-                threshold=0.3,
-                name="RSI+MACD+BOLL",
+                strategies=[(rsi_s, 0.4), (macd_s, 0.3), (boll_s, 0.3)],
+                threshold=0.3, name="RSI+MACD+BOLL",
             )
-        elif strategy_type == "FORMULA":
-            # 内置公式或自定义
+
+        # 通达信公式
+        if strategy_type == "FORMULA":
             formula_str = self.formula or BUILTIN_FORMULAS.get('KDJ', BUILTIN_FORMULAS['MACD'])
-            return FormulaStrategy(
-                formula=formula_str,
-                symbol=self.symbol,
-                timeframe=self.timeframe,
-                stop_loss=self.stop_loss_pct,
-                take_profit=self.take_profit_pct,
-            )
-        else:
-            # 默认 RSI
-            return RSIStrategy(config=config, rsi_period=self.rsi_period,
-                               oversold=self.oversold, overbought=self.overbought)
+            return FormulaStrategy(formula=formula_str, symbol=self.symbol,
+                                   timeframe=self.timeframe,
+                                   stop_loss=self.stop_loss_pct,
+                                   take_profit=self.take_profit_pct)
+
+        # 内置策略（通过注册表）
+        strategy_kwargs = {}
+        if strategy_type == "RSI":
+            strategy_kwargs = {"rsi_period": self.rsi_period,
+                               "oversold": self.oversold,
+                               "overbought": self.overbought}
+        elif strategy_type == "BOLLINGER":
+            strategy_kwargs = {"period": 20, "std_dev": 2.0}
+
+        return build_strategy(strategy_type, config, **strategy_kwargs)
 
     # -------------------- 数据获取 --------------------
 
@@ -713,7 +661,7 @@ class TradingAgent:
         else:
             exec_price = price
 
-        self.capital = self.initial_capital * (1 + pnl_pct / 100)
+        self.capital = quantity * exec_price
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()

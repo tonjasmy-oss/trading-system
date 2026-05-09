@@ -32,11 +32,62 @@ class Signal:
 @dataclass
 class StrategyConfig:
     """策略通用配置"""
-    symbol:      str   = "BTC/USDT"   # 交易对
-    timeframe:   str   = "1h"         # K线周期
-    capital_pct: float = 1.0         # 每次下单资金占总资金比例（0~1）
-    stop_loss:   float = 0.05        # 止损比例（5%）
-    take_profit: float = 0.10        # 止盈比例（10%）
+    symbol:          str   = "BTC/USDT"   # 交易对
+    timeframe:       str   = "1h"         # K线周期
+    capital_pct:     float = 1.0          # 每次下单资金占总资金比例（0~1）
+    stop_loss:       float = 0.05         # 止损比例（5%）
+    take_profit:     float = 0.10         # 止盈比例（10%）
+    commission_pct:  float = 0.001        # 手续费率（默认 0.1% = 现货 taker fee）
+    slippage_pct:    float = 0.0005       # 滑点率（默认 0.05%）
+
+
+# ============================================================
+# 公共指标计算（模块级，供策略类和外部模块共享）
+# ============================================================
+
+def compute_rsi(prices: List[float], period: int = 14) -> List[float]:
+    """
+    计算相对强弱指数 RSI (Wilder's smoothing)
+
+    Args:
+        prices:  价格列表（收盘价）
+        period:  RSI 周期，默认 14
+
+    Returns:
+        与输入等长的列表，值域 0~100
+    """
+    if len(prices) < period + 1:
+        return [50.0] * len(prices)
+
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0.0 for d in deltas]
+    losses = [-d if d < 0 else 0.0 for d in deltas]
+
+    result = [50.0] * (period + 1)
+
+    # 初始平均涨跌幅
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    if avg_loss == 0:
+        result.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        result.append(100 - 100 / (1 + rs))
+
+    for i in range(period + 1, len(deltas) + 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
+        if avg_loss == 0:
+            result.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            result.append(100 - 100 / (1 + rs))
+
+    # 与 prices 等长
+    while len(result) < len(prices):
+        result.insert(0, 50.0)
+    return result
 
 
 # ============================================================
@@ -58,6 +109,7 @@ class Strategy(ABC):
     def __init__(self, config: Optional[StrategyConfig] = None):
         self.config = config or StrategyConfig()
         self._indicators: Dict[str, List[float]] = {}   # 缓存计算出的指标
+        self._validate_config()
 
     # -------------------- 抽象接口 --------------------
 
@@ -145,48 +197,27 @@ class Strategy(ABC):
         return result
 
     def RSI(self, prices: List[float], period: int = 14) -> List[float]:
-        """
-        计算相对强弱指数 RSI
+        """计算相对强弱指数 RSI（委托给模块级函数）"""
+        return compute_rsi(prices, period)
 
-        Args:
-            prices:  价格列表（收盘价）
-            period:  RSI 周期，默认 14
-
-        Returns:
-            与输入等长的列表，值域 0~100
-        """
-        if len(prices) < period + 1:
-            return [50.0] * len(prices)
-
-        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-        gains = [d if d > 0 else 0.0 for d in deltas]
-        losses = [-d if d < 0 else 0.0 for d in deltas]
-
-        result = [50.0] * (period + 1)
-
-        # 初始平均涨跌幅
-        avg_gain = sum(gains[:period]) / period
-        avg_loss = sum(losses[:period]) / period
-
-        if avg_loss == 0:
-            result.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            result.append(100 - 100 / (1 + rs))
-
-        for i in range(period + 1, len(deltas) + 1):
-            avg_gain = (avg_gain * (period - 1) + gains[i - 1]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[i - 1]) / period
-            if avg_loss == 0:
-                result.append(100.0)
-            else:
-                rs = avg_gain / avg_loss
-                result.append(100 - 100 / (1 + rs))
-
-        # 与 prices 等长
-        while len(result) < len(prices):
-            result.insert(0, 50.0)
-        return result
+    def _validate_config(self):
+        """校验参数合法性，防止颠倒的参数导致策略反向交易"""
+        c = self.config
+        if c.stop_loss <= 0:
+            raise ValueError(f"stop_loss 必须 > 0，当前值: {c.stop_loss}")
+        if c.take_profit <= 0:
+            raise ValueError(f"take_profit 必须 > 0，当前值: {c.take_profit}")
+        if c.stop_loss >= c.take_profit:
+            raise ValueError(
+                f"stop_loss({c.stop_loss}) 必须 < take_profit({c.take_profit})，"
+                f"否则盈亏比倒挂"
+            )
+        if not 0 < c.capital_pct <= 1.0:
+            raise ValueError(f"capital_pct 必须在 (0, 1] 范围内，当前值: {c.capital_pct}")
+        if c.commission_pct < 0:
+            raise ValueError(f"commission_pct 不能为负，当前值: {c.commission_pct}")
+        if c.slippage_pct < 0:
+            raise ValueError(f"slippage_pct 不能为负，当前值: {c.slippage_pct}")
 
     def get_config(self) -> StrategyConfig:
         """返回当前策略配置"""
@@ -790,6 +821,26 @@ class BollingerBandsStrategy(Strategy):
             if closes[i] >= upper[i] and closes[i-1] < upper[i-1]:
                 signals[i] = Signal.SELL
         return signals
+
+
+# ============================================================
+# 策略注册表 — 新策略在此一行注册，自动接入回测和实盘
+# ============================================================
+
+STRATEGY_REGISTRY: Dict[str, type] = {
+    "RSI": RSIStrategy,
+    "SMA": SMAcrossStrategy,
+    "MACD": MACDStrategy,
+    "BOLLINGER": BollingerBandsStrategy,
+}
+
+
+def build_strategy(name: str, config: StrategyConfig, **kwargs) -> Strategy:
+    """根据策略名称和配置构建策略实例"""
+    cls = STRATEGY_REGISTRY.get(name.upper())
+    if cls:
+        return cls(config=config, **kwargs)
+    raise ValueError(f"未知策略: {name}，可用: {list(STRATEGY_REGISTRY.keys())}")
 
 
 # ============================================================

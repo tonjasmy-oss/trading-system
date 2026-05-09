@@ -26,7 +26,7 @@ SYMBOL_MAP = {
     "ETH": "ETH/USDT",
     "BNB": "BNB/USDT",
     "SOL": "SOL/USDT",
-    "XRP": "ETH/USDT",  # 待确认
+    "XRP": "XRP/USDT",
     "ADA": "ADA/USDT",
     "DOGE": "DOGE/USDT",
     "DOT": "DOT/USDT",
@@ -445,7 +445,13 @@ def _normalize_symbol(symbol: str) -> str:
     s = symbol.upper()
     if "/" not in s:
         # 尝试从 SYMBOL_MAP 映射
-        return SYMBOL_MAP.get(s, f"{s}/USDT")
+        pair = SYMBOL_MAP.get(s)
+        if pair:
+            coin = pair.split("/")[0]
+            if coin != s:
+                raise ValueError(f"SYMBOL_MAP 映射异常: {s} → {pair} (期望 {s}/USDT)")
+            return pair
+        return f"{s}/USDT"
     return s
 
 
