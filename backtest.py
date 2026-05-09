@@ -482,8 +482,8 @@ def parse_args():
     parser.add_argument("--rsi-oversold",   type=float, default=30.0,   help="RSI 超卖阈值（仅 RSIStrategy）")
     parser.add_argument("--rsi-overbought",  type=float, default=70.0,  help="RSI 超买阈值（仅 RSIStrategy）")
     parser.add_argument("--initial-capital",type=float, default=10000.0,help="初始资金（USDT）")
-    parser.add_argument("--commission",     type=float, default=0.1,  help="手续费率（%），默认 0.1")
-    parser.add_argument("--slippage",       type=float, default=0.05, help="滑点率（%），默认 0.05")
+    parser.add_argument("--commission",     type=float, default=0.1,  help="手续费率(%%)，默认 0.1")
+    parser.add_argument("--slippage",       type=float, default=0.05, help="滑点率(%%)，默认 0.05")
     parser.add_argument("--output-dir",     default="backtest_results", help="报告输出目录")
     parser.add_argument("--formula",       type=str, default=None,
                         help="通达信公式字符串（支持内置名如 KDJ/MACD/RSI/BOLL/WR/MA_CROSS）")
