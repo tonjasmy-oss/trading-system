@@ -226,6 +226,31 @@ def get_cache_stats() -> Dict:
     return {"total_rows": total_rows, "pairs": details}
 
 
+def warmup_cache(symbols: List[str], timeframes: List[str] = None, limit: int = 500):
+    """启动时预热缓存：为常用标的预拉取 K线数据"""
+    if timeframes is None:
+        timeframes = ["4h", "1d"]
+    init_cache_db()
+    try:
+        import crypto_api
+    except ImportError:
+        logger.warning("crypto_api 不可用，跳过缓存预热")
+        return
+
+    for sym in symbols:
+        for tf in timeframes:
+            existing = get_ohlcv(sym, tf, limit=limit)
+            if len(existing) < 50:
+                logger.info(f"预热缓存: {sym} {tf}...")
+                try:
+                    candles = crypto_api.get_ohlcv(sym.split("/")[0], tf, limit=limit)
+                    if candles:
+                        save_ohlcv(sym, tf, candles)
+                        logger.info(f"预热完成: {sym} {tf} ({len(candles)} 条)")
+                except Exception as e:
+                    logger.warning(f"预热失败 {sym} {tf}: {e}")
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     init_cache_db()

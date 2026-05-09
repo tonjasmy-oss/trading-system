@@ -277,6 +277,16 @@ class TradingAgent:
             except Exception as e:
                 logger.warning(f"[{agent_id}] AI 过滤器初始化失败: {e}")
 
+        # 策略轮动器（strategy=AUTO 时使用）
+        self._rotator = None
+        if strategy == "AUTO":
+            try:
+                from components.strategy_rotator import StrategyRotator
+                self._rotator = StrategyRotator(symbol=symbol)
+                logger.info(f"[{agent_id}] 策略轮动器已启用")
+            except ImportError:
+                logger.warning(f"[{agent_id}] 策略轮动器不可用，回退到MACD")
+
         # 策略实例（支持通达信公式）
         self.strategy_obj = self._build_strategy(strategy)
 
@@ -289,6 +299,10 @@ class TradingAgent:
     def _build_strategy(self, strategy_type: str):
         """根据策略类型构建策略实例（通过注册表）"""
         config = StrategyConfig(symbol=self.symbol, timeframe=self.timeframe)
+
+        # 自动轮动模式：初始默认 MACD
+        if strategy_type == "AUTO":
+            return build_strategy("MACD", config)
 
         # 多策略投票
         if strategy_type == "VOTE":
@@ -798,6 +812,18 @@ class TradingAgent:
                     "confidence": regime_state.get("confidence", 0.0),
                 }
                 result["market_regime"] = regime_info
+
+                # ── 策略轮动：根据市场状态自动选择策略 ──
+                if self._rotator and regime_state:
+                    pick = self._rotator.pick(regime_state)
+                    new_strategy = pick["strategy"]
+                    if new_strategy != self.strategy_name:
+                        logger.info(f"[{self.agent_id}] 策略轮动: {self.strategy_name} → {new_strategy} "
+                                    f"({pick['reason']})")
+                        self.strategy_name = new_strategy
+                        self.strategy_obj = self._build_strategy(new_strategy)
+                        result["strategy"] = new_strategy
+                        result["rotation"] = pick
             except Exception as e:
                 logger.warning(f"[{self.agent_id}] MarketRegime 获取失败: {e}")
 

@@ -115,7 +115,7 @@ AGENT_CHECK_INTERVAL = int(os.getenv("AGENT_CHECK_INTERVAL", "60"))
 # 示例: ETH/USDT:RSI:binance,SOL/USDT:RSI:hyperliquid,SUI/USDT:SMA:binance
 AGENT_SYMBOLS = os.getenv(
     "AGENT_SYMBOLS",
-    "BTC/USDT:VOTE:binance,ETH/USDT:VOTE:binance,SOL/USDT:VOTE:binance,SUI/USDT:VOTE:binance,ARB/USDT:VOTE:binance,AVAX/USDT:VOTE:binance,OP/USDT:VOTE:binance,LINK/USDT:VOTE:binance"
+    "BTC/USDT:VOTE:binance,ETH/USDT:AUTO:binance,SOL/USDT:VOTE:binance,SUI/USDT:AUTO:binance,ARB/USDT:VOTE:binance,AVAX/USDT:VOTE:binance,OP/USDT:VOTE:binance,LINK/USDT:VOTE:binance"
 )
 
 # ============================================================

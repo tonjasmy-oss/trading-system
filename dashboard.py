@@ -742,7 +742,56 @@ async def list_backtest_strategies():
     return {
         "single": list(BUILTIN_FORMULAS.keys()),
         "multi": ["MultiVote"],
+        "registered": list(STRATEGY_REGISTRY.keys()) if "STRATEGY_REGISTRY" in dir() else [],
     }
+
+
+@app.get("/api/backtest/compare")
+async def compare_strategies(symbol: str = "ETH/USDT", timeframe: str = "4h",
+                             direction: str = "long"):
+    """运行全部6个策略对比回测并返回排行"""
+    try:
+        from backtest import BacktestEngine
+        from strategies import (RSIStrategy, SMAcrossStrategy, MACDStrategy,
+                                BollingerBandsStrategy, KDJStrategy, ATRStopStrategy,
+                                StrategyConfig)
+        from history_cache import get_ohlcv, init_cache_db
+        init_cache_db()
+
+        cfg = StrategyConfig(symbol=symbol, timeframe=timeframe,
+                            stop_loss=0.02, take_profit=0.04,
+                            trade_direction=direction)
+        strats = {
+            "RSI": RSIStrategy(cfg, rsi_period=14, oversold=28, overbought=65),
+            "SMA": SMAcrossStrategy(cfg),
+            "MACD": MACDStrategy(cfg),
+            "BOLLINGER": BollingerBandsStrategy(cfg),
+            "KDJ": KDJStrategy(cfg),
+            "ATRSTOP": ATRStopStrategy(cfg),
+        }
+        candles = get_ohlcv(symbol, timeframe, limit=5000)
+        if len(candles) < 100:
+            return {"error": f"数据不足（{len(candles)} 条）"}
+
+        rankings = []
+        for name, s in strats.items():
+            try:
+                engine = BacktestEngine(s, initial_capital=10000, trade_direction=direction)
+                engine.candles = candles
+                engine.compute_signals()
+                r = engine.run()
+                rankings.append({
+                    "strategy": name, "return": round(r.total_return_pct, 2),
+                    "sharpe": r.sharpe_ratio, "drawdown": round(r.max_drawdown_pct, 2),
+                    "win_rate": round(r.win_rate_pct, 1), "trades": r.total_trades,
+                })
+            except Exception as e:
+                rankings.append({"strategy": name, "error": str(e)})
+        rankings.sort(key=lambda x: x.get("return", -999), reverse=True)
+        return {"symbol": symbol, "timeframe": timeframe, "direction": direction,
+                "rankings": rankings}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ========== HTML Dashboard ==========
 

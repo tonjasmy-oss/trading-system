@@ -214,12 +214,14 @@ class BatchBacktester:
             f"overbought={GRID_OVERBOUGHT}, SL={sl_grid}, TP={tp_grid}"
         )
 
-        # 生成所有组合
+        # 生成所有组合，过滤 SL >= TP 的无效组合
         configs = []
         for rp, os_val, ob_val, sl, tp in itertools.product(
             GRID_RSI_PERIOD, GRID_OVERSOLD, GRID_OVERBOUGHT,
             sl_grid, tp_grid,
         ):
+            if sl >= tp:  # 止损必须小于止盈
+                continue
             configs.append(BacktestConfig(
                 symbol=symbol,
                 strategy=strategy,

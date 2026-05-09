@@ -505,6 +505,7 @@ def parse_args():
     parser.add_argument("--slippage",       type=float, default=0.05, help="滑点率(%%)，默认 0.05")
     parser.add_argument("--direction",      type=str, default="long",
                         choices=["long", "short", "both"], help="交易方向（默认 long）")
+    parser.add_argument("--compare",        action="store_true", help="对比全部策略并排行")
     parser.add_argument("--output-dir",     default="backtest_results", help="报告输出目录")
     parser.add_argument("--formula",       type=str, default=None,
                         help="通达信公式字符串（支持内置名如 KDJ/MACD/RSI/BOLL/WR/MA_CROSS）")
@@ -513,8 +514,92 @@ def parse_args():
     return parser.parse_args()
 
 
+def main_compare(args):
+    """对比全部6个策略并排行"""
+    from strategies import (
+        RSIStrategy, SMAcrossStrategy, MACDStrategy,
+        BollingerBandsStrategy, KDJStrategy, ATRStopStrategy,
+    )
+
+    config = StrategyConfig(
+        symbol=args.symbol, timeframe=args.timeframe,
+        capital_pct=args.capital_pct, stop_loss=args.stop_loss,
+        take_profit=args.take_profit,
+        commission_pct=args.commission / 100.0,
+        slippage_pct=args.slippage / 100.0,
+        trade_direction=args.direction,
+    )
+
+    strategies_map = {
+        "RSI":       RSIStrategy(config, rsi_period=args.rsi_period, oversold=args.rsi_oversold, overbought=args.rsi_overbought),
+        "SMA":       SMAcrossStrategy(config, fast_period=args.fast_period, slow_period=args.slow_period),
+        "MACD":      MACDStrategy(config),
+        "BOLLINGER": BollingerBandsStrategy(config, period=20, std_dev=2.0),
+        "KDJ":       KDJStrategy(config),
+        "ATRSTOP":   ATRStopStrategy(config, ema_period=20, atr_period=14, atr_multiplier=2.0),
+    }
+
+    init_cache_db()
+    candles = cache_get_ohlcv(args.symbol, args.timeframe, limit=5000)
+    if len(candles) < 100:
+        print(f"数据不足（{len(candles)} 条），跳过对比")
+        return
+
+    results = []
+    for name, strategy in strategies_map.items():
+        try:
+            engine = BacktestEngine(strategy, initial_capital=args.initial_capital,
+                                   trade_direction=args.direction)
+            engine.candles = candles
+            engine.compute_signals()
+            result = engine.run()
+            results.append((name, result))
+        except Exception as e:
+            logger.error(f"{name} 回测失败: {e}")
+
+    results.sort(key=lambda x: x[1].total_return_pct, reverse=True)
+
+    print("\n" + "=" * 85)
+    print(f"  策略对比回测  {args.symbol} {args.timeframe} ({args.direction})")
+    print("=" * 85)
+    print(f"{'排名':<4} {'策略':<12} {'收益率':>8} {'夏普':>6} {'回撤':>8} {'胜率':>6} {'交易':>5}")
+    print("-" * 85)
+
+    best_strategy = ""
+    for rank, (name, r) in enumerate(results, 1):
+        if rank == 1:
+            best_strategy = name
+        print(f"{rank:<4} {name:<12} {r.total_return_pct:>+7.2f}% {r.sharpe_ratio:>6.2f} "
+              f"{r.max_drawdown_pct:>7.2f}% {r.win_rate_pct:>5.1f}% {r.total_trades:>5d}")
+
+    print("=" * 85)
+    print(f"\n✅ 最优策略: {best_strategy}")
+
+    # 保存对比报告
+    report = {
+        "symbol": args.symbol, "timeframe": args.timeframe,
+        "direction": args.direction,
+        "rankings": [
+            {"rank": i+1, "strategy": name,
+             "return": r.total_return_pct, "sharpe": r.sharpe_ratio,
+             "drawdown": r.max_drawdown_pct, "win_rate": r.win_rate_pct,
+             "trades": r.total_trades}
+            for i, (name, r) in enumerate(results)
+        ],
+    }
+    os.makedirs(args.output_dir, exist_ok=True)
+    safe_name = args.symbol.replace("/", "_")
+    path = f"{args.output_dir}/compare_{safe_name}_{args.timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(path, "w") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+    print(f"📄 对比报告: {path}")
+
+
 def main():
     args = parse_args()
+
+    if args.compare:
+        return main_compare(args)
 
     # 实例化策略
     strategy: Strategy
