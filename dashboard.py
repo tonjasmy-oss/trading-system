@@ -857,6 +857,34 @@ async def get_equity_curve(agent_id: str = None, limit: int = 100):
         return {"error": str(e)}
 
 
+# ================================================================
+# 在线参数优化 API
+# ================================================================
+
+@app.get("/api/optimizer/history")
+async def get_optimizer_history(symbol: str = None, limit: int = 30):
+    """查询参数优化变更历史"""
+    try:
+        import sqlite3
+        db = "live_trading.db"
+        conn = sqlite3.connect(db)
+        params = []
+        sql = "SELECT symbol, param_name, old_value, new_value, reason, trade_count, win_rate, created_at FROM param_history"
+        if symbol:
+            sql += " WHERE symbol = ?"
+            params.append(symbol)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [
+            {"symbol": r[0], "param": r[1], "old": r[2], "new": r[3],
+             "reason": r[4], "trades": r[5], "win_rate": r[6], "time": r[7]}
+            for r in rows
+        ]
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/api/backtest/compare")
 async def compare_strategies(symbol: str = "ETH/USDT", timeframe: str = "4h",
                              direction: str = "long"):

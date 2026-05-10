@@ -16,7 +16,7 @@
 │   仓位/频率/EMA过滤/成交量/涨跌停/连错上限  8条规则一票否决       │
 ├──────────────────────────────────────────────────────────────┤
 │                    尚书省 · 执行调度层                         │
-│   Binance / Gate.io / OKX / Bybit / Hyperliquid / Alpaca / Tiger │
+│   Binance / Gate.io / Weex / OKX / Bybit / Hyperliquid / Alpaca / Tiger │
 ├──────────────────────────────────────────────────────────────┤
 │  刑部 · 违规记录（SQLite）   户部 · 权益曲线   仓部 · 持仓管理   │
 └──────────────────────────────────────────────────────────────┘
@@ -28,7 +28,7 @@
 
 | 功能 | 说明 |
 |------|------|
-| **多交易所** | Binance / Gate.io / OKX / Bybit / Hyperliquid / Alpaca / Tiger |
+| **多交易所** | Binance / Gate.io / Weex / OKX / Bybit / Hyperliquid / Alpaca / Tiger |
 | **加密货币策略** | RSI / MACD / Bollinger Bands / VOTE 多策略投票 / 自定义公式 |
 | **股票策略** | A股均线交叉 + RSI / 港股 / 美股 |
 | **通达信公式** | TDX 公式字符串 → Python 可执行函数（Lexing / Parsing / Evaluation） |
@@ -41,6 +41,10 @@
 | **Agent Gateway** | Agent Token 鉴权，敏感操作受保护 |
 | **市场状态识别** | 趋势 / 震荡 / 高波动 多状态切换策略权重 |
 | **Reflection Agent** | 交易审计报告，自动分析亏损原因 |
+| **在线参数优化** | 每笔平仓后评估表现，自动微调 RSI/止损/止盈（24h冷却） |
+| **策略轮动** | 根据市场状态（趋势/波动）自动切换最优策略 |
+| **多周期确认** | 1h/4h/1d 信号一致性验证，不一致则否决 |
+| **Weex v3 API** | 独立 REST API 适配器（HMAC-SHA256 Base64 签名） |
 
 ---
 
@@ -62,6 +66,11 @@ trading-system/
 │   ├── signal_router.py          # 信号路由（分发到对应交易所适配器）
 │   ├── market_regime.py          # 市场状态识别（趋势/震荡/高波动，383行）
 │   ├── auditor.py                # Reflection Agent 审计（433行）
+│   ├── online_optimizer.py       # 在线参数自动优化（363行）
+│   ├── strategy_rotator.py       # 市场状态感知策略轮动
+│   ├── mtf_confirmer.py          # 多周期信号确认
+│   ├── correlation_guard.py      # 相关性风控
+│   ├── position_sizer.py         # 动态仓位计算
 │   └── __init__.py
 │
 ├── agent_gateway/                 # Agent Gateway（Token 鉴权）
@@ -98,7 +107,7 @@ trading-system/
 ├── tdx_compiler.py                  # 通达信公式编译器（Lexing/Parsing/Evaluation）
 ├── test_tdx_compiler.py             # TDX 编译器单元测试
 ├── history_cache.py                 # 历史数据缓存管理
-├── weex.py                          # Weex 交易接口封装
+├── weex.py                          # Weex v3 API 适配器（独立 REST，HMAC-SHA256）
 ├── database.py                      # SQLite 数据库（公共模块）
 │
 ├── trading_system.db               # 主数据库（成交记录 + 违规记录）
@@ -282,6 +291,7 @@ Dashboard 为单页应用（1919行），集成以下功能模块：
 | Hyperliquid | ✅ | |
 | Kraken | ✅ | |
 | Bitfinex | ✅ | |
+| **Weex** | ✅ v3 | 独立 REST API 适配器，HMAC-SHA256 Base64 |
 
 ### 股票
 

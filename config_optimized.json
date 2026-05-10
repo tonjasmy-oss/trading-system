@@ -59,53 +59,20 @@
   ],
   "updated_at": "2026-05-09",
   "vote_params": {
-    "_note": "多策略投票 Grid Search 结论 (2026-05-09)",
-    "summary": "遍历 5868 权重组合 x 阈值 x SL/TP 后，ETH 和 BTC 上多策略投票均未超越纯 RSI 策略",
-    "recommendation": "实盘优先使用单策略 RSI(已优化参数)；投票策略保留作为市场风格切换时的风控兜底",
-    "live_vote_config": {
-      "strategies": {
-        "RSI": 0.4,
-        "MACD": 0.3,
-        "BOLL": 0.3
-      },
-      "threshold": 0.3,
-      "note": "高阈值下投票=纯RSI（噪音策略被过滤），低阈值引入亏损交易，无意义"
+    "symbol": "ETH/USDT",
+    "strategies": {
+      "RSI": 0.4,
+      "MACD": 0.3,
+      "ATR": 0.3
     },
-    "eth_usdt_backtest": {
-      "vote_5868_combos": "全部组合最佳为默认权重(=纯RSI)，Score=15.15",
-      "rsi_alone": {
-        "return_pct": 22.2,
-        "sharpe": 1.88,
-        "dd_pct": 3.86,
-        "wr_pct": 66.7,
-        "trades": 9
-      },
-      "vote_default": {
-        "return_pct": 22.2,
-        "sharpe": 1.88,
-        "dd_pct": 3.86,
-        "wr_pct": 66.7,
-        "trades": 9
-      },
-      "verdict": "投票无用 — RSI 信号强度(+22.2%)远超 MACD(-13.5%)和 BOLL(-15.0%)，阈值 0.3 天然过滤弱势策略"
-    },
-    "btc_usdt_backtest": {
-      "rsi_alone": {
-        "return_pct": 18.36,
-        "sharpe": 1.66,
-        "dd_pct": 5.27,
-        "wr_pct": 83.3,
-        "trades": 6
-      },
-      "vote_default": {
-        "return_pct": 18.36,
-        "sharpe": 1.66,
-        "dd_pct": 5.27,
-        "wr_pct": 83.3,
-        "trades": 6
-      },
-      "verdict": "同 ETH — BOLL(+4.8%)和 KDJ(+4.1%)虽有正收益，但与 RSI 相关度过低，投票稀释无效"
-    },
-    "updated_at": "2026-05-09T14:40:00+00:00"
+    "threshold": 0.35,
+    "stop_loss": 0.02,
+    "take_profit": 0.04,
+    "total_return_pct": 42.0,
+    "sharpe_ratio": 2.69,
+    "max_drawdown_pct": 3.86,
+    "win_rate_pct": 66.67,
+    "score": 17.45,
+    "updated_at": "2026-05-10T09:40:59.643485+00:00"
   }
 }

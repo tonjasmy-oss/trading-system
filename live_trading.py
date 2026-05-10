@@ -37,6 +37,7 @@ from config import (
     CRYPTO_EXCHANGE, CRYPTO_API_KEY, CRYPTO_API_SECRET,
     LIVE_TRADING_ENABLED, LIVE_EXCHANGE, LIVE_API_KEY, LIVE_API_SECRET,
     LIVE_TESTNET, LIVE_INITIAL_CAPITAL,
+    WEEX_API_PASSPHRASE,
     RISK_MAX_DAILY_LOSS_PCT, RISK_MAX_DAILY_LOSS_LOCK,
     RISK_MAX_TOTAL_EXPOSURE, RISK_MAX_POSITION_PER_SYMBOL,
     RISK_MAX_DAILY_TRADES, RISK_MAX_HOLDING_HOURS,
@@ -105,6 +106,14 @@ try:
 except ImportError:
     MultiTimeframeConfirmer = None
     _MTF_AVAILABLE = False
+
+# 在线参数优化
+try:
+    from components.online_optimizer import OnlineParameterOptimizer
+    _OPTIMIZER_AVAILABLE = True
+except ImportError:
+    OnlineParameterOptimizer = None
+    _OPTIMIZER_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +308,24 @@ class TradingAgent:
         self._mtf_confirmer = None
         if _MTF_AVAILABLE:
             self._mtf_confirmer = MultiTimeframeConfirmer(symbol=symbol)
+
+        # 在线参数优化器
+        self._optimizer: Optional[OnlineParameterOptimizer] = None
+        if _OPTIMIZER_AVAILABLE:
+            anchor = OPTIMAL_PARAMS.get(symbol, {})
+            self._optimizer = OnlineParameterOptimizer(
+                symbol=symbol,
+                db_path=DB_PATH,
+                anchor_params=anchor,
+            )
+            self._optimizer.set_current_params({
+                "rsi_period": rsi_period,
+                "oversold": oversold,
+                "overbought": overbought,
+                "stop_loss": stop_loss_pct,
+                "take_profit": take_profit_pct,
+            })
+            logger.info(f"[{agent_id}] 在线参数优化器已启用")
 
         # 策略实例（支持通达信公式）
         self.strategy_obj = self._build_strategy(strategy)
@@ -741,6 +768,35 @@ class TradingAgent:
         )
 
         self.position = None
+
+        # ── 在线参数优化：每次平仓后评估是否需要调参 ──
+        if self._optimizer:
+            try:
+                opt_result = self._optimizer.maybe_adjust(self.symbol)
+                if opt_result.get("adjusted"):
+                    for change in opt_result["changes"]:
+                        pname = change["param"]
+                        pnew = change["new"]
+                        if pname == "oversold":
+                            self.oversold = pnew
+                        elif pname == "overbought":
+                            self.overbought = pnew
+                        elif pname == "stop_loss":
+                            self.stop_loss_pct = pnew
+                        elif pname == "take_profit":
+                            self.take_profit_pct = pnew
+                        elif pname == "rsi_period":
+                            self.rsi_period = int(pnew)
+                    # 重建策略以应用新参数
+                    self.strategy_obj = self._build_strategy(self.strategy_name)
+                    logger.info(
+                        f"[{self.agent_id}] 参数已自动优化: "
+                        f"OS={self.oversold} OB={self.overbought} "
+                        f"SL={self.stop_loss_pct:.3f} TP={self.take_profit_pct:.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"[{self.agent_id}] 在线优化异常: {e}")
+
         return True
 
     async def _check_position_risk(self, price: float, timestamp: int, rsi: float) -> bool:
@@ -1128,13 +1184,16 @@ class MultiAgentOrchestrator:
         self.shangshu: Optional[ShangshuSheng] = None
         if _SHANGSHU_AVAILABLE and live_trading:
             try:
-                self.shangshu = ShangshuSheng(
-                    exchange=LIVE_EXCHANGE,
-                    api_key=LIVE_API_KEY,
-                    api_secret=LIVE_API_SECRET,
-                    testnet=LIVE_TESTNET,
-                    db_path=DB_PATH,
-                )
+                shangshu_kwargs = {
+                    "exchange": LIVE_EXCHANGE,
+                    "api_key": LIVE_API_KEY,
+                    "api_secret": LIVE_API_SECRET,
+                    "testnet": LIVE_TESTNET,
+                    "db_path": DB_PATH,
+                }
+                if LIVE_EXCHANGE == "weex":
+                    shangshu_kwargs["api_passphrase"] = WEEX_API_PASSPHRASE
+                self.shangshu = ShangshuSheng(**shangshu_kwargs)
                 mode = "测试网" if LIVE_TESTNET else "实盘"
                 logger.info(f"[尚书省] 初始化: {LIVE_EXCHANGE} ({mode})")
             except Exception as e:

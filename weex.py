@@ -169,7 +169,9 @@ def _sign_v3(
         dict: HTTP headers
     """
     timestamp = str(int(time.time() * 1000))
-    payload_str = timestamp + method.upper() + '/' + endpoint
+    # endpoint 去掉前导斜杠，避免签名出现双斜线 //api/v3/...
+    clean_endpoint = endpoint.lstrip('/')
+    payload_str = timestamp + method.upper() + '/' + clean_endpoint
 
     body_json = ""
     if params and method.upper() in ("POST", "DELETE"):

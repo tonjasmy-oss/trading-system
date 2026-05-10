@@ -130,8 +130,8 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 # 实盘交易所：binance / gateio / bybit / bitget / hyperliquid / weex
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "binance")
 # 实盘 API Key（建议使用只读+交易权限的 Trade-only Key）
-LIVE_API_KEY = os.getenv("LIVE_API_KEY", "")
-LIVE_API_SECRET = os.getenv("LIVE_API_SECRET", "")
+LIVE_API_KEY = os.getenv("LIVE_API_KEY", "") or os.getenv("WEEX_API_KEY", "")
+LIVE_API_SECRET = os.getenv("LIVE_API_SECRET", "") or os.getenv("WEEX_API_SECRET", "")
 # 测试网模式（不消耗真实资金）
 LIVE_TESTNET = os.getenv("LIVE_TESTNET", "true").lower() == "true"
 # 单笔下单金额占比（每次开仓使用资金的 %）
