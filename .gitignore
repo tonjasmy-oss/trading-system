@@ -28,6 +28,7 @@ trading_system.db
 *.log
 logs/
 nohup.out
+nohup_*.out
 
 # IDE
 .vscode/
@@ -44,6 +45,8 @@ Thumbs.db
 *password*
 *.pem
 *.key
+.agent_token
+.dashboard.pid
 
 # Results (keep structure, ignore large outputs)
 /backtest_results/

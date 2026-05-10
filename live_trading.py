@@ -98,6 +98,14 @@ except ImportError:
     MarketRegime = None
     _MARKET_REGIME_AVAILABLE = False
 
+# 多周期信号确认（MTF Confirmer）
+try:
+    from components.mtf_confirmer import MultiTimeframeConfirmer
+    _MTF_AVAILABLE = True
+except ImportError:
+    MultiTimeframeConfirmer = None
+    _MTF_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # 飞书主动推送
@@ -286,6 +294,11 @@ class TradingAgent:
                 logger.info(f"[{agent_id}] 策略轮动器已启用")
             except ImportError:
                 logger.warning(f"[{agent_id}] 策略轮动器不可用，回退到MACD")
+
+        # 多周期信号确认器
+        self._mtf_confirmer = None
+        if _MTF_AVAILABLE:
+            self._mtf_confirmer = MultiTimeframeConfirmer(symbol=symbol)
 
         # 策略实例（支持通达信公式）
         self.strategy_obj = self._build_strategy(strategy)
@@ -868,6 +881,17 @@ class TradingAgent:
         signal_val, _, _ = self._detect_signals(candles)
         signal_names = {Signal.BUY: "BUY", Signal.SELL: "SELL", Signal.HOLD: "HOLD"}
         result["signal"] = signal_names.get(signal_val, "HOLD")
+
+        # ── 多周期信号确认 ──
+        mtf_result = {}
+        if self._mtf_confirmer and signal_val != Signal.HOLD:
+            mtf_result = self._mtf_confirmer.confirm(signal_val, self.timeframe, candles)
+            if not mtf_result.get("confirmed", True):
+                signal_val = Signal.HOLD  # 多周期否决
+                result["signal"] = f"HOLD（MTF否决: {mtf_result.get('reason','')}）"
+                result["mtf"] = mtf_result
+            else:
+                result["mtf"] = mtf_result
 
         # AI 过滤（仅对 BUY/SELL 有效）
         ai_verdict = ""

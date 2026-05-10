@@ -70,6 +70,13 @@ EXCHANGE_CONFIGS = {
         "rate_limit": 500,
         "min_order_value": 0,
     },
+    "weex": {
+        "id": "weex",
+        "name": "Weex",
+        "spot_markets": "https://api-spot.weex.com/api/v3/market/ticker/24hr",
+        "rate_limit": 500,
+        "min_order_value": 1,
+    },
 }
 
 # ccxt symbol format -> exchange-specific format
@@ -78,6 +85,7 @@ _SYMBOL_FORMAT = {
     "gateio":    lambda s: s.replace("/", "_"),   # ETH_USDT
     "bybit":     lambda s: s.replace("/", ""),    # ETHUSDT
     "hyperliquid": lambda s: s.split("/")[0],     # ETH (perpetual)
+    "weex":      lambda s: s,           # BTC/USDT 格式
 }
 
 
@@ -461,6 +469,106 @@ class HyperliquidAdapter(ExchangeAdapter):
             return None
 
 
+class WeexAdapter(ExchangeAdapter):
+    """Weex 交易所适配器（独立 REST API，非 ccxt）"""
+
+    def __init__(self, api_key: str = "", api_secret: str = "",
+                 api_passphrase: str = "", testnet: bool = False):
+        super().__init__("weex", api_key, api_secret, testnet)
+        self.api_passphrase = api_passphrase
+
+    def _get_exchange(self):
+        """Weex 不使用 ccxt，直接返回自身占位"""
+        return self
+
+    async def place_order(self, symbol: str, side: str, order_type: str,
+                         quantity: float, price: Optional[float] = None,
+                         params: Optional[Dict] = None) -> ExecutionResult:
+        from weex import create_order as weex_create_order
+
+        def _do():
+            return weex_create_order(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+                api_passphrase=self.api_passphrase,
+                symbol=symbol,
+                side=side.lower(),
+                order_type=order_type.lower(),
+                amount=quantity,
+                price=price,
+            )
+
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, _do)
+            if result and result.get("id"):
+                return ExecutionResult(
+                    success=True,
+                    order_id=result["id"],
+                    symbol=symbol,
+                    side=side,
+                    quantity=quantity,
+                    exec_price=float(result.get("price", price or 0)),
+                    exec_type=order_type.lower(),
+                    commission=0.0,
+                    message="成功",
+                    raw_response=result,
+                )
+            else:
+                return ExecutionResult(False, "", symbol, side, quantity, 0,
+                                      order_type.lower(), 0, "Weex API 返回空")
+        except Exception as e:
+            logger.error(f"[尚书省] Weex 下单失败: {e}")
+            return ExecutionResult(False, "", symbol, side, quantity, 0,
+                                  order_type.lower(), 0, str(e))
+
+    async def cancel_order(self, order_id: str, symbol: str) -> bool:
+        from weex import cancel_order as weex_cancel
+
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: weex_cancel(self.api_key, self.api_secret, self.api_passphrase, order_id, symbol)
+            )
+        except Exception as e:
+            logger.error(f"[尚书省] Weex 取消订单失败: {e}")
+            return False
+
+    async def get_balance(self, asset: str = "USDT") -> float:
+        from weex import fetch_balance as weex_balance
+
+        try:
+            bal = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: weex_balance(self.api_key, self.api_secret, self.api_passphrase)
+            )
+            if bal and "balances" in bal:
+                for b in bal["balances"]:
+                    if b.get("asset") == asset:
+                        return float(b.get("free", 0))
+            return 0.0
+        except Exception as e:
+            logger.error(f"[尚书省] Weex 查询余额失败: {e}")
+            return 0.0
+
+    async def get_position(self, symbol: str) -> Optional[PositionInfo]:
+        return None  # 现货
+
+    async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
+        from weex import fetch_open_orders
+
+        try:
+            orders = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: fetch_open_orders(self.api_key, self.api_secret, self.api_passphrase, symbol)
+            )
+            for o in orders:
+                if o.get("id") == order_id:
+                    return o
+            return None
+        except Exception:
+            return None
+
+
 # ============================================================
 # 尚书省主调度器
 # ============================================================
@@ -469,6 +577,7 @@ _ADAPTERS = {
     "binance":    BinanceAdapter,
     "gateio":     GateioAdapter,
     "hyperliquid": HyperliquidAdapter,
+    "weex":       WeexAdapter,
 }
 
 
@@ -490,6 +599,7 @@ class ShangshuSheng:
 
     def __init__(self, exchange: str = "binance",
                  api_key: str = "", api_secret: str = "",
+                 api_passphrase: str = "",
                  testnet: bool = True,
                  db_path: str = "trading_system.db"):
         if exchange not in _ADAPTERS:
@@ -500,9 +610,13 @@ class ShangshuSheng:
         self.db_path = db_path
         self._api_key = api_key
         self._api_secret = api_secret
+        self._api_passphrase = api_passphrase
 
         adapter_cls = _ADAPTERS[exchange]
-        self._adapter = adapter_cls(api_key, api_secret, testnet)
+        if exchange == "weex":
+            self._adapter = adapter_cls(api_key, api_secret, api_passphrase, testnet)
+        else:
+            self._adapter = adapter_cls(api_key, api_secret, testnet)
 
         self._init_db()
         logger.info(f"[尚书省] 初始化: {exchange} "

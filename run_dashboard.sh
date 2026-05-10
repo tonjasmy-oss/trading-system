@@ -101,11 +101,15 @@ echo "  交易所: $CRYPTO_EXCHANGE"
 echo "  监听: $HOST:$PORT"
 
 # 启动（nohup 方式，由启动它的 shell 管理生命周期）
+LOG_FILE="nohup_$(date +%Y%m%d).out"
 python3 -m uvicorn dashboard:app \
     --host "$HOST" \
     --port "$PORT" \
     --reload \
-    > nohup.out 2>&1 &
+    > "$LOG_FILE" 2>&1 &
+
+# 清理 7 天前的旧日志
+find "$SCRIPT_DIR" -name "nohup_*.out" -mtime +7 -delete 2>/dev/null || true
 
 NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
@@ -120,5 +124,5 @@ sleep 3
 if curl -sf "http://localhost:$PORT/api/system/status" > /dev/null 2>&1; then
     echo "✅ Dashboard 就绪: http://localhost:$PORT"
 else
-    echo "⚠️  Dashboard 可能仍在启动，查看日志: tail -f nohup.out"
+    echo "⚠️  Dashboard 可能仍在启动，查看日志: tail -f $LOG_FILE"
 fi

@@ -751,14 +751,84 @@ def main_stock():
     print(f"\n📄 完整报告: {report_path}")
 
 
+# ============================================================
+# 压力测试
+# ============================================================
+
+def monte_carlo(result: BacktestResult, simulations: int = 1000) -> dict:
+    import random
+    if not result.trades:
+        return {"error": "无交易数据"}
+    pnls = [t.pnl_pct for t in result.trades]
+    sim_returns = []
+    for _ in range(simulations):
+        random.shuffle(pnls)
+        sim_returns.append(sum(pnls))
+    sim_returns.sort()
+    return {
+        "simulations": simulations,
+        "original": round(sum(pnls), 2),
+        "mean": round(sum(sim_returns)/simulations, 2),
+        "p5": round(sim_returns[int(simulations*0.05)], 2),
+        "p95": round(sim_returns[int(simulations*0.95)], 2),
+        "worst": round(sim_returns[0], 2),
+        "positive_prob": round(sum(1 for r in sim_returns if r>0)/simulations*100,1),
+    }
+
+
+def walk_forward(symbol: str, timeframe: str, strategy: Strategy,
+                 train_months: int = 3, test_months: int = 1,
+                 initial_capital: float = 10000) -> dict:
+    init_cache_db()
+    all_candles = cache_get_ohlcv(symbol, timeframe, limit=5000)
+    if len(all_candles) < 200:
+        return {"error": "数据不足"}
+    months_map = {}
+    for c in all_candles:
+        mk = datetime.fromtimestamp(c["timestamp"]/1000).strftime("%Y-%m")
+        months_map.setdefault(mk, []).append(c)
+    months = sorted(months_map.keys())
+    total = train_months + test_months
+    if len(months) < total:
+        return {"error": f"月份不足({len(months)}<{total})"}
+
+    results = []
+    w = 0
+    while w * test_months + train_months + test_months <= len(months):
+        test_start = w * test_months + train_months
+        test_end = test_start + test_months
+        test_candles = []
+        for m in months[test_start:test_end]:
+            test_candles.extend(months_map.get(m, []))
+        if len(test_candles) < 10:
+            w += 1; continue
+        engine = BacktestEngine(strategy, initial_capital=initial_capital)
+        engine.candles = test_candles
+        engine.compute_signals()
+        r = engine.run()
+        results.append({
+            "window": w+1, "period": f"{months[test_start]}~{months[test_end-1]}",
+            "return": round(r.total_return_pct,2), "sharpe": r.sharpe_ratio,
+            "drawdown": round(r.max_drawdown_pct,2), "trades": r.total_trades,
+        })
+        w += 1
+
+    returns = [r["return"] for r in results]
+    return {
+        "windows": results,
+        "avg_return": round(sum(returns)/len(returns),2) if returns else 0,
+        "positive": sum(1 for r in returns if r>0),
+        "negative": sum(1 for r in returns if r<=0),
+        "total": len(returns),
+    }
+
+
 if __name__ == "__main__":
-    # 根据参数判断是加密货币还是股票回测
     import sys
     if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
         main()
     elif len(sys.argv) > 1 and ("SH" in sys.argv[1] or "SZ" in sys.argv[1] or
                                "HK" in sys.argv[1] or sys.argv[1] in ("--codes",)):
-        # 股票模式
         sys.argv[0] = sys.argv[0].replace("backtest.py", "stock_backtest.py")
         main_stock()
     else:

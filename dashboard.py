@@ -35,7 +35,68 @@ portfolio = Portfolio()
 
 # 全局监控状态
 _monitor_status = {"status": "stopped", "message": "未启动"}
-_start_time = None
+_start_time = time.time()  # 模块导入时初始化，FastAPI startup 事件中覆盖
+
+
+@app.on_event("startup")
+async def _on_startup():
+    """FastAPI 启动事件：记录启动时间 + 启动后台行情监控"""
+    global _start_time
+    _start_time = time.time()
+    print(f"[Dashboard] 启动完成 @ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(_start_time))}")
+
+    # 启动后台行情监控（独立线程）
+    import threading
+    from database import init_db
+    from monitor import PriceMonitor
+    from feishu_alert import feishu_alert as _fa
+
+    def _monitor_worker():
+        init_db()
+        mon = PriceMonitor(check_interval=30)
+        symbols = [
+            {"symbol": "BTC", "market": "CRYPTO"},
+            {"symbol": "ETH", "market": "CRYPTO"},
+        ]
+        update_monitor_status("running", f"监控 {len(symbols)} 个品种")
+
+        def _on_alert(data):
+            try:
+                _fa.send_alert(
+                    symbol=data.get("symbol"),
+                    market=data.get("market"),
+                    alert_type=data.get("alert_type", "价格波动"),
+                    price=data.get("price", 0),
+                    threshold=data.get("threshold", 0),
+                    message=data.get("message", ""),
+                )
+            except Exception:
+                pass
+
+        mon.add_alert_callback(_on_alert)
+        try:
+            import asyncio as _asyncio
+            _asyncio.run(mon.monitor_loop(symbols, threshold=0.03))
+        except Exception:
+            pass
+        finally:
+            update_monitor_status("stopped", "监控已停止")
+
+    t = threading.Thread(target=_monitor_worker, daemon=True)
+    t.start()
+    print("[Dashboard] 后台行情监控线程已启动")
+
+    # 交易所连通性自检
+    try:
+        from config import CRYPTO_EXCHANGE
+        from crypto_api import get_crypto_price
+        result = get_crypto_price("BTC")
+        if result and result.get("price"):
+            print(f"[Dashboard] 连通性检查通过: {CRYPTO_EXCHANGE} BTC=${result['price']:,.2f}")
+        else:
+            print(f"[Dashboard] ⚠️ 连通性检查: {CRYPTO_EXCHANGE} 返回异常")
+    except Exception as e:
+        print(f"[Dashboard] ⚠️ 连通性检查失败: {e}")
 
 # 复盘模块实例（全工作线程共享，避免重复初始化）
 _replay_th = None
@@ -204,8 +265,8 @@ async def get_system_status():
     """获取系统状态"""
     return {
         "monitor": _monitor_status,
-        "uptime": int(asyncio.get_event_loop().time()) if _start_time else 0,
-        "start_time": _start_time
+        "uptime": int(time.time() - _start_time) if _start_time else 0,
+        "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_start_time)) if _start_time else None
     }
 
 @app.get("/api/sansheng/status")
@@ -555,25 +616,6 @@ async def get_stock_chart_data(
 # P2 回测图表 API（Equity Curve + 买卖点标注）
 # ================================================================
 
-@app.get("/api/signal/review")
-async def get_signal_review():
-    """返回信号复盘统计"""
-    try:
-        from signal_review import get_review
-        review = get_review()
-        summary = review.get_recent_summary(20)
-        patterns = review.get_error_patterns(5)
-        return {
-            "quality_score": review.get_signal_quality_score(),
-            "accuracy": summary["accuracy"],
-            "avg_confidence": summary["avg_confidence"],
-            "total_reviewed": summary["total"],
-            "error_patterns": [{"pattern": p, "count": c} for p, c in patterns],
-            "recommendation": "proceed" if summary["accuracy"] >= 0.5 else "caution"
-        }
-    except Exception as e:
-        return {"error": str(e), "quality_score": 0.5, "recommendation": "unknown"}
-
 @app.get("/api/backtest/chart/{strategy_name}")
 async def get_backtest_chart_data(strategy_name: str):
     """
@@ -744,6 +786,75 @@ async def list_backtest_strategies():
         "multi": ["MultiVote"],
         "registered": list(STRATEGY_REGISTRY.keys()) if "STRATEGY_REGISTRY" in dir() else [],
     }
+
+
+# ================================================================
+# J: 实时 PnL / 权益曲线 API
+# ================================================================
+
+@app.get("/api/pnl/summary")
+async def get_pnl_summary():
+    """获取所有 Agent 的实时盈亏摘要"""
+    try:
+        from live_trading import orchestrator
+        if not orchestrator:
+            return {"agents": [], "total_equity": 0, "total_return_pct": 0}
+        status_list = orchestrator.get_all_status()
+        total_equity = sum(s["equity"] for s in status_list)
+        total_return = sum(s["total_return_pct"] for s in status_list)
+        return {
+            "agents": [
+                {
+                    "agent_id": s["agent_id"], "symbol": s["symbol"],
+                    "strategy": s.get("strategy", "VOTE"),
+                    "equity": round(s["equity"], 2),
+                    "return_pct": round(s["total_return_pct"], 2),
+                    "in_position": s["position"] is not None,
+                    "risk_level": s.get("risk_level", "normal"),
+                }
+                for s in status_list
+            ],
+            "total_equity": round(total_equity, 2),
+            "total_return_pct": round(total_return, 2),
+            "agent_count": len(status_list),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/pnl/equity")
+async def get_equity_curve(agent_id: str = None, limit: int = 100):
+    """获取权益曲线数据（从 equity_log 表读取）"""
+    try:
+        import sqlite3
+        from live_trading import DB_PATH as _DB_PATH_LIVE
+        conn = sqlite3.connect(_DB_PATH_LIVE)
+        conn.row_factory = sqlite3.Row
+        if agent_id:
+            rows = conn.execute(
+                "SELECT agent_id, timestamp, equity, in_position FROM equity_log "
+                "WHERE agent_id=? ORDER BY timestamp DESC LIMIT ?",
+                (agent_id, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT agent_id, timestamp, equity, in_position FROM equity_log "
+                "ORDER BY timestamp DESC LIMIT ?", (limit,)
+            ).fetchall()
+        conn.close()
+        curves = {}
+        for r in rows:
+            aid = r["agent_id"]
+            curves.setdefault(aid, []).append({
+                "t": r["timestamp"] // 1000,
+                "v": round(r["equity"], 2),
+                "in_position": bool(r["in_position"]),
+            })
+        for k in curves:
+            curves[k].reverse()
+        return {"curves": curves}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/backtest/compare")
@@ -948,6 +1059,7 @@ DASHBOARD_HTML = """
             <button class="tab" onclick="switchTab('trade')">💰 交易操作</button>
             <button class="tab" onclick="switchTab('alerts')">🔔 告警记录</button>
             <button class="tab" onclick="switchTab('backtest')">📊 回测图表</button>
+            <button class="tab" onclick="switchTab('live-equity')">📈 实时权益</button>
             <button class="tab" onclick="switchTab('replay')">🔍 交易复盘</button>
         </div>
         
@@ -1065,6 +1177,70 @@ DASHBOARD_HTML = """
 
                 <!-- 信号统计 -->
                 <div id="bt-stats" style="margin-top:10px;font-size:13px;color:#aaa;"></div>
+            </div>
+        </div>
+
+        <!-- 实时权益曲线 -->
+        <div id="tab-live-equity" class="tab-content">
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                    <h2 style="margin:0;">📈 实时权益曲线</h2>
+                    <div style="display:flex;gap:8px;">
+                        <select id="eq-agent-filter" onchange="loadLiveEquity()" style="width:auto;margin:0;">
+                            <option value="">全部 Agent</option>
+                        </select>
+                        <button class="btn btn-primary" onclick="loadLiveEquity()" style="margin:0;">🔄 刷新</button>
+                    </div>
+                </div>
+                <div id="equity-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:15px;"></div>
+                <div class="card" style="background:#0d1b2a;">
+                    <div id="live-equity-chart" style="height:350px;"></div>
+                </div>
+                <p class="refresh-info">自动刷新间隔: 30秒</p>
+            </div>
+
+            <!-- 策略对比排名 -->
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;flex-wrap:wrap;gap:10px;">
+                    <h2 style="margin:0;">🏆 策略对比排名</h2>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                        <select id="compare-symbol" onchange="loadCompareRanking()" style="width:120px;margin:0;">
+                            <option value="ETH/USDT" selected>ETH/USDT</option>
+                            <option value="BTC/USDT">BTC/USDT</option>
+                            <option value="SOL/USDT">SOL/USDT</option>
+                            <option value="SUI/USDT">SUI/USDT</option>
+                        </select>
+                        <select id="compare-tf" onchange="loadCompareRanking()" style="width:70px;margin:0;">
+                            <option value="4h" selected>4h</option>
+                            <option value="1h">1h</option>
+                            <option value="1d">1d</option>
+                        </select>
+                        <select id="compare-dir" onchange="loadCompareRanking()" style="width:80px;margin:0;">
+                            <option value="long" selected>做多</option>
+                            <option value="short">做空</option>
+                            <option value="both">多空</option>
+                        </select>
+                        <button class="btn btn-primary" onclick="loadCompareRanking()" style="margin:0;">▶ 开始对比</button>
+                    </div>
+                </div>
+                <div id="compare-table"></div>
+                <div id="compare-verdict" style="margin-top:10px;font-size:13px;color:#aaa;"></div>
+            </div>
+
+            <!-- 投票参数配置 -->
+            <div class="card">
+                <h2>🎛 多策略投票配置</h2>
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px;">
+                    <div><label style="font-size:12px;color:#888;">RSI 权重</label>
+                        <input type="range" id="vw-rsi" min="0" max="100" value="40" oninput="updateVoteWeights()"><span id="vw-rsi-v">40%</span></div>
+                    <div><label style="font-size:12px;color:#888;">MACD 权重</label>
+                        <input type="range" id="vw-macd" min="0" max="100" value="30" oninput="updateVoteWeights()"><span id="vw-macd-v">30%</span></div>
+                    <div><label style="font-size:12px;color:#888;">BOLL 权重</label>
+                        <input type="range" id="vw-boll" min="0" max="100" value="30" oninput="updateVoteWeights()"><span id="vw-boll-v">30%</span></div>
+                    <div><label style="font-size:12px;color:#888;">投票阈值</label>
+                        <input type="range" id="vw-th" min="0" max="50" value="30" step="5" oninput="updateVoteThreshold()"><span id="vw-th-v">0.30</span></div>
+                </div>
+                <div id="vote-config-display" style="font-size:13px;color:#aaa;"></div>
             </div>
         </div>
 
@@ -1531,11 +1707,180 @@ DASHBOARD_HTML = """
         function switchTab(tab) {
             document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.querySelector(`.tab[onclick="switchTab('${tab}')"]`).classList.add('active');
-            document.getElementById('tab-' + tab).classList.add('active');
+            const targetTab = document.querySelector(`.tab[onclick="switchTab('${tab}')"]`);
+            if (targetTab) targetTab.classList.add('active');
+            const targetContent = document.getElementById('tab-' + tab);
+            if (targetContent) targetContent.classList.add('active');
             if (tab === 'backtest') loadBacktestChart();
+            if (tab === 'live-equity') { loadLiveEquity(); loadCompareRanking(); }
             if (tab === 'replay') loadReplayAll();
         }
+
+        // ================================================================
+        // 实时权益曲线
+        // ================================================================
+
+        let liveEquityChart = null;
+        const AGENT_COLORS = ['#00d4ff', '#ff9800', '#00c853', '#e040fb', '#ff1744', '#ffeb3b', '#00bcd4', '#8bc34a'];
+
+        async function loadLiveEquity() {
+            const filter = document.getElementById('eq-agent-filter').value;
+            try {
+                const url = filter ? `/api/pnl/equity?agent_id=${encodeURIComponent(filter)}&limit=200` : '/api/pnl/equity?limit=200';
+                const res = await fetch(url);
+                const data = await res.json();
+                const curves = data.curves || {};
+
+                // 更新 Agent 过滤器
+                const agentIds = Object.keys(curves);
+                const sel = document.getElementById('eq-agent-filter');
+                sel.innerHTML = '<option value="">全部 Agent</option>' + agentIds.map(a => `<option value="${a}" ${a===filter?'selected':''}>${a}</option>`).join('');
+
+                // 加载 PnL 概要
+                try {
+                    const sumRes = await fetch('/api/pnl/summary');
+                    const sumData = await sumRes.json();
+                    const summaryDiv = document.getElementById('equity-summary');
+                    if (sumData.agents && sumData.agents.length > 0) {
+                        summaryDiv.innerHTML = sumData.agents.map(a => {
+                            const cls = a.return_pct >= 0 ? 'profit' : 'loss';
+                            const posTag = a.in_position ? '🟢 持仓' : '⚪ 空仓';
+                            const riskColors = {normal:'#00c853',caution:'#ff9800',warning:'#ff5722',locked:'#ff1744'};
+                            const riskColor = riskColors[a.risk_level] || '#888';
+                            return `<div class="sys-stat-card" style="border-left-color:${a.return_pct>=0?'#00c853':'#ff1744'};">
+                                <div class="sys-stat-label">${a.agent_id} · ${a.symbol}</div>
+                                <div class="sys-stat-value" style="font-size:18px;">$${a.equity.toLocaleString()}</div>
+                                <div style="font-size:13px;margin-top:4px;">
+                                    <span class="${cls}">${a.return_pct>=0?'+':''}${a.return_pct}%</span>
+                                    <span style="margin-left:8px;color:${riskColor};">${posTag}</span>
+                                    <span style="margin-left:8px;font-size:11px;color:#888;">${a.strategy||'VOTE'}</span>
+                                </div>
+                            </div>`;
+                        }).join('');
+                    } else {
+                        summaryDiv.innerHTML = '<div style="color:#888;padding:10px;">暂无运行中的 Agent</div>';
+                    }
+                } catch(e) {}
+
+                // 渲染权益曲线（清除旧序列）
+                const chartDiv = document.getElementById('live-equity-chart');
+                if (!liveEquityChart) {
+                    liveEquityChart = LightweightCharts.createChart(chartDiv, {
+                        width: chartDiv.clientWidth || 800,
+                        height: 350,
+                        layout: { backgroundColor: '#0d1b2a', textColor: '#aaa' },
+                        grid: { vertLines: { color: '#1a2a3a' }, horzLines: { color: '#1a2a3a' } },
+                        rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 } },
+                    });
+                }
+
+                // 清除旧序列
+                while (liveEquityChart.series().length > 0) {
+                    liveEquityChart.removeSeries(liveEquityChart.series()[0]);
+                }
+
+                let ci = 0;
+                for (const [agentId, points] of Object.entries(curves)) {
+                    if (!points || points.length < 2) continue;
+                    const color = AGENT_COLORS[ci % AGENT_COLORS.length]; ci++;
+                    const series = liveEquityChart.addLineSeries({ color, lineWidth: 2, title: agentId });
+                    series.setData(points.map(p => ({ time: p.t, value: p.v })));
+                }
+                liveEquityChart.timeScale().fitContent();
+
+            } catch(e) {
+                document.getElementById('equity-summary').innerHTML = `<div style="color:#ff1744;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        // ================================================================
+        // 策略对比排名
+        // ================================================================
+
+        async function loadCompareRanking() {
+            const symbol = document.getElementById('compare-symbol').value;
+            const timeframe = document.getElementById('compare-tf').value;
+            const direction = document.getElementById('compare-dir').value;
+            const tableDiv = document.getElementById('compare-table');
+            const verdictDiv = document.getElementById('compare-verdict');
+
+            tableDiv.innerHTML = '<div style="color:#888;padding:10px;">⏳ 回测中...</div>';
+            verdictDiv.innerHTML = '';
+
+            try {
+                const res = await fetch(`/api/backtest/compare?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&direction=${direction}`);
+                const data = await res.json();
+                if (data.error) { tableDiv.innerHTML = `<div style="color:#ff1744;">${data.error}</div>`; return; }
+
+                const rankings = data.rankings || [];
+                let html = `<table><thead><tr>
+                    <th>#</th><th>策略</th><th>收益率</th><th>夏普</th><th>最大回撤</th><th>胜率</th><th>交易数</th>
+                </tr></thead><tbody>`;
+                rankings.forEach((r, i) => {
+                    const retCls = (r.return||0) >= 0 ? 'profit' : 'loss';
+                    const srCls = (r.sharpe||0) >= 1 ? 'profit' : ((r.sharpe||0) >= 0 ? '' : 'loss');
+                    const ddCls = (r.drawdown||0) <= 10 ? 'profit' : ((r.drawdown||0) <= 20 ? '' : 'loss');
+                    html += `<tr>
+                        <td><b>${i+1}</b></td>
+                        <td style="font-weight:bold;color:#00d4ff;">${r.strategy}</td>
+                        <td class="${retCls}">${(r.return||0)>=0?'+':''}${(r.return||0).toFixed(2)}%</td>
+                        <td class="${srCls}">${(r.sharpe||0).toFixed(2)}</td>
+                        <td class="${ddCls}">${(r.drawdown||0).toFixed(2)}%</td>
+                        <td>${(r.win_rate||0).toFixed(1)}%</td>
+                        <td>${r.trades||0}</td>
+                    </tr>`;
+                });
+                html += '</tbody></table>';
+                tableDiv.innerHTML = html;
+
+                const best = rankings[0];
+                if (best && !best.error) {
+                    verdictDiv.innerHTML = `🏆 最优策略: <b style="color:#00d4ff;">${best.strategy}</b> | 收益率: <b class="profit">${best.return>=0?'+':''}${best.return}%</b> | 夏普: ${best.sharpe} | 交易: ${best.trades}笔 | ${symbol} ${timeframe} (${direction})`;
+                }
+            } catch(e) {
+                tableDiv.innerHTML = `<div style="color:#ff1744;">加载失败: ${e.message}</div>`;
+            }
+        }
+
+        // ================================================================
+        // 投票参数配置
+        // ================================================================
+
+        function updateVoteWeights() {
+            const rsi = parseInt(document.getElementById('vw-rsi').value);
+            const macd = parseInt(document.getElementById('vw-macd').value);
+            const boll = parseInt(document.getElementById('vw-boll').value);
+            const total = rsi + macd + boll || 1;
+            document.getElementById('vw-rsi-v').textContent = Math.round(rsi/total*100) + '%';
+            document.getElementById('vw-macd-v').textContent = Math.round(macd/total*100) + '%';
+            document.getElementById('vw-boll-v').textContent = Math.round(boll/total*100) + '%';
+            displayVoteConfig();
+        }
+
+        function updateVoteThreshold() {
+            const th = parseInt(document.getElementById('vw-th').value) / 100;
+            document.getElementById('vw-th-v').textContent = th.toFixed(2);
+            displayVoteConfig();
+        }
+
+        function displayVoteConfig() {
+            const rsi = parseInt(document.getElementById('vw-rsi').value);
+            const macd = parseInt(document.getElementById('vw-macd').value);
+            const boll = parseInt(document.getElementById('vw-boll').value);
+            const total = rsi + macd + boll || 1;
+            const th = parseInt(document.getElementById('vw-th').value) / 100;
+
+            const rsiPct = Math.round(rsi/total*100);
+            const macdPct = Math.round(macd/total*100);
+            const bollPct = Math.round(boll/total*100);
+
+            const div = document.getElementById('vote-config-display');
+            div.innerHTML = `当前配置: <b>RSI ${rsiPct}% + MACD ${macdPct}% + BOLL ${bollPct}%</b> | 阈值: <b>${th.toFixed(2)}</b> | ` +
+                (th >= 0.35 ? '🛡 高阈值-严格过滤' : th >= 0.2 ? '⚖ 中阈值-平衡模式' : '🎯 低阈值-信号密集');
+        }
+
+        // 初始化投票配置显示
+        displayVoteConfig();
 
         // ================================================================
         // P2 回测图表
@@ -1870,6 +2215,12 @@ DASHBOARD_HTML = """
         // 初始化
         loadAll();
         setInterval(loadAll, 30000);  // 每30秒刷新
+        // 权益曲线也定时刷新
+        setInterval(() => {
+            if (document.getElementById('tab-live-equity').classList.contains('active')) {
+                loadLiveEquity();
+            }
+        }, 30000);
     </script>
 </body>
 </html>

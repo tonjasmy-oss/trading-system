@@ -20,7 +20,7 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 DB_PATH = os.getenv("DB_PATH", "trading_system.db")
 
 # 加密货币交易所配置（ccxt 统一数据层）
-# 支持: binance, gateio, kraken, bitfinex, okx, bybit, bitget, hyperliquid
+# 支持: binance, gateio, kraken, bitfinex, okx, bybit, bitget, hyperliquid, weex
 # 默认 gateio（兼容原系统），可改为 binance 获得更高流动性数据
 CRYPTO_EXCHANGE = os.getenv("CRYPTO_EXCHANGE", "gateio")
 CRYPTO_API_KEY = os.getenv("CRYPTO_API_KEY", "")
@@ -34,6 +34,7 @@ BITGET_API_PASSPHRASE = os.getenv("BITGET_API_PASSPHRASE", "")
 # Weex 交易账户 API Key（当 CRYPTO_EXCHANGE=weex 时使用）
 WEEX_API_KEY = os.getenv("WEEX_API_KEY", "")
 WEEX_API_SECRET = os.getenv("WEEX_API_SECRET", "")
+WEEX_API_PASSPHRASE = os.getenv("WEEX_API_PASSPHRASE", "")
 
 # API 配置
 COINGECKO_API = "https://api.coingecko.com/api/v3"
@@ -111,7 +112,7 @@ AGENT_CHECK_INTERVAL = int(os.getenv("AGENT_CHECK_INTERVAL", "60"))
 
 # --- 多 Agent 标的配置（格式：SYMBOL:STRATEGY:EXCHANGE）---
 # 策略可选: RSI, SMA, BOLLINGER, MACD, GRID, VOLUME
-# 交易所可选: binance, gateio, bitget, hyperliquid
+# 交易所可选: binance, gateio, bitget, hyperliquid, weex
 # 示例: ETH/USDT:RSI:binance,SOL/USDT:RSI:hyperliquid,SUI/USDT:SMA:binance
 AGENT_SYMBOLS = os.getenv(
     "AGENT_SYMBOLS",
@@ -126,7 +127,7 @@ AGENT_SYMBOLS = os.getenv(
 # --- 尚书省：实盘执行配置 ---
 # 是否启用实盘交易（true=真实下单，false=模拟）
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
-# 实盘交易所：binance / gateio / bybit / bitget / hyperliquid
+# 实盘交易所：binance / gateio / bybit / bitget / hyperliquid / weex
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "binance")
 # 实盘 API Key（建议使用只读+交易权限的 Trade-only Key）
 LIVE_API_KEY = os.getenv("LIVE_API_KEY", "")

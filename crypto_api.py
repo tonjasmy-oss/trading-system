@@ -10,6 +10,10 @@ from typing import Optional, Dict, List, TYPE_CHECKING, Callable
 from datetime import datetime
 from functools import lru_cache, wraps
 
+# 抑制 SSH 隧道 localhost 自签名证书的 SSL 警告
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 logger = logging.getLogger(__name__)
 
 
