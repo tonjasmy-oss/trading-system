@@ -196,7 +196,7 @@ class MenxiaSheng:
     EQUITY_RECOVER_TRIGGER  = 0.03   # R8: 恢复 3% → 降级
     MAX_CONSECUTIVE_LOSSES  = 5      # R9: 连续亏损 5 笔 → 熔断
     MAX_POS_DRAWDOWN_PCT    = 0.15   # R10: 单仓浮亏 15% → 强制平仓
-    MIN_ORDER_NOTIONAL      = 10.0   # R11: 最低下单金额（USDT）
+    MIN_ORDER_NOTIONAL      = 3.0    # R11: 最低下单金额（USDT）
     MAX_ORDER_RATIO         = 0.5    # R11: 单笔下单不超过资金 50%
 
     def __init__(self, initial_capital: float = 10000.0,

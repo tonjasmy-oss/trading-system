@@ -55,24 +55,21 @@
       "max_drawdown_pct": 14.83,
       "win_rate_pct": 43.48,
       "updated_at": "2026-05-09"
+    },
+    {
+      "symbol": "ZEC/USDT",
+      "strategy": "RSIStrategy",
+      "rsi_period": 6,
+      "oversold": 20,
+      "overbought": 73,
+      "stop_loss": 0.04,
+      "take_profit": 0.08,
+      "total_return_pct": 1129.87,
+      "sharpe_ratio": 0.89,
+      "max_drawdown_pct": 16.94,
+      "win_rate_pct": 48.39,
+      "updated_at": "2026-05-15T00:08:24.638608+00:00"
     }
   ],
-  "updated_at": "2026-05-09",
-  "vote_params": {
-    "symbol": "ETH/USDT",
-    "strategies": {
-      "RSI": 0.4,
-      "MACD": 0.3,
-      "ATR": 0.3
-    },
-    "threshold": 0.35,
-    "stop_loss": 0.02,
-    "take_profit": 0.04,
-    "total_return_pct": 42.0,
-    "sharpe_ratio": 2.69,
-    "max_drawdown_pct": 3.86,
-    "win_rate_pct": 66.67,
-    "score": 17.45,
-    "updated_at": "2026-05-10T09:40:59.643485+00:00"
-  }
+  "updated_at": "2026-05-15T00:08:24.638636+00:00"
 }

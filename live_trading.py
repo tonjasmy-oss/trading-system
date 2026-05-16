@@ -36,7 +36,8 @@ from config import (
     HYPERLIQUID_WALLET_ADDRESS,
     CRYPTO_EXCHANGE, CRYPTO_API_KEY, CRYPTO_API_SECRET,
     LIVE_TRADING_ENABLED, LIVE_EXCHANGE, LIVE_API_KEY, LIVE_API_SECRET,
-    LIVE_TESTNET, LIVE_INITIAL_CAPITAL,
+    LIVE_TESTNET, LIVE_TESTNET_API_KEY, LIVE_TESTNET_API_SECRET,
+    LIVE_INITIAL_CAPITAL, LIVE_ORDER_CAPITAL_PCT,
     WEEX_API_PASSPHRASE,
     RISK_MAX_DAILY_LOSS_PCT, RISK_MAX_DAILY_LOSS_LOCK,
     RISK_MAX_TOTAL_EXPOSURE, RISK_MAX_POSITION_PER_SYMBOL,
@@ -44,16 +45,27 @@ from config import (
     STRATEGY_RSI_PERIOD, STRATEGY_RSI_OVERSOLD, STRATEGY_RSI_OVERBOUGHT,
     STRATEGY_STOP_LOSS, STRATEGY_TAKE_PROFIT,
     OPTIMAL_PARAMS,
+    # 多因子 / 资金费率套利 / 统计套利 参数
+    MULTIFACTOR_MIN_SCORE, MULTIFACTOR_EMA_PERIOD, MULTIFACTOR_ATR_PERIOD,
+    MULTIFACTOR_ATR_MULTIPLIER, MULTIFACTOR_MAX_POSITION, MULTIFACTOR_TRAILING_PCT,
+    MULTIFACTOR_STOP_LOSS_PCT, MULTIFACTOR_TP1_PCT, MULTIFACTOR_TP2_PCT,
+    MULTIFACTOR_FUNDING_THRESH,
+    FUNDING_ARB_MIN_RATE, FUNDING_ARB_MAX_RATE, FUNDING_ARB_REBALANCE_H,
+    STAT_ARB_PAIR_SYMBOL, STAT_ARB_LOOKBACK, STAT_ARB_Z_ENTRY,
+    STAT_ARB_Z_EXIT, STAT_ARB_Z_LOSS,
+    BLACK_SWAN_DROP_PCT, MAX_DRAWDOWN_LOCK_PCT,
 )
 from crypto_api import (
     get_crypto_price, get_ohlcv,
     validate_trade_only_key, set_hyperliquid_wallet,
     get_hyperliquid_price, get_hyperliquid_candles,
+    get_fear_and_greed_index, get_btc_dominance, get_funding_rate,
+    get_onchain_metrics, get_multi_factor_data,
 )
 from strategies import (
     Signal, AISignalFilter, AIModel, MarketContext,
     StrategyConfig, build_strategy, STRATEGY_REGISTRY,
-    compute_rsi,
+    compute_rsi, RSIStrategy, MACDStrategy, BollingerBandsStrategy,
 )
 from multi_strategy_vote import MultiStrategyVote
 
@@ -115,6 +127,7 @@ except ImportError:
     OnlineParameterOptimizer = None
     _OPTIMIZER_AVAILABLE = False
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 # 飞书主动推送
@@ -149,6 +162,7 @@ def init_trading_db():
             entry_price REAL, entry_time INTEGER,
             stop_loss REAL, take_profit REAL,
             quantity REAL, status TEXT DEFAULT 'open',
+            side TEXT DEFAULT 'long',
             exchange TEXT DEFAULT 'binance',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
@@ -183,6 +197,9 @@ def init_trading_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # 迁移：为已有数据库增加 side 列
+    try: c.execute("ALTER TABLE positions ADD COLUMN side TEXT DEFAULT 'long'")
+    except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
     logger.info("实盘模拟数据库初始化完成: %s", DB_PATH)
@@ -372,6 +389,58 @@ class TradingAgent:
         elif strategy_type == "BOLLINGER":
             strategy_kwargs = {"period": 20, "std_dev": 2.0}
 
+        # ── 多因子趋势策略（MULTIFACTOR）─────────────────────────────
+        elif strategy_type == "MULTIFACTOR":
+            logger.info(f"[{self.agent_id}] 初始化多因子趋势策略")
+            from strategies import MultiFactorTrendStrategy
+            return MultiFactorTrendStrategy(
+                symbol=self.symbol,
+                timeframe=self.timeframe,
+                min_score=MULTIFACTOR_MIN_SCORE,
+                ema_period=MULTIFACTOR_EMA_PERIOD,
+                atr_period=MULTIFACTOR_ATR_PERIOD,
+                atr_multiplier=MULTIFACTOR_ATR_MULTIPLIER,
+                max_position=MULTIFACTOR_MAX_POSITION,
+                trailing_pct=MULTIFACTOR_TRAILING_PCT,
+                stop_loss_pct=MULTIFACTOR_STOP_LOSS_PCT,
+                tp1_pct=MULTIFACTOR_TP1_PCT,
+                tp2_pct=MULTIFACTOR_TP2_PCT,
+                funding_threshold=MULTIFACTOR_FUNDING_THRESH,
+            )
+
+        # ── 资金费率套利策略（FUNDING_ARB）───────────────────────────
+        elif strategy_type == "FUNDING_ARB":
+            logger.info(f"[{self.agent_id}] 初始化资金费率套利策略")
+            from strategies import FundingRateArbitrageStrategy
+            return FundingRateArbitrageStrategy(
+                symbol=self.symbol,
+                min_rate=FUNDING_ARB_MIN_RATE,
+                max_rate=FUNDING_ARB_MAX_RATE,
+                rebalance_h=FUNDING_ARB_REBALANCE_H,
+            )
+
+        # ── 统计套利策略（STAT_ARB）─────────────────────────────────
+        elif strategy_type == "STAT_ARB":
+            logger.info(f"[{self.agent_id}] 初始化统计套利策略")
+            from strategies import StatisticalArbitrageStrategy
+            pair_symbol = STAT_ARB_PAIR_SYMBOL
+            # 从配置字典获取配对币种（如 STAT_ARB_PAIR_ETH = "BTC"）
+            stat_pairs = {}
+            try:
+                from config import STAT_ARB_PAIRS
+                stat_pairs = STAT_ARB_PAIRS
+            except Exception:
+                pass
+            pair_base = stat_pairs.get(self.symbol, pair_symbol)
+            return StatisticalArbitrageStrategy(
+                symbol=self.symbol,
+                pair_symbol=pair_base,
+                lookback=STAT_ARB_LOOKBACK,
+                z_entry=STAT_ARB_Z_ENTRY,
+                z_exit=STAT_ARB_Z_EXIT,
+                z_loss=STAT_ARB_Z_LOSS,
+            )
+
         return build_strategy(strategy_type, config, **strategy_kwargs)
 
     # -------------------- 数据获取 --------------------
@@ -455,6 +524,16 @@ class TradingAgent:
                 timeframe=self.timeframe,
                 limit=limit,
             )
+        elif self.exchange == "weex":
+            from weex import fetch_ohlcv as weex_ohlcv
+            candles = weex_ohlcv(
+                symbol=self.symbol.split("/")[0],
+                timeframe=self.timeframe,
+                limit=limit,
+            )
+            # weex_ohlcv returns [{timestamp, open, high, low, close, volume}]
+            # already in the correct format
+            return candles
         else:
             # Binance / Gate.io
             return get_ohlcv(
@@ -468,6 +547,10 @@ class TradingAgent:
         if self.exchange == "hyperliquid":
             data = get_hyperliquid_price(symbol=self.symbol.split("/")[0])
             return data.get("price") if data else None
+        elif self.exchange == "weex":
+            from weex import fetch_ticker as weex_ticker
+            ticker = weex_ticker(self.symbol.split("/")[0])
+            return ticker["price"] if ticker else None
         else:
             data = get_crypto_price(self.symbol.split("/")[0])
             return data.get("price") if data else None
@@ -558,8 +641,11 @@ class TradingAgent:
         pos_status = "in_position" if self.position else "no_position"
         entry_price = self.position["entry_price"] if self.position else None
         unrealized = None
-        if self.position and entry_price:
+        pos_side_ai = self.position.get("side", "long") if self.position else "long"
+        if self.position and entry_price and pos_side_ai == "long":
             unrealized = (current_price - entry_price) / entry_price * 100
+        elif self.position and entry_price and pos_side_ai == "short":
+            unrealized = (entry_price - current_price) / entry_price * 100
 
         market_ctx = MarketContext(
             symbol=self.symbol,
@@ -577,23 +663,30 @@ class TradingAgent:
 
     # -------------------- 交易操作 --------------------
 
-    async def _open_position(self, price: float, timestamp: int, rsi: float, ai_verdict: str) -> bool:
-        """开仓（已通过风控检查）— 支持实盘+模拟双路径"""
+    async def _open_position(self, price: float, timestamp: int, rsi: float, ai_verdict: str,
+                             side: str = "buy") -> bool:
+        """开仓（已通过风控检查）— 支持多空双向"""
         if self.position is not None:
             return False
 
-        quantity = (self.capital * 1.0) / price
+        quantity = (self.capital * LIVE_ORDER_CAPITAL_PCT) / price
         if quantity <= 0:
             return False
 
-        stop_loss = price * (1 - self.stop_loss_pct)
-        take_profit = price * (1 + self.take_profit_pct)
+        is_short = (side == "sell")
+        if is_short:
+            # 做空：止损价在上方，止盈价在下方
+            stop_loss = price * (1 + self.stop_loss_pct)
+            take_profit = price * (1 - self.take_profit_pct)
+        else:
+            stop_loss = price * (1 - self.stop_loss_pct)
+            take_profit = price * (1 + self.take_profit_pct)
 
         # ── 实盘路径：尚书省执行 ──
         if self.shangshu is not None and LIVE_TRADING_ENABLED:
             result = await self.shangshu.execute_open(
                 symbol=self.symbol,
-                side="buy",
+                side=side,
                 quantity=quantity,
                 order_type="market",
                 agent_id=self.agent_id,
@@ -605,34 +698,44 @@ class TradingAgent:
                 return False
             exec_price = result.exec_price
             logger.info(
-                f"[{self.agent_id}] === 实盘 BUY === 价格: ${exec_price:.4f} "
+                f"[{self.agent_id}] === 实盘 {side.upper()} === 价格: ${exec_price:.4f} "
                 f"数量: {quantity:.6f} 订单ID: {result.order_id}"
             )
         else:
             # ── 模拟路径（原有逻辑）─
             exec_price = price
 
+        # 市价单成交价回填：exec_price=0 时用信号价代替
+        safe_entry = exec_price if exec_price > 0 else price
+
         self.position = {
             "symbol": self.symbol,
-            "entry_price": exec_price,
+            "entry_price": safe_entry,
             "entry_time": timestamp,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "quantity": quantity,
             "ai_verdict": ai_verdict,
             "entry_rsi": rsi,
+            "side": "short" if is_short else "long",
             "is_live": self.shangshu is not None and LIVE_TRADING_ENABLED,
             "order_id": result.order_id if self.shangshu else None,
         }
-        self.capital = 0.0
+        # 扣除/增加仓位成本（避免巨额回撤误算）
+        position_cost = quantity * safe_entry
+        if is_short:
+            self.capital += position_cost   # 做空：收到卖出所得
+        else:
+            self.capital -= position_cost   # 做多：支付买入成本
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
             INSERT INTO positions (symbol, timeframe, entry_price, entry_time,
-                                   stop_loss, take_profit, quantity, status, exchange)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?)
-        """, (self.symbol, self.timeframe, exec_price, timestamp, stop_loss, take_profit, quantity, self.exchange))
+                                   stop_loss, take_profit, quantity, status, side, exchange)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+        """, (self.symbol, self.timeframe, safe_entry, timestamp, stop_loss, take_profit,
+              quantity, "short" if is_short else "long", self.exchange))
         conn.commit()
         conn.close()
 
@@ -664,10 +767,11 @@ class TradingAgent:
                 logger.warning(f"[{self.agent_id}] TradeHistory 开仓记录失败: {e}")
 
         # 飞书推送：开仓通知
+        display_side_open = "SELL" if is_short else "BUY"
         if _feishu and self._feishu_enabled:
             _feishu.send_position_alert(
                 symbol=self.symbol,
-                side="BUY",
+                side=display_side_open,
                 price=exec_price,
                 quantity=quantity,
                 stop_loss=stop_loss,
@@ -676,28 +780,36 @@ class TradingAgent:
             )
 
         logger.info(
-            "[%s] === BUY === 价格: $%.2f  RSI: %.2f  数量: %.6f  止损: $%.2f  止盈: $%.2f  AI:%s",
-            self.agent_id, exec_price, rsi, quantity, stop_loss, take_profit, ai_verdict
+            "[%s] === %s === 价格: $%.2f  RSI: %.2f  数量: %.6f  止损: $%.2f  止盈: $%.2f  AI:%s",
+            self.agent_id, display_side_open, exec_price, rsi, quantity, stop_loss, take_profit, ai_verdict
         )
         return True
 
     async def _close_position(self, price: float, timestamp: int, reason: str, rsi: float) -> bool:
-        """平仓（同步通知门下省）— 支持实盘+模拟双路径"""
+        """平仓（同步通知门下省）— 支持多空双向"""
         if self.position is None:
             return False
 
         entry_price = self.position["entry_price"]
         quantity = self.position["quantity"]
         ai_verdict = self.position.get("ai_verdict", "")
+        pos_side_c = self.position.get("side", "long")
 
-        pnl_pct = (price - entry_price) / entry_price * 100
-        pnl_abs = quantity * (price - entry_price)
+        if pos_side_c == "short":
+            # 做空盈亏：价格下跌盈利
+            pnl_pct = (entry_price - price) / entry_price * 100
+            pnl_abs = quantity * (entry_price - price)
+            close_side_c = "buy"   # 平空 = 买入回补
+        else:
+            pnl_pct = (price - entry_price) / entry_price * 100
+            pnl_abs = quantity * (price - entry_price)
+            close_side_c = "sell"  # 平多 = 卖出
 
         # ── 实盘路径：尚书省执行 ──
         if self.shangshu is not None and LIVE_TRADING_ENABLED:
             result = await self.shangshu.execute_close(
                 symbol=self.symbol,
-                side="sell",
+                side=close_side_c,
                 quantity=quantity,
                 order_type="market",
                 agent_id=self.agent_id,
@@ -707,15 +819,23 @@ class TradingAgent:
                 logger.error(f"[{self.agent_id}] 尚书省实盘平仓失败: {result.message}")
                 return False
             exec_price = result.exec_price
-            pnl_pct = (exec_price - entry_price) / entry_price * 100
+            if pos_side_c == "short":
+                pnl_pct = (entry_price - exec_price) / entry_price * 100
+            else:
+                pnl_pct = (exec_price - entry_price) / entry_price * 100
             logger.info(
-                f"[{self.agent_id}] === 实盘 SELL === 价格: ${exec_price:.4f} "
+                f"[{self.agent_id}] === 实盘 {close_side_c.upper()} === 价格: ${exec_price:.4f} "
                 f"盈亏: {pnl_pct:+.2f}% 订单ID: {result.order_id}"
             )
         else:
             exec_price = price
 
-        self.capital = quantity * exec_price
+        if pos_side_c == "short":
+            # 平空后：回补成本返还
+            self.capital -= quantity * exec_price
+        else:
+            # 平多后：卖出所得加入资金
+            self.capital += quantity * exec_price
 
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -752,10 +872,11 @@ class TradingAgent:
                 logger.warning(f"[{self.agent_id}] TradeHistory 平仓记录失败: {e}")
 
         # 飞书推送：平仓通知
+        display_close_side_c = "BUY" if pos_side_c == "short" else "SELL"
         if _feishu and self._feishu_enabled:
             _feishu.send_position_alert(
                 symbol=self.symbol,
-                side="SELL",
+                side=display_close_side_c,
                 price=exec_price,
                 quantity=quantity,
                 pnl_pct=pnl_pct,
@@ -764,7 +885,9 @@ class TradingAgent:
 
         logger.info(
             "[%s] === %s 平仓 === 价格: $%.2f  盈亏: %+.2f%%  原因: %s  RSI: %.2f",
-            self.agent_id, "SELL" if reason != "stop_loss" else "止损", exec_price, pnl_pct, reason, rsi
+            self.agent_id,
+            display_close_side_c if reason not in ("stop_loss", "止损") else "止损",
+            exec_price, pnl_pct, reason, rsi
         )
 
         self.position = None
@@ -800,11 +923,15 @@ class TradingAgent:
         return True
 
     async def _check_position_risk(self, price: float, timestamp: int, rsi: float) -> bool:
-        """检查持仓是否触发止损/止盈"""
+        """检查持仓是否触发止损/止盈（多空双向）"""
         if self.position is None:
             return False
 
-        pnl_pct = (price - self.position["entry_price"]) / self.position["entry_price"]
+        pos_side_risk = self.position.get("side", "long")
+        if pos_side_risk == "short":
+            pnl_pct = (self.position["entry_price"] - price) / self.position["entry_price"]
+        else:
+            pnl_pct = (price - self.position["entry_price"]) / self.position["entry_price"]
 
         if pnl_pct <= -self.stop_loss_pct:
             await self._close_position(price, timestamp, "stop_loss", rsi)
@@ -896,14 +1023,15 @@ class TradingAgent:
             except Exception as e:
                 logger.warning(f"[{self.agent_id}] MarketRegime 获取失败: {e}")
 
-        # 获取 24h 数据用于 AI 过滤器
+        # 获取 24h 数据用于 AI 过滤器（不覆盖 current_price）
         price_data = self._fetch_price()
         price_change_24h_pct = 0.0
         volume_24h = 0.0
-        current_price = price_data  # _fetch_price 返回 float（当前价格）
-        if current_price:
-            # 尝试从实时数据中获取 24h 变化和成交量（通过单独请求行情数据）
+        if price_data is not None:
+            # 尝试从实时数据中获取 24h 变化和成交量
             try:
+                # 用 _fetch_price 返回的实时价作为 AI 过滤的参考价
+                live_price = price_data
                 from crypto_api import get_crypto_price
                 ticker = get_crypto_price(self.symbol.split("/")[0])
                 if isinstance(ticker, dict):
@@ -911,6 +1039,49 @@ class TradingAgent:
                     volume_24h = ticker.get("volume_24h", 0.0)
             except Exception:
                 pass
+
+        # ── 黑天鹅保护：BTC 单日跌幅 > BLACK_SWAN_DROP_PCT → 强平所有杠杆仓 ──
+        btc_drop_pct = 0.0
+        try:
+            btc_ticker = get_crypto_price("BTC")
+            if isinstance(btc_ticker, dict):
+                btc_drop_pct = btc_ticker.get("change_24h_pct", 0.0)
+                result["btc_24h_change_pct"] = btc_drop_pct
+        except Exception:
+            pass
+
+        # 涨跌幅合理性校验：绝对值 > 0.99（即 99%）视为数据异常，丢弃
+        if abs(btc_drop_pct) > 0.99:
+            logger.warning(f"[{self.agent_id}] BTC 24h涨跌幅数据异常({btc_drop_pct:.4f})，已丢弃")
+            btc_drop_pct = 0.0
+
+        if btc_drop_pct < 0 and abs(btc_drop_pct) >= BLACK_SWAN_DROP_PCT:
+            logger.warning(f"[{self.agent_id}] ⚠️ 黑天鹅预警：BTC 24h跌幅={btc_drop_pct:.1%}，超过阈值 {BLACK_SWAN_DROP_PCT:.1%}")
+            result["black_swan"] = True
+            # 有持仓则强平
+            if self.position:
+                await self._close_position(current_price, current_ts, "black_swan", rsi)
+                result["message"] = f"黑天鹅强平：BTC跌幅{btc_drop_pct:.1%}"
+            else:
+                result["message"] = f"黑天鹅预警：禁止开仓（BTC跌幅{btc_drop_pct:.1%}）"
+            result["signal"] = "HOLD"
+            return result
+
+        # ── 回撤锁定：总权益回撤 > MAX_DRAWDOWN_LOCK_PCT → 暂停所有新仓 ──
+        drawdown_pct = (self.initial_capital - equity) / self.initial_capital
+        if self.menxia:
+            mx_status = self.menxia.get_status()
+            total_dd = mx_status.get("total_drawdown_pct", drawdown_pct)
+        else:
+            total_dd = drawdown_pct
+        if total_dd >= MAX_DRAWDOWN_LOCK_PCT:
+            logger.warning(f"[{self.agent_id}] ⚠️ 回撤锁定：总回撤={total_dd:.1%}，超过阈值 {MAX_DRAWDOWN_LOCK_PCT:.1%}")
+            result["drawdown_lock"] = True
+            result["total_drawdown_pct"] = total_dd
+            if self.position is None:
+                result["message"] = f"回撤锁定：禁止开仓（回撤{total_dd:.1%}）"
+                result["signal"] = "HOLD"
+                return result
 
         # 门下省：持仓超时检查
         if self.menxia and self.position:
@@ -957,14 +1128,22 @@ class TradingAgent:
             )
             result["ai_verdict"] = ai_verdict
 
-            if filtered_sig == Signal.BUY and self.position is None:
+            # ── 多空信号处理 ──
+            # BUY + 持空 → 平空; BUY + 空仓 → 开多
+            # SELL + 持多 → 平多; SELL + 空仓 → 开空
+            if filtered_sig == Signal.BUY and self.position is not None and self.position.get("side") == "short":
+                # 持有空仓，BUY信号→平空
+                await self._close_position(current_price, current_ts, "signal_cover", rsi)
+                result["signal"] = "COVER（平空）"
+                # position already cleared, continue to equity calc below
+            elif filtered_sig == Signal.BUY and self.position is None:
                 # === 门下省风控审核（第一优先）===
                 can_open, reason = (True, "")
                 if self.menxia:
                     review = self.menxia.review_open(
                         symbol=self.symbol,
                         entry_price=current_price,
-                        quantity=(self.capital * 1.0) / current_price,
+                        quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
                         agent_id=self.agent_id,
                         signal_confidence=last_conf if 'last_conf' in dir() else 0.5,
                         indicators={'rsi': current_rsi} if 'current_rsi' in dir() else {},
@@ -976,7 +1155,7 @@ class TradingAgent:
                 routing_info: Dict = {}
                 if self._signal_router and can_open:
                     try:
-                        quantity = (self.capital * 1.0) / current_price
+                        quantity = (self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price
                         # 当前策略候选
                         primary = CandidateSignal(
                             symbol=self.symbol,
@@ -1032,10 +1211,34 @@ class TradingAgent:
                     if routing_info:
                         result["routing"] = routing_info
                 else:
-                    await self._open_position(current_price, current_ts, rsi, ai_verdict)
+                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="buy")
                     result["signal"] = "BUY"
                     if routing_info:
                         result["routing"] = routing_info
+            elif filtered_sig == Signal.SELL and self.position is not None and self.position.get("side") == "long":
+                # 持有多仓，SELL信号→平多
+                await self._close_position(current_price, current_ts, "signal_exit", rsi)
+                result["signal"] = "EXIT（平多）"
+            elif filtered_sig == Signal.SELL and self.position is None:
+                # 空仓，SELL信号→开空（门下省审核）
+                can_open_short, reason_short = (True, "")
+                if self.menxia:
+                    review = self.menxia.review_open(
+                        symbol=self.symbol,
+                        entry_price=current_price,
+                        quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
+                        agent_id=self.agent_id,
+                        signal_confidence=0.5,
+                        indicators={"rsi": rsi},
+                    )
+                    can_open_short = review.approved
+                    reason_short = review.reason
+                if not can_open_short:
+                    logger.warning(f"[{self.agent_id}] 门校省否决开空: {reason_short}")
+                    result["signal"] = f"门校省否决({reason_short})"
+                else:
+                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="sell")
+                    result["signal"] = "SHORT"
             elif filtered_sig == Signal.HOLD and signal_val == Signal.BUY:
                 result["signal"] = "HOLD（AI否决）"
         else:
@@ -1053,11 +1256,16 @@ class TradingAgent:
         # 持仓状态
         if self.position:
             entry = self.position["entry_price"]
-            pnl = (current_price - entry) / entry * 100
+            pos_side_disp = self.position.get("side", "long")
+            if pos_side_disp == "short":
+                pnl = (entry - current_price) / entry * 100
+            else:
+                pnl = (current_price - entry) / entry * 100
             result["position"] = {
                 "entry_price": entry,
                 "current_price": current_price,
                 "pnl_pct": pnl,
+                "side": pos_side_disp,
                 "stop_loss": self.position["stop_loss"],
                 "take_profit": self.position["take_profit"],
                 "quantity": self.position["quantity"],
@@ -1067,8 +1275,15 @@ class TradingAgent:
 
     def _get_equity(self, current_price: float) -> float:
         if self.position:
+            pos_side_eq = self.position.get("side", "long")
             qty = self.position["quantity"]
-            return self.capital + qty * current_price
+            entry = self.position["entry_price"]
+            if pos_side_eq == "short":
+                # 资本已含做空所得，权益 = 资本 + 浮动盈亏
+                return self.capital + qty * (entry - current_price)
+            else:
+                # 资本已扣买入成本，权益 = 资本 + 当前市值
+                return self.capital + qty * current_price
         return self.capital
 
     # -------------------- 持久化 --------------------
@@ -1078,12 +1293,13 @@ class TradingAgent:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
-            SELECT symbol, entry_price, entry_time, stop_loss, take_profit, quantity, exchange
+            SELECT symbol, entry_price, entry_time, stop_loss, take_profit, quantity, exchange, side
             FROM positions WHERE status = 'open' AND symbol = ? ORDER BY id DESC LIMIT 1
         """, (self.symbol,))
         row = c.fetchone()
         conn.close()
         if row:
+            side_val = row[7] if len(row) > 7 else "long"
             self.position = {
                 "symbol": row[0],
                 "entry_price": row[1],
@@ -1091,9 +1307,18 @@ class TradingAgent:
                 "stop_loss": row[3],
                 "take_profit": row[4],
                 "quantity": row[5],
-                "exchange": row[6],
+                "exchange": row[6] if len(row) > 6 else "binance",
+                "side": side_val,
             }
-            self.capital = 0.0
+            # 恢复时扣除/增加持仓成本（根据多空方向）
+            entry_price = row[1]
+            qty = row[5]
+            side_val = row[7] if len(row) > 7 else "long"
+            cost = qty * (entry_price if entry_price > 0 else 1.0)
+            if side_val == "short":
+                self.capital += cost  # 做空：收到卖出所得
+            else:
+                self.capital -= cost  # 做多：支付买入成本
             logger.info("[%s] 恢复未平持仓: %s 价格 $%.2f  数量 %.6f",
                         self.agent_id, row[0], row[1], row[5])
 
@@ -1104,7 +1329,7 @@ class TradingAgent:
             INSERT INTO equity_log (agent_id, timestamp, price, equity, position_value, in_position, rsi)
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (self.agent_id, timestamp, price, equity,
-              self.position["quantity"] * price if self.position else 0.0,
+              (self.position["quantity"] * (2 * self.position["entry_price"] - price) if self.position.get("side") == "short" else self.position["quantity"] * price) if self.position else 0.0,
               1 if self.position else 0, rsi))
         conn.commit()
         conn.close()
@@ -1184,10 +1409,13 @@ class MultiAgentOrchestrator:
         self.shangshu: Optional[ShangshuSheng] = None
         if _SHANGSHU_AVAILABLE and live_trading:
             try:
+                # 测试网优先用专用 Key，空则降级到实盘 Key
+                api_key_to_use = (LIVE_TESTNET_API_KEY or LIVE_API_KEY)
+                api_secret_to_use = (LIVE_TESTNET_API_SECRET or LIVE_API_SECRET)
                 shangshu_kwargs = {
                     "exchange": LIVE_EXCHANGE,
-                    "api_key": LIVE_API_KEY,
-                    "api_secret": LIVE_API_SECRET,
+                    "api_key": api_key_to_use,
+                    "api_secret": api_secret_to_use,
                     "testnet": LIVE_TESTNET,
                     "db_path": DB_PATH,
                 }
@@ -1261,6 +1489,7 @@ class MultiAgentOrchestrator:
                 overbought=ob_val,
                 stop_loss_pct=sl_val,
                 take_profit_pct=tp_val,
+                initial_capital=LIVE_INITIAL_CAPITAL,
                 formula=resolved_formula,
                 # 三省六部注入
                 menxia=self.menxia,
@@ -1353,15 +1582,20 @@ class MultiAgentOrchestrator:
         total_return = 0.0
         for s in status_list:
             pos_info = "持有中" if s["position"] else "空仓"
+            pos_side_ps = s["position"].get("side", "long") if s["position"] else ""
+            side_label = f"({'做空' if pos_side_ps == 'short' else '做多'})" if pos_side_ps else ""
             price_str = f"${s['current_price']:.2f}" if s["current_price"] else "N/A"
             print(f"\n  [{s['agent_id']}] {s['symbol']} @ {s['exchange']}  ({s['strategy']})")
             print(f"    当前价格    : {price_str}")
             print(f"    模拟资金    : ${s['capital']:.2f}")
             print(f"    总资产      : ${s['equity']:.2f}  ({s['total_return_pct']:+.2f}%)")
-            print(f"    持仓状态    : {pos_info}")
+            print(f"    持仓状态    : {pos_info}{side_label}")
             if s["position"]:
                 p = s["position"]
-                pnl = (s["current_price"] - p["entry_price"]) / p["entry_price"] * 100 if s["current_price"] else 0
+                if p.get("side") == "short":
+                    pnl = (p["entry_price"] - s["current_price"]) / p["entry_price"] * 100 if s["current_price"] else 0
+                else:
+                    pnl = (s["current_price"] - p["entry_price"]) / p["entry_price"] * 100 if s["current_price"] else 0
                 print(f"    入场价      : ${p['entry_price']:.2f}")
                 print(f"    持仓盈亏    : {pnl:+.2f}%")
             total_return += s["total_return_pct"]
@@ -1371,6 +1605,12 @@ class MultiAgentOrchestrator:
         print(f"  平均收益率  : {avg_return:+.2f}%")
         print("=" * 70)
 
+
+# ============================================================
+# 模块级编排器引用（供 Dashboard 等外部模块访问运行中实例）
+# ============================================================
+
+orchestrator = None
 
 # ============================================================
 # API Key 安全验证命令
@@ -1476,6 +1716,7 @@ def main():
         return
 
     # 多 Agent 模式
+    global orchestrator
     orchestrator = MultiAgentOrchestrator()
 
     if args.check:

@@ -1,10 +1,10 @@
 """
-Weex 交易所适配器 - REST API v3
+Weex 交易所适配器 - REST API v3（合约版）
 用于 live_trading.py 实盘交易
 
 API 文档: https://www.weex.com/api-doc
 参考: ccxt weex.py (Exchange v3)
-支持: 币币现货交易
+支持: USDT本位永续合约（Perpetual Swap）
 """
 
 import base64
@@ -13,11 +13,15 @@ import hmac
 import json
 import logging
 import socket
+import ssl
 import time
+import uuid
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 
 import requests
+from urllib3.poolmanager import PoolManager
+from requests.adapters import HTTPAdapter
 
 # 抑制 SSH 隧道 localhost 自签名证书的 SSL 警告
 import urllib3
@@ -26,13 +30,42 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 常量 — 基于 Weex API v3（ccxt 官方适配）
+# 常量 — Weex 合约 API（api-contract.weex.com）
 # ============================================================
 
-BASE_URL = "https://api-spot.weex.com"        # 现货 API
+BASE_URL = "https://api-contract.weex.com"   # 合约 API
 TUNNEL_HOST = "127.0.0.1"
-TUNNEL_PORT = 8891                            # SSH 隧道：localhost:8891 → api-spot.weex.com:443
+TUNNEL_PORT = 8892                            # SSH 隧道：localhost:8892 → api-contract.weex.com:443
 TIMEOUT = 15
+API_HOST = "api-contract.weex.com"            # CloudFront SNI 所需
+
+# 合约步长表 — Weex 合约最小下单量（stepSize），key 为币种名（不含USDT）
+_CONTRACT_STEP_SIZES = {
+    "BTC": 0.001,
+    "ETH": 0.01,
+    "BNB": 0.01,
+    "SOL": 0.1,
+    "XRP": 1.0,
+    "ADA": 1.0,
+    "DOGE": 10.0,
+    "DOT": 1.0,
+    "MATIC": 1.0,
+    "AVAX": 0.1,
+    "LINK": 0.1,
+    "UNI": 0.1,
+    "LTC": 0.1,
+    "FIL": 0.1,
+    "ARB": 1.0,
+    "OP": 1.0,
+    "SUI": 10.0,
+    "ZEC": 0.01,
+}
+
+def _round_quantity(symbol: str, quantity: float) -> float:
+    """将数量截断到合约步长精度"""
+    coin = symbol.upper().split("/")[0] if "/" in symbol else symbol.upper()
+    step = _CONTRACT_STEP_SIZES.get(coin, 0.01)
+    return float(int(quantity / step) * step)
 
 # 交易对映射：友好符号 → Weex 内部格式（无斜线）
 SYMBOL_MAP = {
@@ -84,11 +117,35 @@ _ORDER_STATUS_MAP = {
 
 
 # ============================================================
+# CloudFront SNI 修复（合约 API 通过 CloudFront 需要正确的 SNI）
+# ============================================================
+
+class _SNIAdapter(HTTPAdapter):
+    """强制设置 TLS SNI 为真实主机名，而非 localhost"""
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["assert_hostname"] = False
+        kwargs["server_hostname"] = API_HOST
+        return super().init_poolmanager(*args, **kwargs)
+
+
+# 全局 session，隧道模式下复用（自动处理 SNI）
+_sni_session: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+    global _sni_session
+    if _sni_session is None:
+        _sni_session = requests.Session()
+        _sni_session.mount("https://", _SNIAdapter())
+    return _sni_session
+
+
+# ============================================================
 # 隧道支持（通过 VPS 代理访问 Weex，解决国际访问限制）
 # ============================================================
 
 def _is_tunnel_active() -> bool:
-    """检测 Weex 隧道是否可用（连接 localhost:8891）"""
+    """检测 Weex 隧道是否可用（连接 localhost:8892）"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(1)
     try:
@@ -108,6 +165,13 @@ def _get_base_url() -> str:
 def _get_verify_ssl() -> bool:
     """隧道模式下跳过 SSL 验证（本地转发使用自签名证书）"""
     return not _is_tunnel_active()
+
+
+def _get_http_session() -> requests.Session:
+    """获取 HTTP session：隧道模式用 SNI 修复 session，直连用默认"""
+    if _is_tunnel_active():
+        return _get_session()
+    return requests.Session()
 
 
 # ============================================================
@@ -169,7 +233,6 @@ def _sign_v3(
         dict: HTTP headers
     """
     timestamp = str(int(time.time() * 1000))
-    # endpoint 去掉前导斜杠，避免签名出现双斜线 //api/v3/...
     clean_endpoint = endpoint.lstrip('/')
     payload_str = timestamp + method.upper() + '/' + clean_endpoint
 
@@ -203,16 +266,17 @@ def _get(endpoint: str, params: Optional[Dict] = None,
          api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
     """GET 请求"""
     url = f"{_get_base_url()}{endpoint}"
+    sess = _get_http_session()
     try:
         if api_key and api_secret:
             headers = _sign_v3(api_key, api_secret, api_passphrase, "GET", endpoint)
         else:
             headers = {"User-Agent": "trading-system/2.0"}
-        # 隧道模式下显式设置 Host 头以通过 Cloudflare
+        # 隧道模式下显式设置 Host 头以通过 CloudFront
         if _is_tunnel_active():
-            headers["Host"] = "api-spot.weex.com"
-        resp = requests.get(url, params=params, headers=headers,
-                           timeout=TIMEOUT, verify=_get_verify_ssl())
+            headers["Host"] = API_HOST
+        resp = sess.get(url, params=params, headers=headers,
+                        timeout=TIMEOUT, verify=_get_verify_ssl())
         return _parse_response(resp)
     except requests.exceptions.Timeout:
         logger.warning(f"Weex GET 超时: {endpoint}")
@@ -229,13 +293,15 @@ def _post(endpoint: str, params: Optional[Dict] = None,
           api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
     """POST 请求"""
     url = f"{_get_base_url()}{endpoint}"
+    sess = _get_http_session()
     try:
         headers = _sign_v3(api_key, api_secret, api_passphrase, "POST", endpoint, params or {})
         if _is_tunnel_active():
-            headers["Host"] = "api-spot.weex.com"
+            headers["Host"] = API_HOST
         body = json.dumps(params or {}, separators=(",", ":"))
-        resp = requests.post(url, data=body, headers=headers,
-                            timeout=TIMEOUT, verify=_get_verify_ssl())
+        logger.debug(f"Weex POST {endpoint} body={body}")
+        resp = sess.post(url, data=body, headers=headers,
+                         timeout=TIMEOUT, verify=_get_verify_ssl())
         return _parse_response(resp)
     except requests.exceptions.Timeout:
         logger.warning(f"Weex POST 超时: {endpoint}")
@@ -252,13 +318,14 @@ def _delete(endpoint: str, params: Optional[Dict] = None,
             api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
     """DELETE 请求"""
     url = f"{_get_base_url()}{endpoint}"
+    sess = _get_http_session()
     try:
         headers = _sign_v3(api_key, api_secret, api_passphrase, "DELETE", endpoint, params or {})
         if _is_tunnel_active():
-            headers["Host"] = "api-spot.weex.com"
+            headers["Host"] = API_HOST
         body = json.dumps(params or {}, separators=(",", ":"))
-        resp = requests.delete(url, data=body, headers=headers,
-                              timeout=TIMEOUT, verify=_get_verify_ssl())
+        resp = sess.delete(url, data=body, headers=headers,
+                           timeout=TIMEOUT, verify=_get_verify_ssl())
         return _parse_response(resp)
     except requests.exceptions.Timeout:
         logger.warning(f"Weex DELETE 超时: {endpoint}")
@@ -283,6 +350,10 @@ def _parse_response(resp: requests.Response) -> Optional[Dict]:
         logger.warning(f"Weex HTTP {resp.status_code}: {data}")
         return None
 
+    # 部分合约 endpoint（如 balance）直接返回 list，无需 code 检查
+    if isinstance(data, list):
+        return data
+
     # v3 错误格式: {"code": -1047, "msg": "API auth failed"}
     code = data.get("code")
     if code is not None and code != 0:
@@ -301,7 +372,7 @@ def fetch_ticker(symbol: str) -> Optional[Dict]:
     """
     获取单个交易对 24hr 行情
 
-    GET /api/v3/market/ticker/24hr?symbol=BTCUSDT
+    GET /capi/v3/market/ticker/24hr?symbol=BTCUSDT
 
     Returns:
         dict: {
@@ -311,11 +382,11 @@ def fetch_ticker(symbol: str) -> Optional[Dict]:
     """
     weex_sym = _to_weex_symbol(symbol)
 
-    data = _get("/api/v3/market/ticker/24hr", params={"symbol": weex_sym})
+    data = _get("/capi/v3/market/ticker/24hr", params={"symbol": weex_sym})
     if not data:
         return None
 
-    # v3 ticker/24hr 返回单对象（可能包含在列表中）
+    # 合约 API ticker 可能返回列表，取第一个元素
     ticker = data
     if isinstance(data, list) and len(data) > 0:
         ticker = data[0]
@@ -326,7 +397,7 @@ def fetch_ticker(symbol: str) -> Optional[Dict]:
             "pair": _to_ccxt_symbol(ticker.get("symbol", weex_sym)),
             "price": float(ticker.get("lastPrice", 0)),
             "change_24h": float(ticker.get("priceChange", 0)),
-            "change_24h_pct": float(ticker.get("priceChangePercent", 0)) * 100,
+            "change_24h_pct": float(ticker.get("priceChangePercent", 0)) / 100,
             "high_24h": float(ticker.get("highPrice", 0)),
             "low_24h": float(ticker.get("lowPrice", 0)),
             "volume_24h": float(ticker.get("volume", 0)),
@@ -349,7 +420,7 @@ def fetch_ohlcv(
     """
     获取 OHLCV K线数据
 
-    GET /api/v3/market/klines?symbol=BTCUSDT&interval=1h&limit=100
+    GET /capi/v3/market/klines?symbol=BTCUSDT&interval=1h&limit=100
 
     Args:
         since: 起始时间戳（毫秒）
@@ -367,13 +438,13 @@ def fetch_ohlcv(
         "limit": min(limit, 1000),
     }
     if since is not None:
-        params["startTime"] = since
+        params["endTime"] = since
 
-    data = _get("/api/v3/market/klines", params=params)
+    data = _get("/capi/v3/market/klines", params=params)
     if not data:
         return None
 
-    # v3 klines 返回 [[ts, open, high, low, close, vol, ...], ...]
+    # 合约 API klines 返回 [[ts, open, high, low, close, vol, ...], ...]
     raw_list = data if isinstance(data, list) else data.get("data", [])
     if not isinstance(raw_list, list):
         logger.warning(f"Weex klines 格式异常: {type(raw_list)}")
@@ -402,13 +473,13 @@ def fetch_order_book(symbol: str, limit: int = 10) -> Optional[Dict]:
     """
     获取订单簿深度
 
-    GET /api/v3/market/depth?symbol=BTCUSDT&limit=10
+    GET /capi/v3/market/depth?symbol=BTCUSDT&limit=10
 
     Returns:
         dict: {bids: [[price, qty], ...], asks: [[price, qty], ...]}
     """
     weex_sym = _to_weex_symbol(symbol)
-    data = _get("/api/v3/market/depth", params={"symbol": weex_sym, "limit": limit})
+    data = _get("/capi/v3/market/depth", params={"symbol": weex_sym, "limit": limit})
     if not data:
         return None
 
@@ -431,9 +502,13 @@ def fetch_balance(
     api_passphrase: str = "",
 ) -> Optional[Dict]:
     """
-    获取账户余额
+    获取合约账户余额
 
-    GET /api/v3/account/
+    GET /capi/v3/account/balance
+
+    合约 API 响应格式：
+        [{"asset":"USDT","balance":"318.48","availableBalance":"318.48",
+          "frozen":"0","unrealizePnl":"0"}]
 
     Returns:
         dict: {
@@ -443,15 +518,16 @@ def fetch_balance(
             balances: [{"asset": "USDT", "free": ..., "locked": ...}, ...]
         }
     """
-    data = _get("/api/v3/account/",
+    data = _get("/capi/v3/account/balance",
                 api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if not data:
         return None
 
     try:
-        balances_raw = data.get("balances", data.get("data", data))
+        # 合约 API 返回列表: [{"asset":"USDT", ...}, ...]
+        balances_raw = data if isinstance(data, list) else data.get("data", data)
         if not isinstance(balances_raw, list):
-            balances_raw = data if isinstance(data, list) else []
+            balances_raw = [balances_raw] if isinstance(balances_raw, dict) else []
 
         balances = []
         total = 0.0
@@ -459,17 +535,20 @@ def fetch_balance(
         frozen = 0.0
 
         for b in balances_raw:
-            free = float(b.get("free", 0))
-            locked = float(b.get("locked", 0))
+            # 合约 API 字段: balance / availableBalance / frozen
+            bal = float(b.get("balance", b.get("free", 0)))
+            avail = float(b.get("availableBalance", b.get("free", 0)))
+            locked = float(b.get("frozen", b.get("locked", 0)))
+
             balances.append({
                 "asset": b.get("asset", ""),
-                "free": free,
+                "free": avail,
                 "locked": locked,
             })
-            available += free
+            total += bal
+            available += avail
             frozen += locked
 
-        total = available + frozen
         return {
             "total": total,
             "available": available,
@@ -491,55 +570,75 @@ def create_order(
     amount: float,
     price: Optional[float] = None,
     client_order_id: Optional[str] = None,
+    reduce_only: bool = False,
+    position_side: Optional[str] = None,
 ) -> Optional[Dict]:
     """
-    创建订单
+    创建合约订单
 
-    POST /api/v3/order
+    POST /capi/v3/order
 
     Request body:
-        {"symbol":"ETHUSDT","side":"BUY","type":"LIMIT","quantity":"1.5","price":"2000"}
+        {"symbol":"ETHUSDT","side":"BUY","type":"LIMIT","quantity":"1.5","price":"2000","positionSide":"BOTH"}
+
+    合约额外字段:
+        reduceOnly: 仅减仓（平仓模式）
+        positionSide: 持仓方向（BOTH=单向模式, LONG/SHORT=双向模式，默认BOTH）
 
     Response:
-        {"symbol":"ETHUSDT","orderId":"736557215397183592",
-         "clientOrderId":"c455...","transactTime":1775608924724}
+        {"code":0, "data":{"orderId":"736557215397183592", ...}}
 
     Returns:
         dict: {id, symbol, side, type, price, amount, filled, status, created_at, ...}
     """
     weex_sym = _to_weex_symbol(symbol)
 
+    # 数量对齐合约步长
+    rounded_qty = _round_quantity(symbol, amount)
+
+    # positionSide: Weex 合约默认单向模式用 LONG/SHORT（根据 side 推断）
+    if position_side is None:
+        position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+
     params: Dict[str, Any] = {
         "symbol": weex_sym,
         "side": side.upper(),
         "type": order_type.upper(),
-        "quantity": str(amount),
+        "quantity": str(rounded_qty),
+        "positionSide": position_side,
     }
     if order_type.upper() == "LIMIT" and price is not None:
         params["price"] = str(price)
+    if reduce_only:
+        params["reduceOnly"] = True
     if client_order_id:
-        params["clientOrderId"] = client_order_id
+        params["newClientOrderId"] = client_order_id
+    else:
+        params["newClientOrderId"] = str(uuid.uuid4())
 
-    data = _post("/api/v3/order", params=params,
+    data = _post("/capi/v3/order", params=params,
                  api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if not data:
         return None
 
+    # 合约 API 响应: {"code":0, "data":{...}}
+    order_data = data.get("data", data) if isinstance(data, dict) else {}
+
     try:
         return {
-            "id": str(data.get("orderId", "")),
-            "client_order_id": data.get("clientOrderId", ""),
+            "id": str(order_data.get("orderId", "")),
+            "client_order_id": order_data.get("clientOrderId", ""),
             "symbol": symbol,
             "side": side.lower(),
             "type": order_type.lower(),
             "price": float(price or 0),
-            "amount": float(amount),
+            "amount": float(rounded_qty),
             "filled": 0.0,
             "status": "open",
             "created_at": datetime.fromtimestamp(
-                data.get("transactTime", 0) / 1000
-            ).isoformat() if data.get("transactTime") else "",
-            "raw": data,
+                order_data.get("transactTime", 0) / 1000
+            ).isoformat() if order_data.get("transactTime") else "",
+            "raw": order_data,
         }
     except Exception as e:
         logger.error(f"Weex 解析订单失败: {e}, raw={data}")
@@ -556,13 +655,13 @@ def cancel_order(
     """
     撤销订单
 
-    DELETE /api/v3/order
+    DELETE /capi/v3/order
     Body: {"symbol":"ETHUSDT","orderId":"736557215397183592"}
     """
     weex_sym = _to_weex_symbol(symbol)
     params = {"symbol": weex_sym, "orderId": order_id}
 
-    data = _delete("/api/v3/order", params=params,
+    data = _delete("/capi/v3/order", params=params,
                    api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if data is None:
         return False
@@ -578,13 +677,13 @@ def fetch_open_orders(
     """
     查询活跃订单
 
-    GET /api/v3/openOrders?symbol=ETHUSDT
+    GET /capi/v3/openOrders?symbol=ETHUSDT
     """
     params = {}
     if symbol:
         params["symbol"] = _to_weex_symbol(symbol)
 
-    data = _get("/api/v3/openOrders", params=params,
+    data = _get("/capi/v3/openOrders", params=params,
                 api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if not data:
         return []
@@ -630,34 +729,37 @@ def fetch_order(
     """
     查询单个订单
 
-    GET /api/v3/order?orderId=736557215397183592&symbol=ETHUSDT
+    GET /capi/v3/order?orderId=736557215397183592&symbol=ETHUSDT
     """
     params: Dict[str, str] = {"orderId": str(order_id)}
     if symbol:
         params["symbol"] = _to_weex_symbol(symbol)
 
-    data = _get("/api/v3/order", params=params,
+    data = _get("/capi/v3/order", params=params,
                 api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
     if not data:
         return None
 
+    # 合约 API 响应: {"code":0, "data":{...}}
+    order_data = data.get("data", data) if isinstance(data, dict) else {}
+
     try:
-        sym = data.get("symbol", "")
+        sym = order_data.get("symbol", "")
         return {
-            "id": str(data.get("orderId", "")),
-            "client_order_id": data.get("clientOrderId", ""),
+            "id": str(order_data.get("orderId", "")),
+            "client_order_id": order_data.get("clientOrderId", ""),
             "symbol": _from_weex_symbol(sym),
             "pair": _to_ccxt_symbol(sym),
-            "side": data.get("side", "").lower(),
-            "type": data.get("type", "").lower(),
-            "price": float(data.get("price", 0)),
-            "amount": float(data.get("origQty", 0)),
-            "filled": float(data.get("executedQty", 0)),
-            "avg_price": float(data.get("avgPrice", 0) or data.get("price", 0)),
-            "status": _ORDER_STATUS_MAP.get(data.get("status", ""), data.get("status", "").lower()),
+            "side": order_data.get("side", "").lower(),
+            "type": order_data.get("type", "").lower(),
+            "price": float(order_data.get("price", 0)),
+            "amount": float(order_data.get("origQty", 0)),
+            "filled": float(order_data.get("executedQty", 0)),
+            "avg_price": float(order_data.get("avgPrice", 0) or order_data.get("price", 0)),
+            "status": _ORDER_STATUS_MAP.get(order_data.get("status", ""), order_data.get("status", "").lower()),
             "created_at": datetime.fromtimestamp(
-                data.get("time", 0) / 1000
-            ).isoformat() if data.get("time") else "",
+                order_data.get("time", 0) / 1000
+            ).isoformat() if order_data.get("time") else "",
         }
     except Exception as e:
         logger.error(f"Weex 解析订单失败: {e}, raw={data}")
@@ -689,7 +791,7 @@ def get_candles(
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Weex API v3 适配器测试")
+    print("Weex 合约 API v3 适配器测试")
     print("=" * 60)
 
     # 公开接口测试（无需 API Key）
@@ -720,4 +822,4 @@ if __name__ == "__main__":
         print(f"  ETH 买一: {ob['bids'][0] if ob['bids'] else 'N/A'}")
         print(f"  ETH 卖一: {ob['asks'][0] if ob['asks'] else 'N/A'}")
 
-    print("\n✅ Weex v3 适配器测试完成")
+    print("\n✅ Weex 合约 v3 适配器测试完成")

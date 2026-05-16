@@ -61,7 +61,7 @@ STRATEGY_TIMEFRAME = os.getenv("STRATEGY_TIMEFRAME", "4h")
 
 # ── 全局默认值（单策略 / VOTE 子策略用）───────────────────
 STRATEGY_RSI_PERIOD = int(os.getenv("STRATEGY_RSI_PERIOD", "14"))
-STRATEGY_RSI_OVERSOLD = float(os.getenv("STRATEGY_RSI_OVERSOLD", "28.0"))
+STRATEGY_RSI_OVERSOLD = float(os.getenv("STRATEGY_RSI_OVERSOLD", "30.0"))
 STRATEGY_RSI_OVERBOUGHT = float(os.getenv("STRATEGY_RSI_OVERBOUGHT", "65.0"))
 STRATEGY_STOP_LOSS = float(os.getenv("STRATEGY_STOP_LOSS", "0.020"))   # 2.0%
 STRATEGY_TAKE_PROFIT = float(os.getenv("STRATEGY_TAKE_PROFIT", "0.04"))  # 4%
@@ -69,10 +69,10 @@ STRATEGY_CAPITAL_PCT = float(os.getenv("STRATEGY_CAPITAL_PCT", "1.0"))
 
 # ── 逐标的 Grid Search 最优参数（VOTE 策略时按标的选用）───
 OPTIMAL_PARAMS = {
-    "BTC/USDT": dict(rsi_period=10, oversold=18.0, overbought=65.0, stop_loss=0.040, take_profit=0.080),
-    "ETH/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
-    "SOL/USDT":  dict(rsi_period=10, oversold=20.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
-    "SUI/USDT":  dict(rsi_period=10, oversold=25.0, overbought=65.0, stop_loss=0.012, take_profit=0.025),  # Grid Search 2026-05-09 Score=5.30 Ret=10.54% DD=14.83% WR=43.5%
+    "BTC/USDT": dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.040, take_profit=0.080),
+    "ETH/USDT": dict(rsi_period=14, oversold=30.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
+    "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
+    "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.012, take_profit=0.025),  # Grid Search 2026-05-09
     # KYVE/USDT, PYTH/USDT: 无交易所历史数据（数据不足0条），暂沿用全局默认值 stop_loss=0.025 take_profit=0.050
 }
 
@@ -130,10 +130,19 @@ LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "tr
 # 实盘交易所：binance / gateio / bybit / bitget / hyperliquid / weex
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "binance")
 # 实盘 API Key（建议使用只读+交易权限的 Trade-only Key）
-LIVE_API_KEY = os.getenv("LIVE_API_KEY", "") or os.getenv("WEEX_API_KEY", "")
-LIVE_API_SECRET = os.getenv("LIVE_API_SECRET", "") or os.getenv("WEEX_API_SECRET", "")
-# 测试网模式（不消耗真实资金）
+LIVE_API_KEY     = os.getenv("LIVE_API_KEY", "") or os.getenv("WEEX_API_KEY", "")
+LIVE_API_SECRET  = os.getenv("LIVE_API_SECRET", "") or os.getenv("WEEX_API_SECRET", "")
+# 测试网 API Key（Bybit/Binance 测试网专用，空则用实盘 Key 自动降级）
+LIVE_TESTNET_API_KEY     = os.getenv("LIVE_TESTNET_API_KEY", "")
+LIVE_TESTNET_API_SECRET = os.getenv("LIVE_TESTNET_API_SECRET", "")
+# 测试网模式（不消耗真实资金，默认 true）
 LIVE_TESTNET = os.getenv("LIVE_TESTNET", "true").lower() == "true"
+# 测试网时优先使用测试网 Key（空则复用实盘 Key）
+def _resolve_testnet_keys():
+    if LIVE_TESTNET:
+        return (LIVE_TESTNET_API_KEY or LIVE_API_KEY,
+                LIVE_TESTNET_API_SECRET or LIVE_API_SECRET)
+    return (LIVE_API_KEY, LIVE_API_SECRET)
 # 单笔下单金额占比（每次开仓使用资金的 %）
 LIVE_ORDER_CAPITAL_PCT = float(os.getenv("LIVE_ORDER_CAPITAL_PCT", "1.0"))
 # 实盘初始资金（每个 Agent）
@@ -157,3 +166,47 @@ RISK_MAX_HOLDING_HOURS = int(os.getenv("RISK_MAX_HOLDING_HOURS", "72"))
 # 通达信公式编译服务地址（未来对接金策智算 tdx/ 模块）
 TDX_SERVER_HOST = os.getenv("TDX_SERVER_HOST", "localhost")
 TDX_SERVER_PORT = int(os.getenv("TDX_SERVER_PORT", "8765"))
+
+# ============================================================
+# 策略1：多因子趋势系统（Multi-Factor Trend Strategy）参数
+# ============================================================
+MULTIFACTOR_MIN_SCORE      = int(os.getenv("MULTIFACTOR_MIN_SCORE", "65"))       # 最低打分阈值
+MULTIFACTOR_EMA_PERIOD     = int(os.getenv("MULTIFACTOR_EMA_PERIOD", "200"))     # EMA周期（200小时）
+MULTIFACTOR_ATR_PERIOD     = int(os.getenv("MULTIFACTOR_ATR_PERIOD", "14"))     # ATR周期
+MULTIFACTOR_ATR_MULTIPLIER = float(os.getenv("MULTIFACTOR_ATR_MULTIPLIER", "2.5"))  # ATR止损倍数
+MULTIFACTOR_MAX_POSITION   = float(os.getenv("MULTIFACTOR_MAX_POSITION", "0.08"))  # 最大单币仓位 8%
+MULTIFACTOR_TRAILING_PCT   = float(os.getenv("MULTIFACTOR_TRAILING_PCT", "0.10"))  # 移动止盈回调比例
+MULTIFACTOR_STOP_LOSS_PCT  = float(os.getenv("MULTIFACTOR_STOP_LOSS_PCT", "0.12"))  # 止损-12%
+MULTIFACTOR_TP1_PCT       = float(os.getenv("MULTIFACTOR_TP1_PCT", "0.25"))    # 第一止盈目标+25%
+MULTIFACTOR_TP2_PCT       = float(os.getenv("MULTIFACTOR_TP2_PCT", "0.50"))    # 第二止盈目标+50%
+MULTIFACTOR_FUNDING_THRESH = float(os.getenv("MULTIFACTOR_FUNDING_THRESH", "0.0005"))  # 资金费率上限 0.05%
+
+# ============================================================
+# 策略2：资金费率套利（Funding Rate Arbitrage）参数
+# ============================================================
+FUNDING_ARB_MIN_RATE   = float(os.getenv("FUNDING_ARB_MIN_RATE", "0.0003"))    # 最小资金费率 0.03%
+FUNDING_ARB_MAX_RATE   = float(os.getenv("FUNDING_ARB_MAX_RATE", "0.0100"))    # 最大资金费率 1%（避免陷阱）
+FUNDING_ARB_REBALANCE_H = int(os.getenv("FUNDING_ARB_REBALANCE_H", "6"))       # 检查间隔（小时）
+FUNDING_ARB_TARGET_MONTHLY = float(os.getenv("FUNDING_ARB_TARGET_MONTHLY", "0.015"))  # 月度目标收益 1.5%
+
+# ============================================================
+# 策略3：统计套利（Statistical Arbitrage）参数
+# ============================================================
+STAT_ARB_PAIR_SYMBOL   = os.getenv("STAT_ARB_PAIR_SYMBOL", "ETH")              # 配对标的
+STAT_ARB_LOOKBACK      = int(os.getenv("STAT_ARB_LOOKBACK", "30"))            # Z-score回看窗口
+STAT_ARB_Z_ENTRY       = float(os.getenv("STAT_ARB_Z_ENTRY", "2.0"))          # 入场Z-score阈值
+STAT_ARB_Z_EXIT        = float(os.getenv("STAT_ARB_Z_EXIT", "0.5"))           # 平仓Z-score阈值
+STAT_ARB_Z_LOSS        = float(os.getenv("STAT_ARB_Z_LOSS", "3.5"))           # 止损Z-score阈值
+
+# 预设配对列表
+STAT_ARB_PAIRS = {
+    "BTC-ETH":  ("BTC/USDT", "ETH/USDT"),
+    "SOL-AVAX": ("SOL/USDT", "AVAX/USDT"),
+    "SOL-NEAR": ("SOL/USDT", "NEAR/USDT"),
+}
+
+# ============================================================
+# 全局风控补充（黑天鹅保护）
+# ============================================================
+BLACK_SWAN_DROP_PCT   = float(os.getenv("BLACK_SWAN_DROP_PCT", "0.08"))   # BTC单日跌>8%强平所有杠杆仓
+MAX_DRAWDOWN_LOCK_PCT = float(os.getenv("MAX_DRAWDOWN_LOCK_PCT", "0.15"))  # 总资金回撤>15%暂停所有新仓)

@@ -197,7 +197,7 @@ def _gateio_api_tunnel(symbol: str) -> Optional[Dict]:
             "pair": pair.replace("_", "/"),
             "price": float(ticker.get("last", 0)),
             "change_24h": float(ticker.get("change_percentage", 0)),
-            "change_24h_pct": float(ticker.get("change_percentage", 0)),
+            "change_24h_pct": float(ticker.get("change_percentage", 0)) / 100,
             "high_24h": float(ticker.get("high_24h", 0)),
             "low_24h": float(ticker.get("low_24h", 0)),
             "volume_24h": float(ticker.get("quote_volume", 0)),
@@ -233,7 +233,7 @@ def get_crypto_price(symbol: str) -> Optional[Dict]:
             "pair": ccxt_symbol,
             "price": ticker.get("last"),
             "change_24h": ticker.get("change"),
-            "change_24h_pct": ticker.get("percentage"),
+            "change_24h_pct": float(ticker.get("percentage", 0) or 0) / 100,
             "high_24h": ticker.get("high"),
             "low_24h": ticker.get("low"),
             "volume_24h": ticker.get("quoteVolume"),
@@ -478,7 +478,7 @@ def _gateio_fallback(symbol: str) -> Optional[Dict]:
             "pair": pair.replace("_", "/"),
             "price": float(ticker.get("last", 0)),
             "change_24h": float(ticker.get("change_percentage", 0)),
-            "change_24h_pct": float(ticker.get("change_percentage", 0)),
+            "change_24h_pct": float(ticker.get("change_percentage", 0)) / 100,
             "high_24h": float(ticker.get("high_24h", 0)),
             "low_24h": float(ticker.get("low_24h", 0)),
             "volume_24h": float(ticker.get("quote_volume", 0)),
@@ -722,6 +722,286 @@ def get_hyperliquid_order_book(symbol: str = "ETH", limit: int = 10) -> Optional
         "asks": [[float(p), float(s)] for p, s in orderbook.get("asks", [])],
         "timestamp": datetime.now().isoformat(),
         "exchange": "hyperliquid",
+    }
+
+
+# ============================================================
+# 多因子系统数据接口（2026-05-14 新增）
+# ============================================================
+
+# Fear & Greed Index API
+FNG_API_URL = "https://api.alternative.me/fng/"
+FNG_CACHE_TTL = 3600  # 1小时缓存
+_last_fng_fetch = {"timestamp": 0, "value": None, "classification": None}
+
+
+@retry_on_network_error(max_retries=3, base_delay=2.0)
+def get_fear_and_greed_index() -> Optional[Dict]:
+    """
+    获取 CNN Fear & Greed Index（恐惧贪婪指数）
+
+    Returns:
+        {
+            "value": int,        # 0-100
+            "classification": str,  # "Extreme Fear" / "Fear" / "Neutral" / "Greed" / "Extreme Greed"
+            "timestamp": str,    # ISO时间
+        }
+    """
+    import time
+    global _last_fng_fetch
+
+    # 缓存检查
+    if (_last_fng_fetch["value"] is not None and
+            time.time() - _last_fng_fetch["timestamp"] < FNG_CACHE_TTL):
+        return {
+            "value": _last_fng_fetch["value"],
+            "classification": _last_fng_fetch["classification"],
+            "timestamp": datetime.now().isoformat(),
+            "cached": True,
+        }
+
+    try:
+        resp = requests.get(FNG_API_URL, timeout=15)
+        if resp.status_code != 200:
+            logger.warning(f"Fear & Greed API HTTP {resp.status_code}")
+            # 返回缓存（即使过期）
+            if _last_fng_fetch["value"] is not None:
+                return {
+                    "value": _last_fng_fetch["value"],
+                    "classification": _last_fng_fetch["classification"],
+                    "timestamp": datetime.now().isoformat(),
+                    "cached": True,
+                    "expired": True,
+                }
+            return None
+
+        data = resp.json()
+        fng_data = data.get("data", [{}])[0]
+        value = int(fng_data.get("value", 50))
+        classification = fng_data.get("value_classification", "Neutral")
+
+        _last_fng_fetch = {
+            "timestamp": time.time(),
+            "value": value,
+            "classification": classification,
+        }
+
+        return {
+            "value": value,
+            "classification": classification,
+            "timestamp": datetime.now().isoformat(),
+            "cached": False,
+        }
+    except Exception as e:
+        logger.error(f"获取 Fear & Greed Index 失败: {e}")
+        # 返回缓存（允许过期）
+        if _last_fng_fetch["value"] is not None:
+            return {
+                "value": _last_fng_fetch["value"],
+                "classification": _last_fng_fetch["classification"],
+                "timestamp": datetime.now().isoformat(),
+                "cached": True,
+                "expired": True,
+            }
+        return None
+
+
+def get_btc_dominance() -> Optional[float]:
+    """
+    获取 BTC 主导率（BTC Market Cap / Total Crypto Market Cap）
+    数据来源：CoinGecko global data
+
+    Returns:
+        float: BTC主导率（0.0 ~ 1.0），失败返回 None
+    """
+    try:
+        resp = requests.get(
+            "https://api.coingecko.com/api/v3/global",
+            timeout=15,
+            headers={"Accept": "application/json", "User-Agent": "trading-system/1.0"},
+        )
+        if resp.status_code != 200:
+            logger.warning(f"CoinGecko global HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        global_data = data.get("data", {})
+        btc_pct = global_data.get("market_cap_percentage", {})
+        btc_dominance = btc_pct.get("btc", 0.0) / 100.0
+        return btc_dominance
+    except Exception as e:
+        logger.error(f"获取 BTC 主导率失败: {e}")
+        return None
+
+
+@retry_on_network_error(max_retries=2)
+def get_funding_rate(symbol: str = "BTC", exchange: str = "binance",
+                     testnet: bool = False) -> Optional[float]:
+    """
+    获取永续合约资金费率（Funding Rate）
+
+    数据来源：Binance 公开 API（无需认证）
+    Binance 实盘:   GET https://fapi.binance.com/fapi/v1/premiumIndex
+    Binance 测试网: GET https://testnet.binancefuture.com/fapi/v1/premiumIndex
+    Bybit 实盘:    GET https://api.bybit.com/v5/position/tpsl-switch-mode
+    Bybit 测试网:  GET https://api-testnet.bybit.com/v5/position/tpsl-switch-mode
+
+    Args:
+        symbol:   币种符号，如 "BTC"
+        exchange: 交易所，"binance" / "bybit"
+        testnet:  是否使用测试网（默认 False）
+
+    Returns:
+        float: 资金费率（如 0.0001 = 0.01%），失败返回 None
+    """
+    try:
+        if exchange.lower() == "binance":
+            # Binance USDT永续
+            if testnet:
+                url = "https://testnet.binancefuture.com/fapi/v1/premiumIndex"
+            else:
+                url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+            params = {"symbol": f"{symbol.upper()}USDT"}
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Binance funding rate HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            # lastFundingRate 为小数形式（如 0.0001 = 0.01%）
+            fr = float(data.get("lastFundingRate", 0))
+            return fr
+
+        elif exchange.lower() == "bybit":
+            if testnet:
+                url = "https://api-testnet.bybit.com/v5/position/tpsl-switch-mode"
+            else:
+                url = "https://api.bybit.com/v5/position/tpsl-switch-mode"
+            params = {"category": "linear", "symbol": f"{symbol.upper()}USDT"}
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Bybit funding rate HTTP {resp.status_code}")
+                return None
+            data = resp.json()
+            # Bybit 返回格式不同，尝试从 list 内获取
+            items = data.get("list", [])
+            if items:
+                return float(items[0].get("fundingRate", 0))
+            return None
+
+        else:
+            logger.warning(f"资金费率暂不支持交易所: {exchange}")
+            return None
+
+    except Exception as e:
+        logger.error(f"获取 {symbol} 资金费率失败: {e}")
+        return None
+
+
+def get_onchain_metrics(symbol: str = "BTC") -> Optional[Dict]:
+    """
+    获取链上指标（活跃地址数 / 交易量趋势）
+    简化版：从 Dune Analytics 公开端点获取（无API Key限制）
+
+    Args:
+        symbol: 币种符号，"BTC" / "ETH"
+
+    Returns:
+        {
+            "active_addresses_trend": "rising" | "falling" | "stable",
+            "transaction_volume_trend": "rising" | "falling" | "stable",
+            "onchain_score": int,  # 0~100 综合评分
+        }
+    """
+    try:
+        # 尝试 CryptoQuant API（无需 Key 的公开端点）
+        # CryptoQuant 提供部分免费数据
+        # 这里使用简单近似：通过 CoinGecko 获取活跃地址趋势
+        # 注意：CoinGecko 的活跃地址数据需要付费，这里降级为成交量趋势
+
+        # 降级方案：使用成交量变化趋势作为链上活跃度的近似
+        # 获取 7 天和 30 天成交量对比
+        candles_7d = get_ohlcv(symbol, "1d", limit=8)
+        candles_30d = get_ohlcv(symbol, "1d", limit=31)
+
+        if not candles_7d or not candles_30d:
+            return None
+
+        # 最近7天 vs 前7天
+        recent_7d_vol = sum(c.get("volume", 0) for c in candles_7d[-7:])
+        prev_7d_vol = sum(c.get("volume", 0) for c in candles_7d[-14:-7]) if len(candles_7d) >= 14 else recent_7d_vol
+
+        vol_change_pct = (recent_7d_vol - prev_7d_vol) / prev_7d_vol * 100 if prev_7d_vol > 0 else 0
+
+        # 综合评分（成交量变化驱动，简化处理）
+        onchain_score = 50  # 默认中性
+        if vol_change_pct > 10:
+            onchain_score = min(100, 50 + int(vol_change_pct))
+        elif vol_change_pct < -10:
+            onchain_score = max(0, 50 + int(vol_change_pct))
+
+        vol_trend = "rising" if vol_change_pct > 5 else ("falling" if vol_change_pct < -5 else "stable")
+
+        return {
+            "active_addresses_trend": vol_trend,
+            "transaction_volume_trend": vol_trend,
+            "onchain_score": onchain_score,
+            "volume_change_7d_pct": vol_change_pct,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        logger.error(f"获取链上指标失败: {e}")
+        return None
+
+
+def get_multi_factor_data(symbol: str = "BTC") -> Optional[Dict]:
+    """
+    获取多因子趋势系统所需的全部外部数据
+    一次性获取：恐惧贪婪指数 + BTC主导率 + 资金费率 + 链上指标
+
+    Returns:
+        {
+            "fear_greed": int,           # 0-100
+            "fear_greed_class": str,     # 分类标签
+            "btc_dominance": float,      # 0.0~1.0
+            "funding_rate": float,       # 资金费率
+            "onchain_score": int,        # 0~100
+            "timestamp": str,
+        }
+    """
+    import concurrent.futures
+
+    results = {}
+    errors = {}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        fng_future = executor.submit(get_fear_and_greed_index)
+        dom_future = executor.submit(get_btc_dominance)
+        fr_future  = executor.submit(get_funding_rate, symbol)
+        oc_future  = executor.submit(get_onchain_metrics, symbol)
+
+        for name, future in [("fear_greed", fng_future),
+                              ("btc_dominance", dom_future),
+                              ("funding_rate", fr_future),
+                              ("onchain", oc_future)]:
+            try:
+                results[name] = future.result(timeout=10)
+            except Exception as e:
+                errors[name] = str(e)
+                results[name] = None
+
+    fng = results.get("fear_greed")
+    oc  = results.get("onchain")
+
+    return {
+        "fear_greed": fng.get("value", 50) if fng else 50,
+        "fear_greed_class": fng.get("classification", "Neutral") if fng else "Neutral",
+        "btc_dominance": results.get("btc_dominance") or 0.5,
+        "funding_rate": results.get("funding_rate") or 0.0,
+        "onchain_score": oc.get("onchain_score", 50) if oc else 50,
+        "onchain_vol_trend": oc.get("transaction_volume_trend", "stable") if oc else "stable",
+        "volume_change_7d_pct": oc.get("volume_change_7d_pct", 0) if oc else 0,
+        "errors": errors,
+        "timestamp": datetime.now().isoformat(),
     }
 
 

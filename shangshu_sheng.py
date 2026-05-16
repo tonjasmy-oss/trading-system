@@ -369,6 +369,149 @@ class GateioAdapter(ExchangeAdapter):
             return None
 
 
+class BybitAdapter(ExchangeAdapter):
+    """Bybit 交易所适配器（支持 USDT 永续 / 测试网）"""
+
+    def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = False):
+        super().__init__("bybit", api_key, api_secret, testnet)
+        if testnet:
+            # Bybit 测试网 API endpoint
+            self._testnet_urls = {
+                "default": "https://api-testnet.bybit.com",
+                "public":  "https://api-testnet.bybit.com/v5",
+                "private": "https://api-testnet.bybit.com/v5",
+            }
+
+    def _get_exchange(self):
+        """覆盖父类：Bybit 测试网需要主动 set_sandbox_mode"""
+        if not _CCXT_AVAILABLE:
+            raise RuntimeError("ccxt 未安装，无法执行实盘交易")
+        if self._exchange is None:
+            ex_class = getattr(ccxt, self.exchange_id)
+            config: Dict[str, Any] = {
+                "apiKey": self.api_key,
+                "secret": self.api_secret,
+                "enableRateLimit": True,
+                "options": {"defaultType": "linear"},   # USDT 永续
+            }
+            self._exchange = ex_class(config)
+            if self.testnet:
+                self._exchange.set_sandbox_mode(True)
+            logger.info(f"[尚书省] Bybit 交易所实例"
+                         f"{'(测试网)' if self.testnet else '(实盘)'}")
+        return self._exchange
+
+    def _format_symbol(self, symbol: str) -> str:
+        # ccxt/bybit 接受 BTC/USDT -> BTCUSDT
+        return symbol.replace("/", "")
+
+    async def place_order(self, symbol: str, side: str, order_type: str,
+                         quantity: float, price: Optional[float] = None,
+                         params: Optional[Dict] = None) -> ExecutionResult:
+        ex = self._get_exchange()
+        ccxt_sym = self._format_symbol(symbol)
+
+        try:
+            if order_type == "MARKET":
+                order = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ex.create_order(ccxt_sym, "market", side.lower(), quantity)
+                )
+            elif order_type == "LIMIT":
+                order = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ex.create_order(ccxt_sym, "limit", side.lower(),
+                                          quantity, price)
+                )
+            elif order_type == "STOP_LOSS":
+                params = dict(params or {})
+                params["stopPrice"] = price
+                order = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: ex.create_order(ccxt_sym, "stop", side.lower(),
+                                          quantity, price, params)
+                )
+            else:
+                return ExecutionResult(False, "", symbol, side, quantity, 0,
+                                      order_type, 0, f"不支持: {order_type}")
+
+            fills = order.get("trades", [])
+            total_fee = sum(float(f.get("fee", 0)) for f in fills)
+            avg_price = (
+                sum(float(f["price"]) * float(f["amount"]) for f in fills) /
+                max(sum(float(f["amount"]) for f in fills), 1) if fills
+                else price or 0
+            )
+
+            return ExecutionResult(
+                success=True,
+                order_id=str(order["id"]),
+                symbol=symbol,
+                side=side,
+                quantity=float(order.get("amount", quantity)),
+                exec_price=float(avg_price),
+                exec_type=order_type.lower(),
+                commission=total_fee,
+                message="成功",
+                raw_response=order,
+            )
+        except Exception as e:
+            logger.error(f"[尚书省] Bybit 下单失败: {e}")
+            return ExecutionResult(False, "", symbol, side, quantity, 0,
+                                  order_type, 0, str(e))
+
+    async def cancel_order(self, order_id: str, symbol: str) -> bool:
+        ex = self._get_exchange()
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: ex.cancel_order(order_id, self._format_symbol(symbol))
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[尚书省] Bybit 取消订单失败: {e}")
+            return False
+
+    async def get_balance(self, asset: str = "USDT") -> float:
+        ex = self._get_exchange()
+        try:
+            bal = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ex.fetch_balance())
+            return float(bal.get(asset, {}).get("free", 0))
+        except Exception as e:
+            logger.error(f"[尚书省] Bybit 查询余额失败: {e}")
+            return 0.0
+
+    async def get_position(self, symbol: str) -> Optional[PositionInfo]:
+        ex = self._get_exchange()
+        try:
+            ccxt_sym = self._format_symbol(symbol)
+            positions = ex.fetch_positions([ccxt_sym])
+            if positions:
+                p = positions[0]
+                return PositionInfo(
+                    symbol=symbol,
+                    side=p.get("side", "long"),
+                    size=float(p.get("contracts", 0)),
+                    entry_price=float(p.get("entryPrice", 0)),
+                    unrealized_pnl=float(p.get("unrealizedPnl", 0)),
+                    leverage=float(p.get("leverage", 1)),
+                )
+        except Exception as e:
+            logger.error(f"[尚书省] Bybit 查询持仓失败: {e}")
+        return None
+
+    async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
+        ex = self._get_exchange()
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: ex.fetch_order(order_id, self._format_symbol(symbol))
+            )
+        except Exception:
+            return None
+
+
 class HyperliquidAdapter(ExchangeAdapter):
     """Hyperliquid 永续合约适配器"""
 
@@ -576,6 +719,7 @@ class WeexAdapter(ExchangeAdapter):
 _ADAPTERS = {
     "binance":    BinanceAdapter,
     "gateio":     GateioAdapter,
+    "bybit":      BybitAdapter,
     "hyperliquid": HyperliquidAdapter,
     "weex":       WeexAdapter,
 }

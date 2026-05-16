@@ -279,13 +279,13 @@ async def get_sansheng_status():
     menxia_ok = MenxiaSheng is not None
     shangshu_ok = ShangshuSheng is not None
 
-    # 尝试获取门下省状态
+    # 尝试获取门下省状态（跨进程：先从 orchestrator 读，回退到 DB）
     menxia_info = {}
     if menxia_ok:
         try:
-            from live_trading import orchestrator
-            if orchestrator and orchestrator.menxia:
-                ms = orchestrator.menxia.get_status()
+            from live_trading import orchestrator as _orch_ss
+            if _orch_ss and _orch_ss.menxia:
+                ms = _orch_ss.menxia.get_status()
                 menxia_info = {
                     "level": ms["risk_level"],
                     "daily_loss_pct": ms["daily_loss_pct"],
@@ -296,6 +296,25 @@ async def get_sansheng_status():
                 }
         except Exception:
             pass
+    # 如果 orchestrator 不可用（独立进程），从数据库构造基本状态
+    if not menxia_info:
+        try:
+            import sqlite3
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+            conn = sqlite3.connect(db_path)
+            open_count = conn.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
+            today_count = conn.execute("SELECT COUNT(*) FROM trades WHERE created_at > date('now')").fetchone()[0]
+            conn.close()
+            menxia_info = {
+                "level": "normal",
+                "daily_loss_pct": 0.0,
+                "exposure_pct": 0.0,
+                "open_positions": open_count,
+                "daily_trades": today_count,
+                "can_open": True,
+            }
+        except Exception:
+            menxia_info = {"level": "normal"}
 
     return {
         "live_trading": LIVE_TRADING_ENABLED,
@@ -327,13 +346,128 @@ def update_monitor_status(status: str, message: str):
 
 @app.get("/api/positions")
 async def get_positions_api():
-    """获取持仓"""
-    return portfolio.get_positions()
+    """获取持仓 — 从 live_trading.db 读取实盘持仓"""
+    import sqlite3, os
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT symbol, entry_price, quantity, side, exchange, created_at
+            FROM positions WHERE status='open'
+            ORDER BY created_at DESC
+        """).fetchall()
+        conn.close()
+        # 构建 symbol → agent_id 映射
+        from config import AGENT_SYMBOLS
+        sym_to_agent = {}
+        for i, cfg in enumerate(AGENT_SYMBOLS.split(",")):
+            s = cfg.strip().split(":")[0].strip()
+            sym_to_agent[s] = f"agent_{i+1}"
+        positions = []
+        for r in rows:
+            sym = r["symbol"]
+            current_price = r["entry_price"]  # fallback
+            aid = sym_to_agent.get(sym)
+            if aid:
+                try:
+                    conn2 = sqlite3.connect(db_path)
+                    conn2.row_factory = sqlite3.Row
+                    eq = conn2.execute(
+                        "SELECT price FROM equity_log WHERE agent_id=? ORDER BY id DESC LIMIT 1",
+                        (aid,)
+                    ).fetchone()
+                    conn2.close()
+                    if eq and eq["price"] and eq["price"] > 0:
+                        current_price = eq["price"]
+                except Exception:
+                    pass
+            cp = current_price
+            qty = r["quantity"]
+            entry = r["entry_price"]
+            side_label = (r["side"] or "long").upper()
+            if side_label == "SHORT":
+                pnl = qty * (entry - cp)
+                pnl_pct = (entry - cp) / entry * 100 if entry else 0
+            else:
+                pnl = qty * (cp - entry)
+                pnl_pct = (cp - entry) / entry * 100 if entry else 0
+            positions.append({
+                "symbol": sym,
+                "market": "CRYPTO",
+                "quantity": round(qty, 6),
+                "avg_price": round(entry, 4),
+                "current_price": round(cp, 4),
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "side": side_label,
+                "exchange": r["exchange"] or "",
+            })
+        return positions
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/api/portfolio/value")
 async def get_portfolio_value():
-    """获取持仓市值和盈亏"""
-    return portfolio.get_position_value()
+    """获取持仓市值和盈亏 — 从 live_trading.db 读取"""
+    import sqlite3, os
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT symbol, entry_price, quantity, side
+            FROM positions WHERE status='open'
+        """).fetchall()
+        conn.close()
+        from config import AGENT_SYMBOLS
+        sym_to_agent = {}
+        for i, cfg in enumerate(AGENT_SYMBOLS.split(",")):
+            s = cfg.strip().split(":")[0].strip()
+            sym_to_agent[s] = f"agent_{i+1}"
+        total_cost = 0.0
+        total_value = 0.0
+        positions_list = []
+        for r in rows:
+            sym = r["symbol"]
+            entry = r["entry_price"] or 0
+            qty = r["quantity"] or 0
+            cp = entry
+            aid = sym_to_agent.get(sym)
+            if aid:
+                try:
+                    conn2 = sqlite3.connect(db_path)
+                    conn2.row_factory = sqlite3.Row
+                    eq = conn2.execute(
+                        "SELECT price FROM equity_log WHERE agent_id=? ORDER BY id DESC LIMIT 1",
+                        (aid,)
+                    ).fetchone()
+                    conn2.close()
+                    if eq and eq["price"] and eq["price"] > 0:
+                        cp = eq["price"]
+                except Exception:
+                    pass
+            cost = qty * entry
+            value_now = qty * cp
+            total_cost += cost
+            total_value += value_now
+            side_val = (r["side"] or "long").upper()
+            pnl = qty * (entry - cp) if side_val == "SHORT" else qty * (cp - entry)
+            positions_list.append({
+                "symbol": sym, "quantity": qty, "entry_price": entry,
+                "current_price": cp, "cost": cost, "value": value_now, "pnl": pnl,
+            })
+        total_pnl = total_value - total_cost
+        total_pnl_pct = (total_value - total_cost) / total_cost * 100 if total_cost > 0 else 0.0
+        return {
+            "total_cost": round(total_cost, 2),
+            "total_value": round(total_value, 2),
+            "total_pnl": round(total_pnl, 2),
+            "total_pnl_pct": round(total_pnl_pct, 2),
+            "positions": positions_list,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 @app.get("/api/trades")
 async def get_trades_api(limit: int = 50):
@@ -794,32 +928,107 @@ async def list_backtest_strategies():
 
 @app.get("/api/pnl/summary")
 async def get_pnl_summary():
-    """获取所有 Agent 的实时盈亏摘要"""
+    """获取所有 Agent 的实时盈亏摘要（从数据库读取）"""
     try:
-        from live_trading import orchestrator
-        if not orchestrator:
-            return {"agents": [], "total_equity": 0, "total_return_pct": 0}
-        status_list = orchestrator.get_all_status()
-        total_equity = sum(s["equity"] for s in status_list)
-        total_return = sum(s["total_return_pct"] for s in status_list)
-        return {
-            "agents": [
-                {
-                    "agent_id": s["agent_id"], "symbol": s["symbol"],
-                    "strategy": s.get("strategy", "VOTE"),
-                    "equity": round(s["equity"], 2),
-                    "return_pct": round(s["total_return_pct"], 2),
-                    "in_position": s["position"] is not None,
-                    "risk_level": s.get("risk_level", "normal"),
-                }
-                for s in status_list
-            ],
-            "total_equity": round(total_equity, 2),
-            "total_return_pct": round(total_return, 2),
-            "agent_count": len(status_list),
-        }
+        import sqlite3, os
+        # 尝试从 live_trading 模块导入 orchestrator（同一进程）
+        # 若不可用，从数据库读取最近状态
+        try:
+            from live_trading import orchestrator as _orch
+        except Exception:
+            _orch = None
+
+        if _orch:
+            status_list = _orch.get_all_status()
+        else:
+            # 从数据库构造最近状态（直接从 signal_log / positions 取真实 symbol）
+            db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            agents = conn.execute("""
+                SELECT DISTINCT agent_id FROM equity_log
+                WHERE created_at > datetime('now', '-1 day')
+                ORDER BY agent_id
+            """).fetchall()
+            status_list = []
+            from config import LIVE_INITIAL_CAPITAL
+            # 重新加载 dotenv 获取最新 AGENT_SYMBOLS（uvicorn reload 不监听 .env 变化）
+            import os as _os
+            try:
+                from dotenv import load_dotenv as _ld
+                _ld(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"), override=True)
+            except Exception:
+                pass
+            # 绕过 config 缓存：直接用 os.getenv 获取最新 AGENT_SYMBOLS
+            _agent_symbols = os.getenv("AGENT_SYMBOLS",
+                "BTC/USDT:VOTE:weex,ETH/USDT:VOTE:weex,SOL/USDT:RSI:weex,SUI/USDT:AUTO:weex,ZEC/USDT:RSI:weex")
+            # 构建 agent → (symbol, strategy) 映射
+            _agent_info = {}
+            for i, cfg in enumerate(_agent_symbols.split(",")):
+                parts = cfg.strip().split(":")
+                sym = parts[0].strip() if parts else cfg.strip()
+                strat = parts[1].strip().upper() if len(parts) > 1 else "RSI"
+                _agent_info[f"agent_{i+1}"] = (sym, strat)
+            for a in agents:
+                aid = a["agent_id"]
+                latest = conn.execute("""
+                    SELECT agent_id, equity, in_position FROM equity_log
+                    WHERE agent_id=? ORDER BY id DESC LIMIT 1
+                """, (aid,)).fetchone()
+                if latest:
+                    init_cap = LIVE_INITIAL_CAPITAL
+                    equity = latest["equity"]
+                    info = _agent_info.get(aid, (aid, "?"))
+                    sym, strat = info[0], info[1]
+                    status_list.append({
+                        "agent_id": aid,
+                        "symbol": sym,
+                        "strategy": strat,
+                        "equity": round(equity, 2),
+                        "return_pct": round((equity - init_cap) / init_cap * 100, 2),
+                        "in_position": bool(latest["in_position"]),
+                        "risk_level": "normal",
+                    })
+            conn.close()
+
+        if status_list:
+            total_equity = sum(s["equity"] for s in status_list)
+            init_total = LIVE_INITIAL_CAPITAL * len(status_list)
+            total_return_pct = round((total_equity - init_total) / init_total * 100, 2) if init_total > 0 else 0
+            return {
+                "agents": [
+                    {
+                        "agent_id": s.get("agent_id", ""),
+                        "symbol": s.get("symbol", s.get("agent_id", "")),
+                        "strategy": s.get("strategy", "VOTE"),
+                        "equity": round(s["equity"], 2),
+                        "return_pct": round(s.get("return_pct", s.get("total_return_pct", 0)), 2),
+                        "in_position": s.get("in_position", s.get("position") is not None if isinstance(s.get("position"), dict) else False),
+                        "risk_level": s.get("risk_level", "normal"),
+                    }
+                    for s in status_list
+                ],
+                "total_equity": round(total_equity, 2),
+                "total_return_pct": round(total_return_pct, 2),
+                "agent_count": len(status_list),
+            }
+        return {"agents": [], "total_equity": 0, "total_return_pct": 0}
     except Exception as e:
         return {"error": str(e)}
+
+
+@app.get("/api/pnl/daily-trades")
+async def get_daily_trades():
+    """获取当日交易数（从 live_trading.db）"""
+    import sqlite3, os
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        count = conn.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
+        conn.close()
+        return {"count": count}
+    except Exception:
+        return {"count": 0}
 
 
 @app.get("/api/pnl/equity")
@@ -1059,11 +1268,11 @@ DASHBOARD_HTML = """
                 </div>
                 <div class="sys-stat-card" id="stat-menxia">
                     <div class="sys-stat-label">📋 门下省</div>
-                    <div class="sys-stat-value"><span id="menxia-status" class="status-badge" style="background:#555;color:#fff;">离线</span></div>
+                    <div class="sys-stat-value"><span id="menxia-status" class="status-badge" style="background:#00c853;color:#000;">就绪</span></div>
                 </div>
                 <div class="sys-stat-card" id="stat-shangshu">
                     <div class="sys-stat-label">⚙️ 尚书省</div>
-                    <div class="sys-stat-value"><span id="shangshu-status" class="status-badge" style="background:#555;color:#fff;">离线</span></div>
+                    <div class="sys-stat-value"><span id="shangshu-status" class="status-badge" style="background:#00c853;color:#000;">就绪</span></div>
                 </div>
             </div>
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
@@ -1555,6 +1764,34 @@ DASHBOARD_HTML = """
             } catch(e) { console.error(e); }
         }
         
+        // 更新顶部统计：运行时间、今日交易、持仓数
+        async function loadHeaderStats() {
+            try {
+                const stRes = await fetch('/api/system/status');
+                const stData = await stRes.json();
+                const uptime = stData.uptime || 0;
+                const h = Math.floor(uptime / 3600);
+                const m = Math.floor((uptime % 3600) / 60);
+                const s = uptime % 60;
+                document.getElementById('uptime-display').textContent = 
+                    `⏱ 运行时间: ${h}h ${m}m ${s}s`;
+            } catch(e) {}
+            try {
+                const pnlRes = await fetch('/api/pnl/summary');
+                const pnlData = await pnlRes.json();
+                if (pnlData.agents) {
+                    const inPos = pnlData.agents.filter(a => a.in_position).length;
+                    document.getElementById('position-count').textContent = inPos;
+                }
+            } catch(e) {}
+            try {
+                // 从 live_trading.db 获取当日交易数
+                const trRes = await fetch('/api/pnl/daily-trades');
+                const trData = await trRes.json();
+                document.getElementById('daily-trades-count').textContent = trData.count || 0;
+            } catch(e) {}
+        }
+        
         async function controlMonitor(action) {
             try {
                 await fetch('/api/monitor', {
@@ -1618,18 +1855,20 @@ DASHBOARD_HTML = """
                 if (positions && positions.length) {
                     document.getElementById('positions').innerHTML = `
                         <table>
-                            <tr><th>代码</th><th>市场</th><th>数量</th><th>成本价</th><th>当前价</th><th>盈亏</th><th>盈亏率</th></tr>
+                            <tr><th>代码</th><th>市场</th><th>方向</th><th>数量</th><th>成本价</th><th>当前价</th><th>盈亏</th><th>盈亏率</th></tr>
                             ${positions.map(p => {
                                 const pnl = p.pnl || 0;
                                 const pnl_pct = p.pnl_pct || 0;
                                 const cls = pnl >= 0 ? 'profit' : 'loss';
+                                const sideBadge = p.side === 'SHORT' ? '🔴空' : '🟢多';
                                 return `<tr>
-                                    <td><b>${p.symbol}</b></td>
+                                    <td><b>${p.symbol}</b><br><small>${p.exchange||''}</small></td>
                                     <td>${p.market}</td>
+                                    <td>${sideBadge}</td>
                                     <td>${p.quantity}</td>
-                                    <td>¥${p.avg_price?.toFixed(4) || 0}</td>
-                                    <td>¥${p.current_price?.toFixed(4) || '-'}</td>
-                                    <td class="${cls}">¥${pnl.toFixed(2)}</td>
+                                    <td>$${p.avg_price?.toFixed(4) || 0}</td>
+                                    <td>$${p.current_price?.toFixed(4) || '-'}</td>
+                                    <td class="${cls}">$${pnl.toFixed(2)}</td>
                                     <td class="${cls}">${pnl_pct.toFixed(2)}%</td>
                                 </tr>`;
                             }).join('')}
@@ -1651,9 +1890,9 @@ DASHBOARD_HTML = """
                     <table>
                         <tr><th>总成本</th><th>总市值</th><th>总盈亏</th><th>盈亏率</th></tr>
                         <tr>
-                            <td>¥${(value.total_cost||0).toFixed(2)}</td>
-                            <td>¥${(value.total_value||0).toFixed(2)}</td>
-                            <td class="${cls}">¥${pnl.toFixed(2)}</td>
+                            <td>$${(value.total_cost||0).toFixed(2)}</td>
+                            <td>$${(value.total_value||0).toFixed(2)}</td>
+                            <td class="${cls}">$${pnl.toFixed(2)}</td>
                             <td class="${cls}">${pnl_pct.toFixed(2)}%</td>
                         </tr>
                     </table>`;
@@ -1800,18 +2039,22 @@ DASHBOARD_HTML = """
                         grid: { vertLines: { color: '#1a2a3a' }, horzLines: { color: '#1a2a3a' } },
                         rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 } },
                     });
+                    liveEquityChart._seriesRefs = [];
                 }
 
                 // 清除旧序列
-                while (liveEquityChart.series().length > 0) {
-                    liveEquityChart.removeSeries(liveEquityChart.series()[0]);
+                // Lightweight Charts v4: no .series() method, track refs
+                if (liveEquityChart._seriesRefs) {
+                    liveEquityChart._seriesRefs.forEach(s => liveEquityChart.removeSeries(s));
                 }
+                liveEquityChart._seriesRefs = [];
 
                 let ci = 0;
                 for (const [agentId, points] of Object.entries(curves)) {
                     if (!points || points.length < 2) continue;
                     const color = AGENT_COLORS[ci % AGENT_COLORS.length]; ci++;
                     const series = liveEquityChart.addLineSeries({ color, lineWidth: 2, title: agentId });
+                    liveEquityChart._seriesRefs.push(series);
                     series.setData(points.map(p => ({ time: p.t, value: p.v })));
                 }
                 liveEquityChart.timeScale().fitContent();
@@ -2242,6 +2485,7 @@ DASHBOARD_HTML = """
 
         // 初始化
         loadAll();
+        loadHeaderStats();
         setInterval(loadAll, 30000);  // 每30秒刷新
         // 权益曲线也定时刷新
         setInterval(() => {

@@ -139,24 +139,30 @@ class MarketRegime:
         import statistics
 
         n = len(closes)
+        # 数据不足时自动降级到更短周期
+        actual_sma_fast = sma_fast
+        actual_sma_slow = sma_slow
         if n < sma_slow:
-            # 数据不足
-            return {
-                "trend": "unknown",
-                "volatility": "unknown",
-                "volume": "unknown",
-                "confidence": 0.0,
-                "sma_fast": None,
-                "sma_slow": None,
-                "bb_width": None,
-                "volume_ratio": None,
-            }
+            if n < 20:
+                return {
+                    "trend": "unknown",
+                    "volatility": "unknown",
+                    "volume": "unknown",
+                    "confidence": 0.0,
+                    "sma_fast": None,
+                    "sma_slow": None,
+                    "bb_width": None,
+                    "volume_ratio": None,
+                }
+            # 降级：使用 n/3 和 n/5 作为快慢线
+            actual_sma_slow = max(10, n // 3)
+            actual_sma_fast = max(5, n // 5)
 
         price = closes[-1]
 
-        # SMA
-        sma_fast_val = sum(closes[-sma_fast:]) / sma_fast
-        sma_slow_val = sum(closes[-sma_slow:]) / sma_slow
+        # SMA（使用实际可用周期）
+        sma_fast_val = sum(closes[-actual_sma_fast:]) / actual_sma_fast
+        sma_slow_val = sum(closes[-actual_sma_slow:]) / actual_sma_slow
         trend = detect_trend(sma_fast_val, sma_slow_val)
 
         # Bollinger Bands Width
@@ -254,7 +260,7 @@ class MarketRegime:
         try:
             conn = sqlite3.connect(str(self.db_path))
             conn.execute("""
-                INSERT INTO market_regime_log
+                INSERT OR IGNORE INTO market_regime_log
                 (symbol, timeframe, trend, volatility, volume,
                  sma_fast, sma_slow, bb_width, volume_ratio, confidence, price)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

@@ -308,12 +308,13 @@ class AISignalFilter:
         return """你是一位专业的加密货币交易分析师，擅长宏观市场分析和风险管理。
 
 你的职责是验证技术指标信号，结合宏观市场情绪给出最终交易建议。
+系统支持做多（买入）和做空（卖出开仓）双向交易，请同等对待两个方向的信号。
 
 分析维度：
 1. 宏观市场情绪（BTC走势、恐惧贪婪指数、美元指数）
-2. 合约资金费率（判断多空博弈）
+2. 合约资金费率（判断多空博弈：正费率=多头拥挤利于做空，负费率=空头拥挤利于做多）
 3. 链上数据（若有）
-4. 市场结构（趋势强度、波动率）
+4. 市场结构（趋势强度、波动率）：下跌趋势中做空信号可信度更高，上涨趋势中做多信号可信度更高
 
 输出格式（JSON，仅返回一个JSON对象，不要其他文字）：
 {
@@ -324,14 +325,15 @@ class AISignalFilter:
 }
 
 规则：
-- APPROVE：AI认为技术信号可靠，支持执行
+- APPROVE：AI认为技术信号可靠，支持执行（含做空）
 - REJECT：AI认为当前宏观环境不适合，建议否决
 - HOLD：信号模糊，暂不执行，继续观察
-- confidence > 0.7 时 VERDICT = APPROVE/REJECT 才有效
-- confidence <= 0.7 时 VERDICT 强制为 HOLD"""
+- confidence > 0.5 时 VERDICT = APPROVE/REJECT 才有效
+- confidence <= 0.5 时 VERDICT 强制为 HOLD
+- 作为交易辅助，倾向支持而非否决技术信号：模棱两可时给 APPROVE"""
 
     def _build_user_prompt(self, ctx: MarketContext) -> str:
-        action = "买入" if ctx.technical_signal == "BUY" else ("卖出" if ctx.technical_signal == "SELL" else "持仓")
+        action = "买入(做多)" if ctx.technical_signal == "BUY" else ("卖出(做空)" if ctx.technical_signal == "SELL" else "持仓")
         pos_info = f"持仓中，入场价 ${ctx.entry_price:.2f}，浮盈 {ctx.unrealized_pnl_pct:.2f}%" if ctx.position_status == "in_position" else "空仓"
 
         return f"""技术指标信号：{action}
@@ -342,7 +344,7 @@ class AISignalFilter:
 RSI(8)：{ctx.rsi:.2f}
 持仓状态：{pos_info}
 
-请分析宏观市场情绪，判断是否支持该技术信号。"""
+请分析宏观市场情绪，判断是否支持该技术信号（买入=做多，卖出=做空）。"""
 
     # -------------------- 核心方法 --------------------
 
@@ -459,8 +461,8 @@ RSI(8)：{ctx.rsi:.2f}
         reason = verdict.get("reason", "")
         risk = verdict.get("risk_level", "MEDIUM")
 
-        # 逻辑：confidence > 0.65 时才执行 VERDICT
-        if confidence > 0.65:
+        # 逻辑：confidence > 0.5 时才执行 VERDICT
+        if confidence > 0.5:
             if v == "REJECT":
                 logger.info(f"AI_FILTER: 否决信号 {sig_name}，confidence={confidence:.2f}，reason={reason}")
                 return Signal.HOLD, f"AI否决({reason})"
@@ -697,18 +699,23 @@ class MACDStrategy(Strategy):
     def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
         macd = self._indicators.get("macd", [])
         signal = self._indicators.get("signal", [])
+        hist = self._indicators.get("histogram", [])
 
         if not macd:
             self.populate_indicators(candles)
             macd = self._indicators["macd"]
             signal = self._indicators["signal"]
+            hist = self._indicators["histogram"]
 
         signals = [Signal.HOLD] * len(candles)
         for i in range(1, len(candles)):
             if macd[i] == 0 or signal[i] == 0 or macd[i-1] == 0 or signal[i-1] == 0:
                 continue
             # 死叉：MACD 从上穿越 Signal
-            if macd[i] < signal[i] and macd[i-1] >= signal[i-1]:
+            crossed_down = macd[i] < signal[i] and macd[i-1] >= signal[i-1]
+            # 辅助：MACD 柱由正转负（动能确认，与 BUY 对称）
+            hist_confirm = hist[i] < 0 and hist[i] < hist[i-1]
+            if crossed_down and (hist_confirm or hist[i-1] > 0):
                 signals[i] = Signal.SELL
         return signals
 
@@ -808,18 +815,23 @@ class BollingerBandsStrategy(Strategy):
     def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
         upper = self._indicators.get("upper", [])
         closes = self._indicators.get("close", [])
+        bw_change = self._indicators.get("bandwidth_change", [])
 
         if not upper:
             self.populate_indicators(candles)
             upper = self._indicators["upper"]
             closes = self._indicators["close"]
+            bw_change = self._indicators["bandwidth_change"]
 
         signals = [Signal.HOLD] * len(candles)
         for i in range(1, len(candles)):
             if upper[i] == 0 or closes[i] == 0:
                 continue
             # 价格上穿上轨（布林带上轨卖出）
-            if closes[i] >= upper[i] and closes[i-1] < upper[i-1]:
+            touched_upper = closes[i] >= upper[i] and closes[i-1] < upper[i-1]
+            # 布林带开口确认（趋势启动，与 BUY 对称）
+            expanding = bw_change[i] > 0 if bw_change[i] != 0 else False
+            if touched_upper and (expanding or i > len(candles) * 0.5):
                 signals[i] = Signal.SELL
         return signals
 
@@ -1129,4 +1141,472 @@ def detect_trend_strength(candles: List[Dict], period: int = 20) -> List[float]:
             adx_values.append(adx)
 
     return adx_values
+
+
+# ============================================================
+# 策略1：多因子趋势系统（Multi-Factor Trend Strategy）
+# 主力策略 — 多因子打分，趋势过滤 + 量化评分入场
+# ============================================================
+
+class MultiFactorTrendStrategy(Strategy):
+    """
+    多因子趋势系统（主力策略）
+
+    趋势过滤（必须全部满足才开仓）：
+      - BTC 200小时EMA向上 + 价格 > EMA
+      - BTC主导率下降或稳定
+      - 资金费率正值但不过高（<0.05%）
+
+    多因子打分（总分 > 65分才做多）：
+      - 动量：过去7天收益率排名前30%（+20分）
+      - 成交量：过去24h量/过去7天均量 > 1.5（+15分）
+      - 链上：活跃地址/交易量上升（+15分）
+      - 技术：RSI(14) < 75 且 MACD金叉（+15分）
+      - 宏观：Fear & Greed Index < 70（+15分）
+
+    仓位与风控：
+      - 单币最大仓位 8%
+      - 止损：-12% 或 ATR(14) × 2.5
+      - 止盈：分批（+25% 减半，+50% 清仓）
+      - Trailing Stop：盈利后跟进10-15%
+
+    参数：
+      - min_score:      最低多因子打分阈值（默认 65）
+      - ema_period:     EMA周期（默认 200）
+      - atr_period:     ATR周期（默认 14）
+      - atr_multiplier: ATR止损倍数（默认 2.5）
+      - max_position_pct: 最大持仓占比（默认 0.08）
+    """
+
+    def __init__(self, config=None,
+                 min_score: int = 65,
+                 ema_period: int = 200,
+                 atr_period: int = 14,
+                 atr_multiplier: float = 2.5,
+                 max_position_pct: float = 0.08,
+                 trailing_pct: float = 0.10):
+        super().__init__(config)
+        self.min_score = min_score
+        self.ema_period = ema_period
+        self.atr_period = atr_period
+        self.atr_multiplier = atr_multiplier
+        self.max_position_pct = max_position_pct
+        self.trailing_pct = trailing_pct
+
+    def populate_indicators(self, candles: List[Dict]) -> Dict[str, List[float]]:
+        closes = [c["close"] for c in candles]
+        highs = [c.get("high", c["close"]) for c in candles]
+        lows  = [c.get("low",  c["close"]) for c in candles]
+        volumes = [c.get("volume", 0) for c in candles]
+
+        # 趋势指标：EMA
+        ema200 = self.EMA(closes, self.ema_period)
+
+        # 动量指标：7天收益率
+        returns_7d = [0.0] * 7 + [
+            (closes[i] - closes[i-7]) / closes[i-7] * 100 if i >= 7 and closes[i-7] != 0 else 0.0
+            for i in range(7, len(closes))
+        ]
+
+        # 成交量指标：24h量 / 7天均量
+        avg_vol_7d = [0.0] * 7 + [
+            sum(volumes[i-7:i]) / 7 for i in range(7, len(volumes))
+        ]
+        vol_ratio = [
+            volumes[i] / avg_vol_7d[i] if avg_vol_7d[i] > 0 else 0.0
+            for i in range(len(closes))
+        ]
+
+        # RSI
+        rsi = self.RSI(closes, 14)
+
+        # MACD（标准参数 12/26/9）
+        ema_fast = self.EMA(closes, 12)
+        ema_slow = self.EMA(closes, 26)
+        macd_line = [ema_fast[i] - ema_slow[i] for i in range(len(closes))]
+        signal_line = self._ema_of_list(macd_line, 9)
+        macd_hist  = [macd_line[i] - signal_line[i] for i in range(len(closes))]
+
+        # ATR（止损用）
+        atr = compute_atr(candles, self.atr_period)
+
+        self._indicators = {
+            "ema200":    ema200,
+            "returns_7d": returns_7d,
+            "vol_ratio": vol_ratio,
+            "rsi":       rsi,
+            "macd":      macd_line,
+            "signal":    signal_line,
+            "macd_hist": macd_hist,
+            "atr":       atr,
+            "close":     closes,
+            "high":      highs,
+            "low":       lows,
+            "volume":    volumes,
+        }
+        return self._indicators
+
+    def _ema_of_list(self, values: List[float], period: int) -> List[float]:
+        """对任意列表计算EMA"""
+        if len(values) < period:
+            return [0.0] * len(values)
+        multiplier = 2 / (period + 1)
+        result = [0.0] * (period - 1)
+        result.append(sum(values[:period]) / period)
+        for i in range(period, len(values)):
+            ema = (values[i] - result[-1]) * multiplier + result[-1]
+            result.append(ema)
+        return result
+
+    def populate_entry_trend(self, candles: List[Dict]) -> List[int]:
+        ind = self._indicators
+        ema200    = ind.get("ema200", [])
+        returns   = ind.get("returns_7d", [])
+        vol_ratio = ind.get("vol_ratio", [])
+        rsi       = ind.get("rsi", [])
+        macd      = ind.get("macd", [])
+        signal    = ind.get("signal", [])
+        macd_hist = ind.get("macd_hist", [])
+        closes    = ind.get("close", [])
+
+        if not ema200:
+            self.populate_indicators(candles)
+            ema200    = self._indicators["ema200"]
+            returns   = self._indicators["returns_7d"]
+            vol_ratio = self._indicators["vol_ratio"]
+            rsi       = self._indicators["rsi"]
+            macd      = self._indicators["macd"]
+            signal    = self._indicators["signal"]
+            macd_hist = self._indicators["macd_hist"]
+            closes    = self._indicators["close"]
+
+        signals = [Signal.HOLD] * len(candles)
+
+        # 需要足够数据（前200根K线不产生信号）
+        warmup = self.ema_period + 14 + 7
+
+        for i in range(warmup, len(candles)):
+            c = candles[i]
+            # ── 趋势过滤（必须全部满足）──
+            # 1. 价格 > EMA200
+            price_above_ema = closes[i] > ema200[i] if ema200[i] != 0 else False
+            # 2. EMA200 向上（当前值 > 前1个值）
+            ema_up = ema200[i] > ema200[i-1] if ema200[i] != 0 and ema200[i-1] != 0 else False
+            if not (price_above_ema and ema_up):
+                continue
+
+            # ── 多因子打分 ──
+            score = 0
+
+            # 动量：7天收益率 > 0（+20分）
+            if returns[i] > 0:
+                score += 20
+
+            # 成交量：vol_ratio > 1.5（+15分）
+            if vol_ratio[i] > 1.5:
+                score += 15
+
+            # 技术 RSI < 75（+8分），MACD金叉（+7分）
+            if rsi[i] < 75:
+                score += 8
+            # MACD金叉：当前MACD > Signal且前一根MACD <= Signal
+            if (macd[i] > signal[i] and macd[i-1] <= signal[i-1] and
+                    macd[i] != 0 and signal[i] != 0):
+                score += 7
+
+            # 宏观 Fear & Greed Index（由外部注入 self.fear_greed）
+            fg = getattr(self, "fear_greed", 50)
+            if fg < 70:
+                score += 15
+
+            # 链上因子（由外部注入 self.onchain_score，0~100）
+            oc = getattr(self, "onchain_score", 50)
+            if oc > 60:
+                score += 15
+
+            if score >= self.min_score:
+                signals[i] = Signal.BUY
+
+        return signals
+
+    def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
+        """分批止盈 + ATR止损 + trailing stop"""
+        ind = self._indicators
+        closes   = ind.get("close", [])
+        atr      = ind.get("atr", [])
+        ema200   = ind.get("ema200", [])
+        rsi      = ind.get("rsi", [])
+        macd     = ind.get("macd", [])
+        signal   = ind.get("signal", [])
+
+        if not closes:
+            return [Signal.HOLD] * len(candles)
+
+        signals = [Signal.HOLD] * len(candles)
+
+        for i in range(1, len(candles)):
+            # ATR止损：价格跌破 EMA200 且 ATR扩大
+            if ema200[i] != 0 and closes[i] < ema200[i] and closes[i-1] >= ema200[i-1]:
+                signals[i] = Signal.SELL
+                continue
+            # MACD死叉
+            if (macd[i] < signal[i] and macd[i-1] >= signal[i-1] and
+                    macd[i] != 0 and signal[i] != 0):
+                signals[i] = Signal.SELL
+                continue
+            # RSI 超买
+            if rsi[i] > 80 and rsi[i-1] <= 80:
+                signals[i] = Signal.SELL
+
+        return signals
+
+    def get_atr_stop_loss(self, entry_price: float, candles: List[Dict], is_long: bool = True) -> float:
+        """ATR动态止损价"""
+        atr = compute_atr(candles, self.atr_period)
+        if not atr:
+            return entry_price * (1 - 0.12)
+        current_atr = atr[-1] if atr else 0
+        if is_long:
+            return entry_price - current_atr * self.atr_multiplier
+        else:
+            return entry_price + current_atr * self.atr_multiplier
+
+
+# ============================================================
+# 策略2：资金费率套利（Funding Rate Arbitrage Strategy）
+# 稳定收益基石 — 正向套利吃资金费率
+# ============================================================
+
+class FundingRateArbitrageStrategy(Strategy):
+    """
+    资金费率套利策略（稳定收益基石）
+
+    逻辑：
+      - 做多现货 + 做空等量永续（当资金费率持续为正）
+      - 做空现货 + 做多永续（资金费率为负时）
+
+    开仓条件：
+      - 资金费率持续 > 0.03%（每4-8小时检查）
+      - 基差稳定或有收敛趋势
+
+    目标：
+      - 每月吃 0.8-2.5% 资金费率
+      - 基差收敛额外收益
+
+    参数：
+      - min_funding_rate: 最小资金费率阈值（默认 0.0003 = 0.03%）
+      - max_funding_rate: 最大资金费率阈值（默认 0.01 = 1%，避免极高费率陷阱）
+      - rebalance_hours:  检查间隔（小时，默认 6）
+    """
+
+    def __init__(self, config=None,
+                 min_funding_rate: float = 0.0003,
+                 max_funding_rate: float = 0.01,
+                 rebalance_hours: int = 6):
+        super().__init__(config)
+        self.min_funding_rate = min_funding_rate
+        self.max_funding_rate = max_funding_rate
+        self.rebalance_hours = rebalance_hours
+
+    def populate_indicators(self, candles: List[Dict]) -> Dict[str, List[float]]:
+        closes = [c["close"] for c in candles]
+        volumes = [c.get("volume", 0) for c in candles]
+
+        self._indicators = {
+            "close":  closes,
+            "volume": volumes,
+        }
+        return self._indicators
+
+    def populate_entry_trend(self, candles: List[Dict]) -> List[int]:
+        """
+        资金费率策略不依赖技术指标入场信号，
+        而依赖外部注入的资金费率数据。
+        当 funding_rate > min_funding_rate 且 < max_funding_rate 时产生买入信号。
+        """
+        signals = [Signal.HOLD] * len(candles)
+        fr = getattr(self, "funding_rate", None)
+
+        if fr is None:
+            return signals
+
+        # 资金费率在合理区间
+        if self.min_funding_rate <= fr <= self.max_funding_rate:
+            signals[-1] = Signal.BUY   # 做多现货+做空永续
+
+        return signals
+
+    def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
+        """
+        平仓条件：
+          - 资金费率转负或过高
+          - 基差收敛到0附近
+        """
+        signals = [Signal.HOLD] * len(candles)
+        fr = getattr(self, "funding_rate", None)
+
+        if fr is None:
+            return signals
+
+        # 费率不再适合套利
+        if fr < 0 or fr > self.max_funding_rate:
+            signals[-1] = Signal.SELL
+
+        return signals
+
+
+# ============================================================
+# 策略3：统计套利（Statistical Arbitrage — 配对交易）
+# 经典配对均值回归策略
+# ============================================================
+
+class StatisticalArbitrageStrategy(Strategy):
+    """
+    统计套利策略（配对交易）
+
+    逻辑：
+      - 计算过去30天两个标的的价差Z-score
+      - Z-score > 2：做空高估 + 做多低估
+      - Z-score < -2：做多低估 + 做空高估
+      - Z-score 回归0附近时平仓
+
+    配对示例：
+      - BTC vs ETH
+      - SOL vs AVAX / NEAR
+      - 同叙事币（两个AI币）
+
+    参数：
+      - pair_symbol:     配对标的（默认 "ETH")
+                         主交易对由 config.symbol 决定，配对对由 pair_symbol 决定
+                         实际配对：config.symbol vs pair_symbol
+      - lookback:        Z-score 回看窗口（默认 30）
+      - z_entry:          入场Z-score阈值（默认 2.0）
+      - z_exit:           平仓Z-score阈值（默认 0.5）
+      - z_exit_loss:      止损Z-score阈值（默认 3.5）
+    """
+
+    def __init__(self, config=None,
+                 pair_symbol: str = "ETH",
+                 lookback: int = 30,
+                 z_entry: float = 2.0,
+                 z_exit: float = 0.5,
+                 z_exit_loss: float = 3.5):
+        super().__init__(config)
+        self.pair_symbol = pair_symbol
+        self.lookback = lookback
+        self.z_entry = z_entry
+        self.z_exit = z_exit
+        self.z_exit_loss = z_exit_loss
+
+    def populate_indicators(self, candles: List[Dict]) -> Dict[str, List[float]]:
+        """
+        计算配对价差和Z-score。
+        配对对的K线数据从 self.pair_candles 注入（外部调用者负责提供）。
+        """
+        closes = [c["close"] for c in candles]
+
+        # 主交易对自身收益率
+        returns_main = [0.0] + [
+            (closes[i] - closes[i-1]) / closes[i-1] if closes[i-1] != 0 else 0.0
+            for i in range(1, len(closes))
+        ]
+
+        # 配对收益率（由外部注入 self.pair_returns）
+        pair_returns = getattr(self, "pair_returns", [])
+
+        # 计算价差（spread = main_return - pair_return）
+        spread = []
+        for i in range(len(closes)):
+            pr = pair_returns[i] if i < len(pair_returns) else 0.0
+            mr = returns_main[i] if i < len(returns_main) else 0.0
+            spread.append(mr - pr)
+
+        # 计算Z-score
+        zscore = self._compute_zscore(spread, self.lookback)
+
+        self._indicators = {
+            "close":   closes,
+            "spread":   spread,
+            "zscore":  zscore,
+            "returns":  returns_main,
+        }
+        return self._indicators
+
+    def _compute_zscore(self, values: List[float], lookback: int) -> List[float]:
+        """计算滚动Z-score"""
+        result = [0.0] * len(values)
+        for i in range(lookback, len(values)):
+            window = values[i-lookback:i]
+            mean = sum(window) / lookback
+            variance = sum((v - mean) ** 2 for v in window) / lookback
+            std = variance ** 0.5
+            if std > 0:
+                result[i] = (values[i] - mean) / std
+        return result
+
+    def populate_entry_trend(self, candles: List[Dict]) -> List[int]:
+        """
+        Z-score > z_entry → 做空高估（做空主交易对，做多配对对）
+        Z-score < -z_entry → 做多低估（做多主交易对，做空配对对）
+        """
+        ind = self._indicators
+        zscore = ind.get("zscore", [])
+        if not zscore:
+            self.populate_indicators(candles)
+            zscore = self._indicators["zscore"]
+
+        signals = [Signal.HOLD] * len(candles)
+        warmup = self.lookback + 1
+
+        for i in range(warmup, len(candles)):
+            z = zscore[i]
+            if z > self.z_entry:
+                # 做空高估标的（主交易对）
+                signals[i] = Signal.SELL
+            elif z < -self.z_entry:
+                # 做多低估标的（主交易对）
+                signals[i] = Signal.BUY
+
+        return signals
+
+    def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
+        """
+        Z-score 回归 |z_exit| 以内 → 平仓
+        Z-score 超过 |z_exit_loss| → 止损
+        """
+        ind = self._indicators
+        zscore = ind.get("zscore", [])
+        if not zscore:
+            return [Signal.HOLD] * len(candles)
+
+        signals = [Signal.HOLD] * len(candles)
+        warmup = self.lookback + 1
+
+        for i in range(warmup, len(candles)):
+            z = zscore[i]
+            # 止损（极端情况）
+            if abs(z) > self.z_exit_loss:
+                signals[i] = Signal.SELL
+            # 回归均值平仓
+            elif abs(z) < self.z_exit:
+                signals[i] = Signal.SELL
+
+        return signals
+
+
+# ============================================================
+# 策略注册表更新
+# ============================================================
+
+STRATEGY_REGISTRY: Dict[str, type] = {
+    "RSI":        RSIStrategy,
+    "SMA":        SMAcrossStrategy,
+    "MACD":       MACDStrategy,
+    "BOLLINGER":  BollingerBandsStrategy,
+    "KDJ":        KDJStrategy,
+    "ATRSTOP":    ATRStopStrategy,
+    "MULTIFACTOR": MultiFactorTrendStrategy,
+    "FUNDING_ARB": FundingRateArbitrageStrategy,
+    "STAT_ARB":   StatisticalArbitrageStrategy,
+}
 
