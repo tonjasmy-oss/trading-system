@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+from config import ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER
 from strategies import (
     Strategy, StrategyConfig, Signal,
     RSIStrategy, SMAcrossStrategy, MACDStrategy,
@@ -258,7 +258,7 @@ class VoteBacktester:
         elif name == "KDJ":
             return KDJStrategy(config=config)
         elif name == "ATR":
-            return ATRStopStrategy(config=config, ema_period=20, atr_period=14, atr_multiplier=2.0)
+            return ATRStopStrategy(config=config, ema_period=ATRSTOP_EMA_PERIOD, atr_period=ATRSTOP_ATR_PERIOD, atr_multiplier=ATRSTOP_ATR_MULTIPLIER)
         raise ValueError(f"未知策略: {name}")
 
     # ── 单次回测 ──────────────────────────────────────────

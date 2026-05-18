@@ -21,13 +21,14 @@ import json
 import logging
 import math
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # 加载项目路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER
 
 from strategies import Strategy, SMAcrossStrategy, RSIStrategy, Signal, StrategyConfig
 from tdx_compiler import FormulaStrategy, BUILTIN_FORMULAS
@@ -39,6 +40,10 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+def _ts_to_dt(ts: int) -> datetime:
+    """timestamp 秒/毫秒 auto-detect → UTC datetime"""
+    return datetime.fromtimestamp(ts / 1000 if ts > 1e12 else ts, tz=timezone.utc)
 
 # ============================================================
 # 回测结果数据类
@@ -178,6 +183,9 @@ class BacktestEngine:
         """
         if not self.candles:
             raise RuntimeError("请先调用 load_data() 加载数据")
+        # 自动生成信号（如尚未生成）
+        if not self.entry_signal:
+            self.compute_signals()
 
         sl = self.config.stop_loss
         tp = self.config.take_profit
@@ -190,10 +198,13 @@ class BacktestEngine:
         allow_long = td in ("long", "both")
         allow_short = td in ("short", "both")
 
+        # equity_curve 起点：记录初始资金（K线数据之前的状态）
+        first_ts = self.candles[0]["timestamp"]
+        self.equity_curve.append((first_ts, equity))
+
         for i, candle in enumerate(self.candles):
             ts    = candle["timestamp"]
             close = candle["close"]
-            self.equity_curve.append((ts, equity))
 
             # ── 多头持仓止损/止盈 ──
             lp = self._long_pos
@@ -202,10 +213,12 @@ class BacktestEngine:
                 if long_pnl <= -sl:
                     equity = self._close_pos("long", lp, ts, close, "stop_loss", equity, cp, long_pnl)
                     self._long_pos = {}
+                    self.equity_curve.append((ts, equity))
                     continue
                 if long_pnl >= tp:
                     equity = self._close_pos("long", lp, ts, close, "take_profit", equity, cp, long_pnl)
                     self._long_pos = {}
+                    self.equity_curve.append((ts, equity))
                     continue
 
             # ── 空头持仓止损/止盈 ──
@@ -215,10 +228,12 @@ class BacktestEngine:
                 if short_pnl <= -sl:
                     equity = self._close_pos("short", sp, ts, close, "stop_loss", equity, cp, short_pnl)
                     self._short_pos = {}
+                    self.equity_curve.append((ts, equity))
                     continue
                 if short_pnl >= tp:
                     equity = self._close_pos("short", sp, ts, close, "take_profit", equity, cp, short_pnl)
                     self._short_pos = {}
+                    self.equity_curve.append((ts, equity))
                     continue
 
             buy_sig  = self.entry_signal[i] == Signal.BUY
@@ -232,9 +247,10 @@ class BacktestEngine:
                 }
 
             # ── 多头出场 ──
-            elif self._long_pos and sell_sig:
-                long_pnl = (close - self._long_pos["entry_price"]) / self._long_pos["entry_price"]
-                equity = self._close_pos("long", self._long_pos, ts, close, "signal", equity, cp, long_pnl)
+            if allow_long and self._long_pos and sell_sig:
+                lp = self._long_pos
+                pnl_pct = (close * (1 - self.slippage_pct) - lp["entry_price"]) / lp["entry_price"]
+                equity = self._close_pos("long", lp, ts, close, "signal", equity, cp, pnl_pct)
                 self._long_pos = {}
 
             # ── 空头入场 ──
@@ -245,12 +261,14 @@ class BacktestEngine:
                 }
 
             # ── 空头出场 ──
-            elif self._short_pos and buy_sig:
-                short_pnl = (self._short_pos["entry_price"] - close) / self._short_pos["entry_price"]
-                equity = self._close_pos("short", self._short_pos, ts, close, "signal", equity, cp, short_pnl)
+            if allow_short and self._short_pos and buy_sig:
+                sp = self._short_pos
+                pnl_pct = (sp["entry_price"] - close * (1 + self.slippage_pct)) / sp["entry_price"]
+                equity = self._close_pos("short", sp, ts, close, "signal", equity, cp, pnl_pct)
                 self._short_pos = {}
 
-        # 最后结算未平仓
+            # 每根K线处理完毕后记录 equity（含所有变动）
+            self.equity_curve.append((ts, equity))
         if self.candles:
             last_close = self.candles[-1]["close"]
             last_ts = self.candles[-1]["timestamp"]
@@ -260,7 +278,8 @@ class BacktestEngine:
             if self._short_pos:
                 short_pnl = (self._short_pos["entry_price"] - last_close) / self._short_pos["entry_price"]
                 equity = self._close_pos("short", self._short_pos, last_ts, last_close, "force_close", equity, cp, short_pnl)
-            self.equity_curve[-1] = (last_ts, equity)
+            # 追加 force_close 后的最终 equity（如无持仓则覆盖最后一条）
+            self.equity_curve.append((last_ts, equity))
 
         return self._build_result(equity)
 
@@ -331,8 +350,8 @@ class BacktestEngine:
             strategy_name  = self.strategy.__class__.__name__,
             symbol         = self.config.symbol,
             timeframe      = self.config.timeframe,
-            start_date     = datetime.fromtimestamp(start_ts / 1000).strftime("%Y-%m-%d"),
-            end_date       = datetime.fromtimestamp(end_ts   / 1000).strftime("%Y-%m-%d"),
+            start_date     = _ts_to_dt(start_ts).strftime("%Y-%m-%d"),
+            end_date       = _ts_to_dt(end_ts).strftime("%Y-%m-%d"),
             total_return_pct   = total_return_pct,
             sharpe_ratio       = round(sharpe, 2),
             max_drawdown_pct   = round(max_dd, 2),
@@ -356,10 +375,10 @@ class BacktestEngine:
         """将 equity_curve 转换为日收益率列表（按 timestamp 分组）"""
         if not self.equity_curve:
             return []
-        # 按天聚合
+        # 按天聚合（K线 timestamp 可能是秒或毫秒，统一 auto-detect）
         daily: Dict[str, float] = {}
         for ts, eq in self.equity_curve:
-            day = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+            day = _ts_to_dt(ts).strftime("%Y-%m-%d")
             daily[day] = eq  # 取每天最后一个 equity
 
         days = sorted(daily.keys())
@@ -398,8 +417,8 @@ def generate_report(result: BacktestResult, output_dir: str = "backtest_results"
     # 格式化交易列表
     trade_lines = []
     for i, t in enumerate(result.trades, 1):
-        entry_dt  = datetime.fromtimestamp(t.entry_time / 1000).strftime("%Y-%m-%d %H:%M")
-        exit_dt   = datetime.fromtimestamp(t.exit_time   / 1000).strftime("%Y-%m-%d %H:%M")
+        entry_dt  = _ts_to_dt(t.entry_time).strftime("%Y-%m-%d %H:%M")
+        exit_dt   = _ts_to_dt(t.exit_time).strftime("%Y-%m-%d %H:%M")
         holding_h = (t.exit_time - t.entry_time) / 3600000
         pnl_emoji = "🟢" if t.pnl_pct > 0 else "🔴"
         side_tag = "📈多" if t.side == "long" else "📉空"
@@ -536,7 +555,7 @@ def main_compare(args):
         "MACD":      MACDStrategy(config),
         "BOLLINGER": BollingerBandsStrategy(config, period=20, std_dev=2.0),
         "KDJ":       KDJStrategy(config),
-        "ATRSTOP":   ATRStopStrategy(config, ema_period=20, atr_period=14, atr_multiplier=2.0),
+        "ATRSTOP":   ATRStopStrategy(config, ema_period=ATRSTOP_EMA_PERIOD, atr_period=ATRSTOP_ATR_PERIOD, atr_multiplier=ATRSTOP_ATR_MULTIPLIER),
     }
 
     init_cache_db()
@@ -785,7 +804,7 @@ def walk_forward(symbol: str, timeframe: str, strategy: Strategy,
         return {"error": "数据不足"}
     months_map = {}
     for c in all_candles:
-        mk = datetime.fromtimestamp(c["timestamp"]/1000).strftime("%Y-%m")
+        mk = _ts_to_dt(c["timestamp"]).strftime("%Y-%m")
         months_map.setdefault(mk, []).append(c)
     months = sorted(months_map.keys())
     total = train_months + test_months

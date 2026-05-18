@@ -59,6 +59,7 @@ _CONTRACT_STEP_SIZES = {
     "OP": 1.0,
     "SUI": 10.0,
     "ZEC": 0.01,
+    "XAUT": 0.001,
 }
 
 def _round_quantity(symbol: str, quantity: float) -> float:
@@ -86,6 +87,7 @@ SYMBOL_MAP = {
     "ARB":   "ARBUSDT",
     "OP":    "OPUSDT",
     "SUI":   "SUIUSDT",
+    "XAUT":  "XAUTUSDT",
 }
 
 # timeframe 映射：ccxt 标准 → Weex

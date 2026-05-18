@@ -7,7 +7,7 @@ import time
 import requests
 import logging
 from typing import Optional, Dict, List, TYPE_CHECKING, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache, wraps
 
 # 抑制 SSH 隧道 localhost 自签名证书的 SSL 警告
@@ -201,7 +201,7 @@ def _gateio_api_tunnel(symbol: str) -> Optional[Dict]:
             "high_24h": float(ticker.get("high_24h", 0)),
             "low_24h": float(ticker.get("low_24h", 0)),
             "volume_24h": float(ticker.get("quote_volume", 0)),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except requests.exceptions.Timeout:
         raise
@@ -237,7 +237,7 @@ def get_crypto_price(symbol: str) -> Optional[Dict]:
             "high_24h": ticker.get("high"),
             "low_24h": ticker.get("low"),
             "volume_24h": ticker.get("quoteVolume"),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except ccxt.ExchangeError as e:
         logger.warning(f"ccxt 获取 {symbol} 失败，尝试降级到 Gate.io: {e}")
@@ -297,7 +297,7 @@ def get_order_book(symbol: str, limit: int = 10) -> Optional[Dict]:
             "pair": ccxt_symbol,
             "bids": orderbook.get("bids", []),
             "asks": orderbook.get("asks", []),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except Exception as e:
         logger.error(f"获取 {symbol} 订单簿失败: {e}")
@@ -482,7 +482,7 @@ def _gateio_fallback(symbol: str) -> Optional[Dict]:
             "high_24h": float(ticker.get("high_24h", 0)),
             "low_24h": float(ticker.get("low_24h", 0)),
             "volume_24h": float(ticker.get("quote_volume", 0)),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     except requests.exceptions.Timeout:
         raise
@@ -654,7 +654,7 @@ def get_hyperliquid_price(symbol: str = "ETH") -> Optional[dict]:
         "high_24h": 0.0,
         "low_24h": 0.0,
         "volume_24h": volume_24h,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "exchange": "hyperliquid",
     }
 
@@ -720,7 +720,7 @@ def get_hyperliquid_order_book(symbol: str = "ETH", limit: int = 10) -> Optional
         "pair": f"{symbol.upper()}/USD",
         "bids": [[float(p), float(s)] for p, s in orderbook.get("bids", [])],
         "asks": [[float(p), float(s)] for p, s in orderbook.get("asks", [])],
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "exchange": "hyperliquid",
     }
 
@@ -756,7 +756,7 @@ def get_fear_and_greed_index() -> Optional[Dict]:
         return {
             "value": _last_fng_fetch["value"],
             "classification": _last_fng_fetch["classification"],
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "cached": True,
         }
 
@@ -769,7 +769,7 @@ def get_fear_and_greed_index() -> Optional[Dict]:
                 return {
                     "value": _last_fng_fetch["value"],
                     "classification": _last_fng_fetch["classification"],
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "cached": True,
                     "expired": True,
                 }
@@ -789,7 +789,7 @@ def get_fear_and_greed_index() -> Optional[Dict]:
         return {
             "value": value,
             "classification": classification,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "cached": False,
         }
     except Exception as e:
@@ -799,7 +799,7 @@ def get_fear_and_greed_index() -> Optional[Dict]:
             return {
                 "value": _last_fng_fetch["value"],
                 "classification": _last_fng_fetch["classification"],
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "cached": True,
                 "expired": True,
             }
@@ -945,7 +945,7 @@ def get_onchain_metrics(symbol: str = "BTC") -> Optional[Dict]:
             "transaction_volume_trend": vol_trend,
             "onchain_score": onchain_score,
             "volume_change_7d_pct": vol_change_pct,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     except Exception as e:
@@ -1001,7 +1001,7 @@ def get_multi_factor_data(symbol: str = "BTC") -> Optional[Dict]:
         "onchain_vol_trend": oc.get("transaction_volume_trend", "stable") if oc else "stable",
         "volume_change_7d_pct": oc.get("volume_change_7d_pct", 0) if oc else 0,
         "errors": errors,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 

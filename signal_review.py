@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Tuple
 import json
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class SignalReview:
@@ -70,7 +70,7 @@ class SignalReview:
             (signal_id, signal_type, confidence, strategy_name, entry_price, market, indicators, recorded_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (signal_id, signal_type, confidence, strategy_name, price, market,
-              json.dumps(indicators or {}), datetime.now().isoformat()))
+              json.dumps(indicators or {}), datetime.now(timezone.utc).isoformat()))
         conn.commit()
         conn.close()
 

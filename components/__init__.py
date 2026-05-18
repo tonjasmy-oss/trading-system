@@ -24,12 +24,6 @@ from .signal_engine import (
     BUILTIN_FORMULAS,
 )
 
-from .position_manager import (
-    PositionManager,
-    Position,
-    PnLResult,
-)
-
 from .signal_router import (
     SignalRouter,
     CandidateSignal,

@@ -471,8 +471,30 @@ async def get_portfolio_value():
 
 @app.get("/api/trades")
 async def get_trades_api(limit: int = 50):
-    """获取交易历史"""
-    return portfolio.get_trades(limit)
+    """获取交易历史 — 从 live_trading.db 读取"""
+    import sqlite3, os
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, symbol, entry_price, exit_price, quantity, pnl_pct, pnl_abs, exit_reason, created_at
+            FROM trades ORDER BY id DESC LIMIT ?
+        """, (limit,)).fetchall()
+        conn.close()
+        return [{
+            "id": r["id"],
+            "symbol": r["symbol"],
+            "entry_price": round(r["entry_price"], 4) if r["entry_price"] else 0,
+            "exit_price": round(r["exit_price"], 4) if r["exit_price"] else 0,
+            "quantity": round(r["quantity"], 6) if r["quantity"] else 0,
+            "pnl_pct": round(r["pnl_pct"], 2) if r["pnl_pct"] else 0,
+            "pnl_abs": round(r["pnl_abs"], 2) if r["pnl_abs"] else 0,
+            "exit_reason": r["exit_reason"] or "",
+            "created_at": r["created_at"] or "",
+        } for r in rows]
+    except Exception as e:
+        return []
 
 @app.get("/api/alerts")
 async def get_alerts_api(limit: int = 20):
@@ -751,143 +773,128 @@ async def get_stock_chart_data(
 # ================================================================
 
 @app.get("/api/backtest/chart/{strategy_name}")
-async def get_backtest_chart_data(strategy_name: str):
+async def get_backtest_chart_data(
+    strategy_name: str,
+    symbol: str = "SUI/USDT",
+    timeframe: str = "4h",
+    ema_period: int = 20,
+    atr_period: int = 14,
+    atr_multiplier: float = 2.0,
+    rsi_period: int = 14,
+    oversold: float = 30.0,
+    overbought: float = 65.0,
+    stop_loss: float = 0.012,
+    take_profit: float = 0.025,
+):
     """
-    获取回测图表数据：Equity Curve + 买卖点标注
+    获取回测图表数据：Equity Curve + 买卖点标注（真实回测引擎）
     strategy_name: "KDJ" | "MACD" | "MA_CROSS" | "CCI" | "RSI" | "BOLL" | "WR" | "MultiVote"
+                 | "ATRStopStrategy" | "RSIStrategy" | "BollingerBandsStrategy" | "SMAcrossStrategy"
     """
     import random, math
-    from tdx_compiler import FormulaStrategy, BUILTIN_FORMULAS, TdxCompiler
+    from backtest import BacktestEngine
     from multi_strategy_vote import MultiStrategyVote
-    from strategies import RSIStrategy, SMAcrossStrategy, StrategyConfig
+    from strategies import (RSIStrategy, SMAcrossStrategy, BollingerBandsStrategy,
+                            KDJStrategy, MACDStrategy, ATRStopStrategy, StrategyConfig)
+    from tdx_compiler import FormulaStrategy, BUILTIN_FORMULAS, TdxCompiler
 
-    # 生成确定性 K 线
-    n = 300
-    base_price = 2000.0
-    random.seed(42)
-    price = base_price
-    candles = []
-    for i in range(n):
-        r = random.uniform(-0.025, 0.025) + 0.0005
-        o = price
-        c = price * (1 + r)
-        h = max(o, c) * (1 + random.uniform(0, 0.008))
-        l = min(o, c) * (1 - random.uniform(0, 0.008))
-        candles.append({
-            "timestamp": 1600000000000 + i * 4 * 3600000,
-            "open": round(o, 2), "high": round(h, 2),
-            "low": round(l, 2), "close": round(c, 2),
-            "volume": round(random.uniform(200, 800), 2),
-        })
-        price = c
-
-    # 选择策略
+    # 构建策略
+    strategy_map = {
+        "RSIStrategy":            RSIStrategy,
+        "BollingerBandsStrategy": BollingerBandsStrategy,
+        "SMAcrossStrategy":       SMAcrossStrategy,
+        "KDJStrategy":            KDJStrategy,
+        "MACDStrategy":           MACDStrategy,
+        "ATRStopStrategy":       ATRStopStrategy,
+        # 别名
+        "RSI":                   RSIStrategy,
+        "BOLL":                  BollingerBandsStrategy,
+        "MA_CROSS":              SMAcrossStrategy,
+    }
     # 多策略投票阈值（0.0 表示过半即触发，适合分散信号的多策略组合）
     VOTE_THRESHOLD = float(os.getenv("LIVE_VOTE_THRESHOLD", "0.0"))
     if strategy_name == "MultiVote":
-        rsi_s = RSIStrategy(StrategyConfig(symbol="ETH/USDT", timeframe="4h", stop_loss=0.05, take_profit=0.10))
-        sma_s = SMAcrossStrategy(StrategyConfig(symbol="ETH/USDT", timeframe="4h", stop_loss=0.05, take_profit=0.10))
-        macd_s = FormulaStrategy(formula=BUILTIN_FORMULAS["MACD"], symbol="ETH/USDT", stop_loss=0.05, take_profit=0.10)
-        vote = MultiStrategyVote(
-            [(rsi_s, 0.4), (sma_s, 0.3), (macd_s, 0.3)],
-            threshold=VOTE_THRESHOLD,
-            name="RSI40%+SMA30%+MACD30%",
-        )
+        rsi_s  = RSIStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit), rsi_period=rsi_period, oversold=oversold, overbought=overbought)
+        sma_s  = SMAcrossStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit))
+        macd_s = FormulaStrategy(formula=BUILTIN_FORMULAS["MACD"], symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit)
+        vote   = MultiStrategyVote([(rsi_s, 0.4), (sma_s, 0.3), (macd_s, 0.3)], threshold=VOTE_THRESHOLD, name="RSI40%+SMA30%+MACD30%")
         strategy = vote
         use_confidence = True
     elif strategy_name in BUILTIN_FORMULAS:
-        strategy = FormulaStrategy(
-            formula=BUILTIN_FORMULAS[strategy_name],
-            symbol="ETH/USDT",
-            timeframe="4h",
-            stop_loss=0.05, take_profit=0.10,
-        )
+        strategy = FormulaStrategy(formula=BUILTIN_FORMULAS[strategy_name], symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit)
+        use_confidence = False
+    elif strategy_name in strategy_map:
+        cls = strategy_map[strategy_name]
+        if cls == ATRStopStrategy:
+            strategy = ATRStopStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005), ema_period=ema_period, atr_period=atr_period, atr_multiplier=atr_multiplier)
+        elif cls == RSIStrategy:
+            strategy = RSIStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005), rsi_period=rsi_period, oversold=oversold, overbought=overbought)
+        elif cls == BollingerBandsStrategy:
+            strategy = BollingerBandsStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        elif cls == SMAcrossStrategy:
+            strategy = SMAcrossStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        elif cls == KDJStrategy:
+            strategy = KDJStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        elif cls == MACDStrategy:
+            strategy = MACDStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        elif cls == WRIStrategy:
+            strategy = WRIStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        elif cls == CCIOScillatorStrategy:
+            strategy = CCIOScillatorStrategy(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit, capital_pct=0.05, commission_pct=0.001, slippage_pct=0.0005))
+        else:
+            strategy = cls(StrategyConfig(symbol=symbol, timeframe=timeframe, stop_loss=stop_loss, take_profit=take_profit))
         use_confidence = False
     else:
         raise HTTPException(status_code=404, detail=f"未知策略: {strategy_name}")
 
-    # 简化指标序列（只返回最后 200 个，前 100 个数据不足）
-    n_show = min(250, n)
-    start = max(0, n - n_show)
+    # ── 真实回测引擎 ──────────────────────────────────────
+    engine = BacktestEngine(strategy=strategy, initial_capital=10000)
+    if not engine.load_data():
+        raise HTTPException(status_code=500, detail="K线数据加载失败")
+    result = engine.run()
 
-    # 计算指标
-    indicators = strategy.populate_indicators(candles)
-    if use_confidence:
-        entry_signals, confidences = strategy.populate_signals_with_confidence(candles)
-        confidence_map = {start + i: confidences[i] for i in range(len(confidences))}
-    else:
-        entry_signals = strategy.populate_entry_trend(candles)
-        confidence_map = {}
-    try:
-        exit_signals = strategy.populate_exit_trend(candles)
-    except Exception:
-        exit_signals = [0] * len(candles)
-    candles_show = candles[start:]
-    timestamps = [c["timestamp"] for c in candles_show]
-    closes = [c["close"] for c in candles_show]
+    # ── 转换 equity_curve 为前端格式 ──────────────────────
+    equity_curve = [{"t": ts, "v": round(eq, 2)} for ts, eq in result.equity_curve]
 
-    # K线数据（前端 lightweight-charts 用）
-    ohlc = [
-        {"t": c["timestamp"] // 1000, "o": c["open"], "h": c["high"], "l": c["low"], "c": c["close"]}
-        for c in candles_show
-    ]
-
-    # Equity Curve（模拟）
-    equity = 10000.0
-    equity_curve = []
-    in_pos = False
-    entry_price = 0.0
-    for i, c in enumerate(candles_show):
-        if in_pos:
-            pnl = (c["close"] - entry_price) / entry_price
-            if pnl <= -0.05:
-                equity *= (1 + pnl * 0.5)
-                in_pos = False
-            elif pnl >= 0.10:
-                equity *= (1 + pnl * 0.9)
-                in_pos = False
-        if entry_signals[start + i] == 1 and not in_pos:
-            in_pos = True
-            entry_price = c["close"]
-        equity_curve.append({"t": c["timestamp"] // 1000, "v": round(equity, 2)})
-
-    # 买卖点
-    buy_markers = []
+    # ── 买卖点 ───────────────────────────────────────────
+    buy_markers  = []
     sell_markers = []
-    for i in range(len(candles_show)):
-        idx = start + i
-        if entry_signals[idx] == 1:
-            conf = confidence_map.get(idx, 0.0)
-            conf_label = "🟢" if conf >= 0.7 else ("🟡" if conf >= 0.4 else "🔴")
-            buy_markers.append({
-                "t": candles_show[i]["timestamp"] // 1000,
-                "price": candles_show[i]["close"],
-                "label": f"买入 {conf_label}{conf:.2f}",
-                "confidence": conf,
-            })
-        if exit_signals[idx] == -1 or (exit_signals[idx] == 0 and entry_signals[idx] == 0 and i > 0 and entry_signals[idx - 1] == 1):
-            # 简化：每次持仓结束视为卖出
-            pass
-        # 用 equity 不变来判断持仓结束（简化逻辑）
-        if i > 0 and in_pos and abs(equity_curve[i]["v"] - equity_curve[i - 1]["v"]) < 0.01:
-            if i == len(candles_show) - 1 or entry_signals[min(idx + 1, n - 1)] == 0:
-                sell_markers.append({
-                    "t": candles_show[i]["timestamp"] // 1000,
-                    "price": candles_show[i]["close"],
-                    "label": "卖出",
-                })
-                in_pos = False
+    for t in result.trades:
+        if t.side == "long":
+            buy_markers.append({"t": t.entry_time, "price": t.entry_price,
+                                 "pnl_pct": round(t.pnl_pct * 100, 2),
+                                 "exit_reason": t.exit_reason})
+            sell_markers.append({"t": t.exit_time, "price": t.exit_price,
+                                  "pnl_pct": round(t.pnl_pct * 100, 2),
+                                  "exit_reason": t.exit_reason})
+        else:
+            sell_markers.append({"t": t.entry_time, "price": t.entry_price,
+                                  "pnl_pct": round(t.pnl_pct * 100, 2),
+                                  "exit_reason": t.exit_reason})
+            buy_markers.append({"t": t.exit_time, "price": t.exit_price,
+                                 "pnl_pct": round(t.pnl_pct * 100, 2),
+                                 "exit_reason": t.exit_reason})
 
-    # 指标线（修复：indicator数组可能比candles_show长，用min防止越界）
-    indicators_out = {}
-    n_candles_show = len(candles_show)
-    for k, v in indicators.items():
-        if len(v) <= start:
-            continue
-        valid = [x for x in v[start:] if x != 0]
-        if valid:
-            indicators_out[k] = [{"t": candles_show[min(i, n_candles_show - 1)]["timestamp"] // 1000, "v": round(val, 4)}
+    # ── 指标线（最后 250 根 K线）────────────────────────
+    n_show = 250
+    candles_all = engine.candles
+    n = len(candles_all)
+    start = max(0, n - n_show)
+    candles_show = candles_all[start:]
+    try:
+        indicators = strategy.populate_indicators(candles_all)
+        indicators_out = {}
+        for k, v in indicators.items():
+            if len(v) <= start:
+                continue
+            indicators_out[k] = [{"t": candles_all[min(start + i, n - 1)]["timestamp"], "v": round(val, 4)}
                                   for i, val in enumerate(v[start:]) if val != 0]
+    except Exception:
+        indicators_out = {}
+
+    # ── K线数据 ─────────────────────────────────────────
+    ohlc = [{"t": c["timestamp"], "o": c["open"], "h": c["high"],
+             "l": c["low"], "c": c["close"]} for c in candles_show]
 
     # 策略投票权重
     strategy_weights = {}
@@ -896,19 +903,25 @@ async def get_backtest_chart_data(strategy_name: str):
             strategy_weights[s.__class__.__name__] = w
 
     return {
-        "strategy": strategy_name,
-        "ohlc": ohlc,
-        "equity_curve": equity_curve,
-        "buy_markers": buy_markers,
-        "sell_markers": sell_markers,
-        "indicators": indicators_out,
-        "weights": strategy_weights,
+        "strategy":       strategy_name,
+        "symbol":         symbol,
+        "timeframe":      timeframe,
+        "ohlc":           ohlc,
+        "equity_curve":   equity_curve,
+        "buy_markers":    buy_markers,
+        "sell_markers":   sell_markers,
+        "indicators":     indicators_out,
+        "weights":        strategy_weights,
         "confidence_enabled": use_confidence,
-        "signal_stats": {
-            "total_signals": sum(1 for s in entry_signals if s != 0),
-            "high_conf": sum(1 for c in confidences if c >= 0.7) if use_confidence else 0,
-            "low_conf": sum(1 for c in confidences if 0 < c < 0.4) if use_confidence else 0,
-        }
+        "performance": {
+            "total_return_pct":   round(result.total_return_pct, 2),
+            "sharpe_ratio":       round(result.sharpe_ratio, 2),
+            "max_drawdown_pct":   round(result.max_drawdown_pct, 2),
+            "win_rate_pct":       round(result.win_rate_pct, 2),
+            "total_trades":       result.total_trades,
+            "start_date":         result.start_date,
+            "end_date":           result.end_date,
+        },
     }
 
 

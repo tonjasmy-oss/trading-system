@@ -19,15 +19,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 REGIME_STRATEGY_MAP = {
-    ("uptrend", "high"):    ("ATRSTOP",  "上升趋势+高波动，使用ATR动态止损", {"ema_period": 20, "atr_multiplier": 2.0}),
-    ("uptrend", "medium"):  ("SMA",      "上升趋势+中等波动，使用均线趋势", {}),
-    ("uptrend", "low"):     ("SMA",      "上升趋势+低波动，使用均线趋势", {"fast_period": 10, "slow_period": 30}),
-    ("downtrend", "high"):  ("RSI",      "下降趋势+高波动，等待超卖反弹", {"rsi_period": 10, "oversold": 20, "overbought": 65}),
-    ("downtrend", "medium"):("MACD",     "下降趋势+中等波动，使用MACD低吸", {}),
-    ("downtrend", "low"):   ("RSI",      "下降趋势+低波动，超卖区反手", {"rsi_period": 14, "oversold": 28, "overbought": 65}),
-    ("ranging", "high"):    ("BOLLINGER","震荡市+高波动，布林带均值回归", {"period": 20, "std_dev": 2.0}),
-    ("ranging", "medium"):  ("KDJ",      "震荡市+中等波动，KDJ摆动交易", {}),
-    ("ranging", "low"):     ("KDJ",      "震荡市+低波动，KDJ小区间摆动", {"k_period": 9, "d_period": 3}),
+    ("uptrend", "high"):    ("ATRSTOP",  "上升趋势+高波动，ATR动态止损(回测最优)", {"ema_period": 20, "atr_multiplier": 2.0}),
+    ("uptrend", "medium"):  ("ATRSTOP",  "上升趋势+中等波动，ATR趋势跟随", {"ema_period": 20, "atr_multiplier": 2.0}),
+    ("uptrend", "low"):     ("SMA",      "上升趋势+低波动，均线趋势", {"fast_period": 10, "slow_period": 30}),
+    ("downtrend", "high"):  ("RSI",      "下降趋势+高波动，超卖反弹", {"rsi_period": 10, "oversold": 20, "overbought": 55}),
+    ("downtrend", "medium"):("RSI",      "下降趋势+中等波动，超卖做多", {"rsi_period": 14, "oversold": 28, "overbought": 55}),
+    ("downtrend", "low"):   ("RSI",      "下降趋势+低波动，超卖做多", {"rsi_period": 14, "oversold": 28, "overbought": 55}),
+    ("ranging", "high"):    ("ATRSTOP",  "震荡市+高波动，ATR动态止损(回测最优)", {"ema_period": 20, "atr_multiplier": 2.0}),
+    ("ranging", "medium"):  ("BOLLINGER","震荡市+中等波动，布林带均值回归", {"period": 20, "std_dev": 2.0}),
+    ("ranging", "low"):     ("KDJ",      "震荡市+低波动，KDJ摆动交易", {}),
 }
 FALLBACK_STRATEGY = ("MACD", "市场状态未知，回退到MACD", {})
 

@@ -172,7 +172,7 @@ def submit_backtest(
     """
     # 注意：完整实现需要调用实际的回测API
     return {
-        "job_id": f"bt_{symbol}_{int(os.time.time())}",
+        "job_id": f"bt_{symbol}_{int(time.time())}",
         "status": "submitted",
         "message": "回测任务已提交（完整回测功能开发中）",
         "params": {

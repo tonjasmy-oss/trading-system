@@ -79,7 +79,10 @@ class XingBuJustice:
         self._init_table()
 
     def _get_conn(self) -> sqlite3.Connection:
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     def _init_table(self):
         conn = self._get_conn()
@@ -236,7 +239,8 @@ class MenxiaSheng:
                     quantity: float, agent_id: str = "default",
                     order_id: Optional[str] = None,
                     signal_confidence: float = 0.5,
-                    indicators: Dict = None) -> ReviewResult:
+                    indicators: Dict = None,
+                    side: str = "long") -> ReviewResult:
         """
         审核开仓请求（所有新开仓必须经过此审核）
         Returns ReviewResult — approved=True 表示可以执行
@@ -244,12 +248,16 @@ class MenxiaSheng:
         self._check_day_reset()
         rules_triggered: List[str] = []
 
+        # ── 计算暴露度（提前，供所有拒绝路径使用）──────────────
+        total_exp = self._calc_total_exposure(symbol, entry_price, quantity, new_side=side)
+        sym_exp   = (quantity * entry_price) / self.current_capital if self.current_capital > 0 else 0.0
+
         # R2: 系统锁定检查
         if self._risk_level == RiskLevel.LOCKED:
             rules_triggered.append(f"R2_系统锁定:{self._lock_reason}")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"系统锁定({self._lock_reason})",
-                               RiskLevel.LOCKED, rules_triggered, entry_price)
+                               RiskLevel.LOCKED, rules_triggered, entry_price, total_exp)
 
         # R1: 单日亏损检查
         if self._daily_loss >= self.MAX_DAILY_LOSS_LOCK:
@@ -259,27 +267,27 @@ class MenxiaSheng:
             self._maybe_alert_risk(level="lock", msg=self._lock_reason)
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"系统锁定({self._lock_reason})",
-                               RiskLevel.LOCKED, rules_triggered, entry_price)
+                               RiskLevel.LOCKED, rules_triggered, entry_price, total_exp)
 
         if self._daily_loss >= self.MAX_DAILY_LOSS_PCT:
             rules_triggered.append(f"R1_CAUTION:{self.MAX_DAILY_LOSS_PCT*100:.0f}%")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"单日亏损{self._daily_loss*100:.1f}%超限",
-                               RiskLevel.CAUTION, rules_triggered, entry_price)
+                               RiskLevel.CAUTION, rules_triggered, entry_price, total_exp)
 
         # R5: 单日交易次数
         if self._daily_trades >= self.MAX_DAILY_TRADES:
             rules_triggered.append(f"R5_日交易次数:{self._daily_trades}")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"单日开仓次数{self._daily_trades}次已达上限",
-                               self._risk_level, rules_triggered, entry_price)
+                               self._risk_level, rules_triggered, entry_price, total_exp)
 
         # R9: 连续亏损熔断
         if self._consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
             rules_triggered.append(f"R9_连续亏损:{self._consecutive_losses}笔")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"连续亏损{self._consecutive_losses}笔，触发熔断",
-                               RiskLevel.LOCKED, rules_triggered, entry_price)
+                               RiskLevel.LOCKED, rules_triggered, entry_price, total_exp)
 
         # R11: 下单量合理性
         order_value = quantity * entry_price
@@ -287,12 +295,12 @@ class MenxiaSheng:
             rules_triggered.append(f"R11_金额过小:${order_value:.2f}")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"下单金额${order_value:.2f}低于最低限额${self.MIN_ORDER_NOTIONAL}",
-                               self._risk_level, rules_triggered, entry_price)
-        if quantity * entry_price > self.current_capital * self.MAX_ORDER_RATIO:
+                               self._risk_level, rules_triggered, entry_price, total_exp)
+        if order_value > self.current_capital * self.MAX_ORDER_RATIO:
             rules_triggered.append(f"R11_金额过大:${order_value:.2f}")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"下单金额${order_value:.2f}超过资金{self.MAX_ORDER_RATIO*100:.0f}%",
-                               self._risk_level, rules_triggered, entry_price)
+                               self._risk_level, rules_triggered, entry_price, total_exp)
 
         # R10: 已有持仓的浮亏检查
         if symbol in self._positions:
@@ -302,23 +310,21 @@ class MenxiaSheng:
                 rules_triggered.append(f"R10_浮亏:{unrealized*100:.1f}%")
                 return self._reject(symbol, quantity, agent_id, order_id,
                                    f"当前持仓浮亏{unrealized*100:.1f}%，禁止加仓",
-                                   self._risk_level, rules_triggered, entry_price)
+                                   self._risk_level, rules_triggered, entry_price, total_exp)
 
-        # R3: 总暴露度
-        total_exp = self._calc_total_exposure(symbol, entry_price, quantity)
+        # R3: 总暴露度（多头和空头均取绝对值计算暴露度）
         if total_exp > self.MAX_TOTAL_EXPOSURE:
             rules_triggered.append(f"R3_总暴露度:{total_exp*100:.1f}%")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"总暴露度{total_exp*100:.1f}%超限({self.MAX_TOTAL_EXPOSURE*100:.0f}%)",
-                               self._risk_level, rules_triggered, entry_price)
+                               self._risk_level, rules_triggered, entry_price, total_exp)
 
         # R4: 单标的暴露度
-        sym_exp = (quantity * entry_price) / self.current_capital
         if sym_exp > self.MAX_POSITION_PER_SYMBOL:
             rules_triggered.append(f"R4_单标的:{sym_exp*100:.1f}%")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"单标的{symbol}暴露度{sym_exp*100:.1f}%超限",
-                               self._risk_level, rules_triggered, entry_price)
+                               self._risk_level, rules_triggered, entry_price, total_exp)
 
         # R7: 动态风险等级
         if self._risk_level in (RiskLevel.WARNING, RiskLevel.LOCKED):
@@ -342,7 +348,7 @@ class MenxiaSheng:
                 rules_triggered.append(f"R8_信号质量:{block_reason}")
                 return self._reject(symbol, quantity, agent_id, order_id,
                                    f"信号质量拦截({block_reason})",
-                                   self._risk_level, rules_triggered, entry_price)
+                                   self._risk_level, rules_triggered, entry_price, total_exp)
         except Exception:
             pass  # 信号复盘模块不可用时跳过
 
@@ -395,7 +401,8 @@ class MenxiaSheng:
         return force_close
 
     def record_open(self, symbol: str, entry_price: float, quantity: float,
-                    stop_loss: float, take_profit: float):
+                    stop_loss: float, take_profit: float,
+                    side: str = "long"):
         """记录开仓成功（尚书省执行完毕后回调）"""
         self._check_day_reset()
         self._positions[symbol] = {
@@ -404,9 +411,10 @@ class MenxiaSheng:
             "quantity": quantity,
             "stop_loss": stop_loss,
             "take_profit": take_profit,
+            "side": side,
         }
         self._daily_trades += 1
-        logger.info(f"[门下省] 开仓记录: {symbol} ${entry_price:.4f} × {quantity}")
+        logger.info(f"[门下省] 开仓记录: {symbol} ${entry_price:.4f} x {quantity} ({side})")
 
     def record_close(self, symbol: str, pnl_pct: float, capital_fraction: float = 1.0):
         """记录平仓（尚书省执行完毕后回调，更新每日盈亏统计）
@@ -500,7 +508,8 @@ class MenxiaSheng:
                 order_id: Optional[str], reason: str,
                 risk_level: RiskLevel,
                 rules_triggered: List[str],
-                entry_price: float) -> ReviewResult:
+                entry_price: float,
+                total_exposure: float) -> ReviewResult:
         """生成否决结果并写入刑部"""
         order = ExecutionOrder(
             order_id=order_id or f"reject_{int(time.time()*1000)}",
@@ -519,7 +528,7 @@ class MenxiaSheng:
             reason=reason,
             risk_level=risk_level,
             rules_triggered=rules_triggered,
-            exposure_pct=0.0,
+            exposure_pct=total_exposure * 100,
         )
 
     def _check_day_reset(self):
@@ -532,15 +541,20 @@ class MenxiaSheng:
             logger.info("[门下省] UTC 新一天，统计已重置")
 
     def _calc_total_exposure(self, new_symbol: str, new_price: float,
-                             new_quantity: float) -> float:
-        """计算总持仓暴露度（含计划中的新仓）"""
+                             new_quantity: float,
+                             new_side: str = "long") -> float:
+        """计算总持仓暴露度（含计划中的新仓）
+
+        多头：名义价值 = quantity × entry_price（成本）
+        空头：名义价值 = quantity × entry_price（也用绝对值，与资金同向消耗）
+        """
         total = sum(
             pos["quantity"] * (new_price if sym == new_symbol else pos["entry_price"])
             for sym, pos in self._positions.items()
         )
         if new_symbol not in self._positions:
             total += new_quantity * new_price
-        return total / self.current_capital if self.current_capital > 0 else 0.0
+        return abs(total) / self.current_capital if self.current_capital > 0 else 0.0
 
     def _downgrade_risk_level(self):
         """降级风险等级"""

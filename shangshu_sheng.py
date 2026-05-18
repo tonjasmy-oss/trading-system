@@ -16,6 +16,7 @@
       menxia.record_open(symbol, ...)  # 回调门下省记录
 """
 
+import os
 import time
 import logging
 import asyncio
@@ -24,6 +25,10 @@ from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent))
+from config import DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +185,10 @@ class ExchangeAdapter:
         """查询订单状态"""
         raise NotImplementedError
 
+    async def fetch_balance(self) -> Dict:
+        """返回完整余额字典 {total, free, frozen}，用于持仓同步"""
+        raise NotImplementedError
+
 
 class BinanceAdapter(ExchangeAdapter):
     """Binance 交易所适配器"""
@@ -221,10 +230,13 @@ class BinanceAdapter(ExchangeAdapter):
 
             fills = order.get("filled", []) or order.get("trades", [])
             total_fee = sum(float(f.get("fee", 0)) for f in fills)
-            avg_price = order.get("average") or (
-                sum(float(f["price"]) * float(f["traded"]) for f in fills) /
-                max(sum(float(f["traded"]) for f in fills), 1) if fills else 0
-            )
+            # 平均成交价：加权平均，若 fills 为空或所有 traded=0 则 fallback 到订单价格
+            traded_list = [float(f["traded"]) for f in fills]
+            total_traded = sum(traded_list)
+            if fills and total_traded > 0:
+                avg_price = sum(float(f["price"]) * float(f["traded"]) for f in fills) / total_traded
+            else:
+                avg_price = order.get("average") or order.get("price") or price or 0
 
             return ExecutionResult(
                 success=True,
@@ -266,7 +278,24 @@ class BinanceAdapter(ExchangeAdapter):
             return 0.0
 
     async def get_position(self, symbol: str) -> Optional[PositionInfo]:
-        return None  # 现货不需要 position query
+        """查询持仓"""
+        ex = self._get_exchange()
+        try:
+            ccxt_sym = symbol.replace("/", "")
+            positions = ex.fetch_positions([ccxt_sym])
+            if positions:
+                p = positions[0]
+                return PositionInfo(
+                    symbol=symbol,
+                    side=p.get("side", "long"),
+                    size=float(p.get("contracts", 0)),
+                    entry_price=float(p.get("entryPrice", 0)),
+                    unrealized_pnl=float(p.get("unrealizedPnl", 0)),
+                    leverage=float(p.get("leverage", 1)),
+                )
+        except Exception as e:
+            logger.error(f"[尚书省] 查询持仓失败: {e}")
+        return None
 
     async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
         ex = self._get_exchange()
@@ -277,6 +306,16 @@ class BinanceAdapter(ExchangeAdapter):
             )
         except Exception:
             return None
+
+    async def fetch_balance(self) -> Dict:
+        """返回 ccxt 风格余额字典 {asset: {total, free, frozen}}"""
+        ex = self._get_exchange()
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ex.fetch_balance())
+        except Exception as e:
+            logger.error(f"[尚书省] Binance 余额查询失败: {e}")
+            return {}
 
 
 class GateioAdapter(ExchangeAdapter):
@@ -312,9 +351,13 @@ class GateioAdapter(ExchangeAdapter):
 
             fills = order.get("trades", [])
             total_fee = sum(float(f.get("fee", 0)) for f in fills)
-            avg_price = (sum(float(f["price"]) * float(f["amount"])
-                         for f in fills) / max(sum(float(f["amount"])
-                         for f in fills), 1) if fills else price or 0)
+            # 平均成交价：先算 total_traded，为 0 时走完整 fallback 链
+            total_traded = max(sum(float(f.get("amount", 0)) for f in fills), 1)
+            avg_price = (
+                sum(float(f["price"]) * float(f["amount"]) for f in fills) / total_traded
+                if fills else
+                order.get("average") or order.get("price") or price or 0
+            )
 
             return ExecutionResult(
                 success=True,
@@ -367,6 +410,15 @@ class GateioAdapter(ExchangeAdapter):
             )
         except Exception:
             return None
+
+    async def fetch_balance(self) -> Dict:
+        ex = self._get_exchange()
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ex.fetch_balance())
+        except Exception as e:
+            logger.error(f"[尚书省] Gate.io 余额查询失败: {e}")
+            return {}
 
 
 class BybitAdapter(ExchangeAdapter):
@@ -511,6 +563,15 @@ class BybitAdapter(ExchangeAdapter):
         except Exception:
             return None
 
+    async def fetch_balance(self) -> Dict:
+        ex = self._get_exchange()
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ex.fetch_balance())
+        except Exception as e:
+            logger.error(f"[尚书省] Bybit 余额查询失败: {e}")
+            return {}
+
 
 class HyperliquidAdapter(ExchangeAdapter):
     """Hyperliquid 永续合约适配器"""
@@ -611,6 +672,15 @@ class HyperliquidAdapter(ExchangeAdapter):
         except Exception:
             return None
 
+    async def fetch_balance(self) -> Dict:
+        ex = self._get_exchange()
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: ex.fetch_balance())
+        except Exception as e:
+            logger.error(f"[尚书省] Hyperliquid 余额查询失败: {e}")
+            return {}
+
 
 class WeexAdapter(ExchangeAdapter):
     """Weex 交易所适配器（独立 REST API，非 ccxt）"""
@@ -630,6 +700,7 @@ class WeexAdapter(ExchangeAdapter):
         from weex import create_order as weex_create_order
 
         def _do():
+            reduce_only = (params or {}).get("reduce_only", False) if params else False
             return weex_create_order(
                 api_key=self.api_key,
                 api_secret=self.api_secret,
@@ -639,6 +710,7 @@ class WeexAdapter(ExchangeAdapter):
                 order_type=order_type.lower(),
                 amount=quantity,
                 price=price,
+                reduce_only=reduce_only,
             )
 
         try:
@@ -693,8 +765,69 @@ class WeexAdapter(ExchangeAdapter):
             logger.error(f"[尚书省] Weex 查询余额失败: {e}")
             return 0.0
 
+    async def fetch_balance(self) -> Dict:
+        """返回 Weex 格式余额，转换为 ccxt 风格 {asset: {total, free, frozen}}"""
+        from weex import fetch_balance as weex_balance
+        try:
+            bal = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: weex_balance(self.api_key, self.api_secret, self.api_passphrase)
+            )
+            if not bal:
+                return {}
+            # 转换为 ccxt 风格
+            result = {}
+            for b in bal.get("balances", []):
+                asset = b.get("asset", "")
+                total = float(b.get("total", 0))
+                free = float(b.get("free", 0))
+                result[asset] = {"total": total, "free": free, "frozen": total - free}
+            return result
+        except Exception as e:
+            logger.error(f"[尚书省] Weex 余额查询失败: {e}")
+            return {}
+
     async def get_position(self, symbol: str) -> Optional[PositionInfo]:
-        return None  # 现货
+        """从数据库读取 Weex 实盘持仓（live_trading.db positions 表）"""
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(__file__), "live_trading.db")
+        try:
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute(
+                "SELECT entry_price, entry_time, quantity, side FROM positions "
+                "WHERE symbol = ? AND exchange = 'weex' AND status = 'open'",
+                (symbol,)
+            )
+            row = c.fetchone()
+            conn.close()
+            if not row:
+                # 无数据库记录时，用余额推断是否有未记录持仓
+                from weex import fetch_balance as weex_balance
+                bal = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: weex_balance(self.api_key, self.api_secret, self.api_passphrase)
+                )
+                if bal:
+                    locked = bal.get("total", 0) - bal.get("available", 0)
+                    if locked > 0.5:
+                        logger.warning(
+                            f"[WeexAdapter] {symbol}: 余额显示持仓价值 ${locked:.2f}，"
+                            f"但数据库无记录！请手动对账"
+                        )
+                return None
+            entry_price, entry_time, quantity, side = row
+            return PositionInfo(
+                symbol=symbol,
+                side=side if side else "long",
+                size=quantity,
+                entry_price=entry_price,
+                unrealized_pnl=0.0,
+                leverage=1.0,
+            )
+        except Exception as e:
+            logger.error(f"[WeexAdapter] 查询持仓失败: {e}")
+            return None
 
     async def get_order_status(self, order_id: str, symbol: str) -> Optional[Dict]:
         from weex import fetch_open_orders
@@ -745,7 +878,7 @@ class ShangshuSheng:
                  api_key: str = "", api_secret: str = "",
                  api_passphrase: str = "",
                  testnet: bool = True,
-                 db_path: str = "trading_system.db"):
+                 db_path: str = DB_PATH):
         if exchange not in _ADAPTERS:
             raise ValueError(f"不支持的交易所: {exchange}，支持: {list(_ADAPTERS.keys())}")
 
@@ -768,6 +901,8 @@ class ShangshuSheng:
 
     def _init_db(self):
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS shangshu_executions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -825,12 +960,14 @@ class ShangshuSheng:
         logger.info(f"[尚书省] 执行平仓: {symbol} {side} × {quantity} "
                    f"@ {price or '市价'} 原因:{reason}")
 
+        # 平仓时传 reduce_only=True，防止在双向持仓模式下误开新仓位
         result = await self._adapter.place_order(
             symbol=symbol,
             side=side.upper(),
             order_type=order_type.upper(),
             quantity=quantity,
             price=price,
+            params={"reduce_only": True},
         )
 
         self._record_execution(result, agent_id)
@@ -840,9 +977,17 @@ class ShangshuSheng:
         """取消挂单"""
         return await self._adapter.cancel_order(order_id, symbol)
 
-    async def get_balance(self, asset: str = "USDT") -> float:
-        """查询账户余额"""
-        return await self._adapter.get_balance(asset)
+    async def fetch_balance(self) -> Optional[Dict]:
+        """
+        查询完整账户信息（含 frozen），用于持仓同步。
+        委托给对应交易所的 Adapter 实现，保持多交易所一致性。
+        """
+        try:
+            balance = await self._adapter.fetch_balance()
+            return balance if balance else None
+        except Exception as e:
+            logger.error(f"[尚书省] 查询余额失败 ({self.exchange}): {e}")
+            return None
 
     async def get_executions(self, limit: int = 50,
                              symbol: Optional[str] = None) -> List[Dict]:
@@ -880,6 +1025,8 @@ class ShangshuSheng:
     def _record_execution(self, result: ExecutionResult, agent_id: str):
         """记录成交到数据库"""
         conn = sqlite3.connect(self.db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("""
             INSERT INTO shangshu_executions
             (order_id, agent_id, symbol, side, quantity, exec_price,

@@ -73,6 +73,7 @@ OPTIMAL_PARAMS = {
     "ETH/USDT": dict(rsi_period=14, oversold=30.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
     "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
     "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.012, take_profit=0.025),  # Grid Search 2026-05-09
+    "XAUT/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),  # Weex回测最优
     # KYVE/USDT, PYTH/USDT: 无交易所历史数据（数据不足0条），暂沿用全局默认值 stop_loss=0.025 take_profit=0.050
 }
 
@@ -182,7 +183,16 @@ MULTIFACTOR_TP2_PCT       = float(os.getenv("MULTIFACTOR_TP2_PCT", "0.50"))    #
 MULTIFACTOR_FUNDING_THRESH = float(os.getenv("MULTIFACTOR_FUNDING_THRESH", "0.0005"))  # 资金费率上限 0.05%
 
 # ============================================================
-# 策略2：资金费率套利（Funding Rate Arbitrage）参数
+# 策略2：ATR 止损趋势策略（ATR Stop Trend Strategy）参数
+# ============================================================
+# 最优参数来自 2026-05-18 Grid Search（80组合，ProcessPoolExecutor 8并发）
+# ema_period=10  atr_period=28  atr_multiplier=1.5  →  sharpe=1.23  ret=+1.7%  dd=0.7%
+ATRSTOP_EMA_PERIOD     = int(os.getenv("ATRSTOP_EMA_PERIOD", "10"))
+ATRSTOP_ATR_PERIOD     = int(os.getenv("ATRSTOP_ATR_PERIOD", "28"))
+ATRSTOP_ATR_MULTIPLIER = float(os.getenv("ATRSTOP_ATR_MULTIPLIER", "1.5"))
+
+# ============================================================
+# 策略3：资金费率套利（Funding Rate Arbitrage）参数
 # ============================================================
 FUNDING_ARB_MIN_RATE   = float(os.getenv("FUNDING_ARB_MIN_RATE", "0.0003"))    # 最小资金费率 0.03%
 FUNDING_ARB_MAX_RATE   = float(os.getenv("FUNDING_ARB_MAX_RATE", "0.0100"))    # 最大资金费率 1%（避免陷阱）

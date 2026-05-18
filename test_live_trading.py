@@ -12,18 +12,30 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import tempfile
+import pytest
+
 from menxia_sheng import MenxiaSheng, RiskLevel
 from shangshu_sheng import ShangshuSheng, _CCXT_AVAILABLE
 from config import LIVE_TESTNET, LIVE_API_KEY, LIVE_API_SECRET
 
 
-def test_menxia_review():
-    """测试1：门下省审核服务"""
-    print("\n" + "="*60)
-    print("测试1: 门下省风控审核")
-    print("="*60)
+@pytest.fixture
+def menxia_db(tmp_path):
+    """每个测试独立临时数据库，避免进程间 race condition"""
+    db = str(tmp_path / "test.db")
+    menxia = MenxiaSheng(initial_capital=10000.0, db_path=db)
+    yield menxia, db
+    # 关闭连接后清理
+    try:
+        menxia._get_conn().close()
+    except Exception:
+        pass
 
-    menxia = MenxiaSheng(initial_capital=10000.0)
+
+def test_menxia_review(menxia_db):
+    """测试1：门下省审核服务"""
+    menxia, _ = menxia_db
 
     # 正常开仓审核
     review = menxia.review_open(
@@ -32,12 +44,10 @@ def test_menxia_review():
         quantity=0.3,
         agent_id="test_agent",
     )
-    print(f"  ✅ 正常审核: approved={review.approved}, reason={review.reason}")
     assert review.approved == True, "应该通过"
 
-    # 记录开仓
-    menxia.record_open("ETH/USDT", 3200.0, 0.3, 3130.0, 3330.0)
-    print(f"  ✅ 开仓记录: 持仓数={menxia.get_status()['open_positions']}")
+    # 记录开仓（多头）
+    menxia.record_open("ETH/USDT", 3200.0, 0.3, 3130.0, 3330.0, side="long")
 
     # 单日亏损过大测试
     menxia._daily_loss = 0.06  # 模拟已亏损6%
@@ -47,54 +57,42 @@ def test_menxia_review():
         quantity=1.0,
         agent_id="test_agent",
     )
-    print(f"  ❌ 亏损过大审核: approved={review2.approved}, reason={review2.reason}")
     assert review2.approved == False, "应该被否决"
     assert "单日亏损" in review2.reason, "应该包含亏损原因"
 
-    # 暴露度超限测试
+    # 暴露度超限测试（ETH多头 0.3×3200=960，BTC多头 0.15×65000=9750，总计10710 > 10000）
     menxia._daily_loss = 0.0
     menxia._daily_trades = 9
     menxia.current_capital = 10000.0
     review3 = menxia.review_open(
         symbol="BTC/USDT",
         entry_price=65000.0,
-        quantity=0.15,  # 15% 暴露度，刚好超限（MAX=0.15）
+        quantity=0.15,
         agent_id="test_agent",
     )
-    # 当前已有 ETH 0.3×3200=960，加上 BTC 0.15×65000=9750 = 10710 > 10000
-    print(f"  ❌ 暴露度过高审核: approved={review3.approved}, reason={review3.reason}")
     assert review3.approved == False, "应该被否决"
 
     # 平仓审核（亏损 -6.7% 触发 5% 硬止损）
-    menxia._positions["ETH/USDT"]["entry_price"] = 3000.0  # 模拟大幅亏损
-    close_allowed = menxia.review_close("ETH/USDT", 2800.0, -6.7)  # -6.67% < -5%
-    print(f"  ❌ 硬止损平仓拦截: allowed={close_allowed}")
+    menxia._positions["ETH/USDT"]["entry_price"] = 3000.0
+    close_allowed = menxia.review_close("ETH/USDT", 2800.0, -6.7)
+    assert close_allowed == False, "应被硬止损拦截"
 
     # 平仓审核通过
     close_allowed2 = menxia.review_close("ETH/USDT", 3200.0, 0.0)
-    print(f"  ✅ 正常平仓审核: allowed={close_allowed2}")
+    assert close_allowed2 == True, "正常平仓应通过"
 
     # 风险等级升级测试
-    menxia.update_equity(9300.0)  # 从10000回落7%
+    menxia.update_equity(9300.0)
     status = menxia.get_status()
-    print(f"  ⚠️  Equity回落升级: level={status['risk_level']}")
     assert status["risk_level"] in ["caution", "warning"], "应该升级风险等级"
 
-    print("\n✅ 门下省测试全部通过！")
 
-
-def test_menxia_xingbu():
+def test_menxia_xingbu(tmp_path):
     """测试2：刑部记录"""
-    print("\n" + "="*60)
-    print("测试2: 刑部违规记录")
-    print("="*60)
-
-    import tempfile
-    db_path = tempfile.mktemp(suffix=".db")
+    db_path = str(tmp_path / "xingbu.db")
     menxia = MenxiaSheng(initial_capital=10000.0, db_path=db_path)
     xingbu = menxia.get_xingbu()
 
-    # 模拟被否决的交易
     from menxia_sheng import ExecutionOrder
     order = ExecutionOrder(
         order_id="test_reject_001",
@@ -106,154 +104,138 @@ def test_menxia_xingbu():
         entry_price=0.15,
     )
     xingbu.record_rejection(order, "单日亏损超限", RiskLevel.CAUTION, ["R1_CAUTION:5%"])
-    print("  ✅ 否决记录已写入刑部")
 
     violations = xingbu.get_violations()
     assert len(violations) == 1, "应该有1条违规记录"
     assert violations[0]["symbol"] == "DOGE/USDT", "symbol应该匹配"
-    print(f"  ✅ 刑部查询: {len(violations)}条记录, symbol={violations[0]['symbol']}")
-
-    os.unlink(db_path)
-    print("\n✅ 刑部测试通过！")
 
 
-def test_shangshu_adapter():
-    """测试3：尚书省交易执行（仅验证结构，不真实下单）"""
-    print("\n" + "="*60)
-    print("测试3: 尚书省执行调度")
-    print("="*60)
+def test_menxia_short_exposure(menxia_db):
+    """测试：空头暴露度计算（多空混合持仓，验证绝对值相加）"""
+    menxia, _ = menxia_db
+    # 资金 = $10,000
+    # MAX_POSITION_PER_SYMBOL = 15%，MAX_TOTAL_EXPOSURE = 30%
 
-    if not _CCXT_AVAILABLE:
-        print("  ⚠️  ccxt 未安装，跳过尚书省实盘测试")
-        print("  ✅ 尚书省结构测试通过（ccxt依赖缺失）")
-        return
+    # ETH 多头 0.2 × $4800 = $960，占比 9.6%（< 15%，R4通过）
+    menxia.record_open("ETH/USDT", 4800.0, 0.2, 4700.0, 4900.0, side="long")
 
-    if not LIVE_API_KEY or LIVE_API_SECRET in ["", "your_secret_here"]:
-        print("  ⚠️  未配置实盘 API Key，跳过真实下单测试")
-        print("  ✅ 尚书省结构测试通过（无API Key）")
-        return
+    # BTC 空头 0.02 × $65000 = $1300，占比 13%（< 15%，R4通过）
+    # 总暴露度 = ETH多头960 + BTC空头1300 = 2260，占比 22.6%（< 30%，R3通过）
+    review = menxia.review_open(
+        symbol="BTC/USDT",
+        entry_price=65000.0,
+        quantity=0.02,
+        agent_id="test_agent",
+        side="short",
+    )
+    assert review.approved == True, f"空头暴露度应正确计入绝对值：{review.reason}"
+    assert review.exposure_pct > 20.0, f"暴露度应为绝对值相加：{review.exposure_pct:.1f}%"
+    assert "R3" not in str(review.rules_triggered), "总暴露度不应触发"
 
-    import asyncio
-
-    async def run_test():
-        shangshu = ShangshuSheng(
-            exchange="binance",
-            api_key=LIVE_API_KEY,
-            api_secret=LIVE_API_SECRET,
-            testnet=LIVE_TESTNET,
-        )
-
-        print(f"  交易所: {shangshu.exchange}")
-        print(f"  测试网: {shangshu.testnet}")
-
-        # 查询余额
-        balance = await shangshu.get_balance("USDT")
-        print(f"  ✅ USDT余额: ${balance:.2f}")
-
-        return True
-
-    success = asyncio.get_event_loop().run_until_complete(run_test())
-    print("\n✅ 尚书省测试通过！")
+    # 再加 SOL 空头，使总暴露度超限
+    # 已有：ETH多头960 + BTC空头1300 = 2260
+    # SOL空头 0.2 × $500 = $100，占比 1%
+    # 总：2260 + 100 = 2360，占比 23.6% — 仍未超 30%
+    # 加 SOL空头 1.0 × $500 = $500：总 2760，占比 27.6% — 仍未超
+    # 换大标的：SOL空头 5.0 × $500 = $2500：总 4760，占比 47.6% >> 30%
+    review_over = menxia.review_open(
+        symbol="SOL/USDT",
+        entry_price=500.0,
+        quantity=5.0,
+        agent_id="test_agent",
+        side="short",
+    )
+    assert review_over.approved == False, "总暴露度超限应被否决"
+    assert any("R3" in r for r in review_over.rules_triggered), "应有R3总暴露度规则触发"
 
 
-def test_sansheng_workflow():
-    """测试4：三省六部完整工作流（模拟）"""
-    print("\n" + "="*60)
-    print("测试4: 三省六部完整工作流（模拟）")
-    print("="*60)
-
-    menxia = MenxiaSheng(initial_capital=10000.0)
+def test_sansheng_workflow(menxia_db):
+    """测试：三省六部完整工作流（模拟）"""
+    menxia, _ = menxia_db
     equity = 10000.0
 
-    # 模拟：中书省生成信号 → ETH RSI=25 超卖
-    print("  📋 中书省: 检测到 ETH RSI=25 超卖信号 BUY")
-    print(f"     当前Equity: ${equity:.2f}, 风险等级: {menxia.get_status()['risk_level']}")
-
-    # 门下省审核
     review = menxia.review_open(
         symbol="ETH/USDT",
         entry_price=3200.0,
         quantity=0.3,
         agent_id="agent_1",
     )
+    assert review.approved == True
 
-    if review.approved:
-        print(f"  ✅ 门下省审核: approved=True")
-        print(f"     暴露度: {review.exposure_pct:.1f}%")
-        # 模拟开仓成功
-        menxia.record_open("ETH/USDT", 3200.0, 0.3, 3130.0, 3330.0)
-        print(f"  ✅ 开仓已记录: ETH 0.3 @ $3200")
+    menxia.record_open("ETH/USDT", 3200.0, 0.3, 3130.0, 3330.0, side="long")
 
-        # 模拟价格上涨
-        equity = 10000.0 + 100.0  # 盈利100
-        menxia.update_equity(equity)
-        print(f"  💰 Equity更新: ${equity:.2f}")
+    equity = 10000.0 + 100.0
+    menxia.update_equity(equity)
 
-        # 模拟平仓信号
-        print("  📋 中书省: ETH 触及止盈线 SELL")
-        can_close = menxia.review_close("ETH/USDT", 3330.0, 4.06)
-        print(f"  ✅ 平仓审核: allowed={can_close}")
+    can_close = menxia.review_close("ETH/USDT", 3330.0, 4.06)
+    assert can_close == True
 
-        if can_close:
-            menxia.record_close("ETH/USDT", 4.06)
-            print(f"  ✅ 平仓已记录: 盈亏 +4.06%")
-
-    # 查看最终状态
+    menxia.record_close("ETH/USDT", 4.06)
     status = menxia.get_status()
-    print(f"\n  📊 最终状态:")
-    print(f"     风险等级: {status['risk_level']}")
-    print(f"     当日亏损: {status['daily_loss_pct']:.2f}%")
-    print(f"     持仓数: {status['open_positions']}")
-    print(f"     当日交易: {status['daily_trades']}次")
-
-    print("\n✅ 三省六部工作流测试完成！")
+    assert status["open_positions"] == 0
 
 
 def test_env_config():
-    """测试5：环境变量配置检查"""
-    print("\n" + "="*60)
-    print("测试5: 实盘配置检查")
-    print("="*60)
-
+    """测试：环境变量配置检查"""
     from config import (
         LIVE_TRADING_ENABLED, LIVE_EXCHANGE, LIVE_API_KEY,
         LIVE_TESTNET, LIVE_INITIAL_CAPITAL,
         RISK_MAX_DAILY_LOSS_PCT, RISK_MAX_TOTAL_EXPOSURE,
     )
-
-    print(f"  LIVE_TRADING_ENABLED: {LIVE_TRADING_ENABLED}")
-    print(f"  LIVE_EXCHANGE:        {LIVE_EXCHANGE}")
-    print(f"  LIVE_API_KEY:         {'已配置' if LIVE_API_KEY else '⚠️ 未配置'}")
-    print(f"  LIVE_TESTNET:         {LIVE_TESTNET}")
-    print(f"  LIVE_INITIAL_CAPITAL: ${LIVE_INITIAL_CAPITAL:.2f}")
-    print(f"  RISK_MAX_DAILY_LOSS:  {RISK_MAX_DAILY_LOSS_PCT*100:.0f}%")
-    print(f"  RISK_MAX_EXPOSURE:    {RISK_MAX_TOTAL_EXPOSURE*100:.0f}%")
-
-    if not LIVE_TRADING_ENABLED:
-        print("\n  ⚠️  实盘交易未启用（LIVE_TRADING_ENABLED=false）")
-        print("     启用实盘: 在 .env 中设置 LIVE_TRADING_ENABLED=true")
-        print("     配置API:   LIVE_API_KEY / LIVE_API_SECRET")
-
-    print("\n✅ 配置检查完成！")
+    # 不抛异常即通过
+    assert LIVE_INITIAL_CAPITAL > 0
+    assert RISK_MAX_DAILY_LOSS_PCT > 0
 
 
-if __name__ == "__main__":
-    print("="*60)
-    print("  三省六部架构测试套件")
-    print("="*60)
+def test_shangshu_adapter_structure():
+    """测试：尚书省各 Adapter 结构完整性（mock，无真实网络）"""
+    import asyncio
+    from shangshu_sheng import (
+        BinanceAdapter, GateioAdapter, BybitAdapter,
+        HyperliquidAdapter, ExecutionResult,
+    )
 
-    test_env_config()
-    test_menxia_review()
-    test_menxia_xingbu()
-    test_sansheng_workflow()
-    test_shangshu_adapter()
+    class FakeExchange:
+        """模拟 ccxt exchange，验证接口契约"""
+        def load_markets(self):
+            pass
 
-    print("\n" + "="*60)
-    print("  全部测试完成！")
-    print("="*60)
-    print()
-    print("启用实盘交易：")
-    print("  1. 在 .env 中设置 LIVE_TRADING_ENABLED=true")
-    print("  2. 配置 LIVE_API_KEY 和 LIVE_API_SECRET")
-    print("  3. 设置 LIVE_TESTNET=true（先用测试网）")
-    print("  4. 运行: python live_trading.py --check")
+        def create_order(self, symbol, order_type, side, amount, price=None):
+            # 模拟市价单：filled=[]，average=0（Bug#4 场景）
+            return {
+                "id": "mock_order_001", "symbol": symbol, "side": side,
+                "amount": amount, "filled": [], "average": 0, "status": "closed",
+            }
+
+        def fetch_order(self, order_id, symbol):
+            return {"id": order_id, "symbol": symbol, "status": "closed",
+                    "filled": [], "average": 0}
+
+        def fetch_balance(self):
+            return {"USDT": {"total": 10000.0, "free": 8000.0, "used": 2000.0}}
+
+    async def run():
+        # 验证 BinanceAdapter.place_order — fills=[] 时 avg_price fallback 不过 0
+        adapter = BinanceAdapter(api_key="test", api_secret="test", testnet=True)
+        adapter._exchange = FakeExchange()
+
+        result = await adapter.place_order("ETH/USDT", "BUY", "MARKET", 0.1, price=3200.0)
+        assert result.success
+        assert result.exec_price > 0, "avg_price fallback 应使用 price 参数"
+
+        # 验证各 Adapter.fetch_balance 返回 ccxt 风格余额
+        for cls, kwargs in [
+            (GateioAdapter,      {"api_key": "k", "api_secret": "s", "testnet": True}),
+            (BybitAdapter,       {"api_key": "k", "api_secret": "s", "testnet": True}),
+            (HyperliquidAdapter, {"api_key": "k", "api_secret": "s", "testnet": True}),
+        ]:
+            a = cls(**kwargs)
+            a._exchange = FakeExchange()
+            b = await a.fetch_balance()
+            assert "USDT" in b, f"{cls.__name__}.fetch_balance 应返回 ccxt 风格余额"
+            assert "total" in b["USDT"], f"{cls.__name__}.fetch_balance['USDT'] 应有 total 字段"
+
+        return True
+
+    ok = asyncio.get_event_loop().run_until_complete(run())
+    assert ok

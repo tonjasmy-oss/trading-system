@@ -20,6 +20,7 @@ import json
 import time
 import math
 import sqlite3
+import asyncio
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -130,12 +131,13 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# 飞书主动推送
+# 飞书主动推送（模块级 lazy init，TradingAgent 可通过参数注入覆盖）
+_feishu_sentinel = object()
+_feishu = _feishu_sentinel  # 未初始化标记
 try:
     from feishu_alert import FeishuAlert
     _feishu = FeishuAlert()
 except Exception:
-    _feishu = None
     logger.warning("飞书推送模块加载失败，将不发送主动通知")
 
 # ============================================================
@@ -151,9 +153,16 @@ FEISHU_CHAT_ID = os.getenv("FEISHU_DM_CHAT_ID", "")
 # 数据库
 # ============================================================
 
+def _enable_wal(conn: sqlite3.Connection) -> None:
+    """启用 WAL mode，提升多进程并发读写性能"""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+
+
 def init_trading_db():
     """初始化实盘模拟数据库"""
     conn = sqlite3.connect(DB_PATH)
+    _enable_wal(conn)
     c = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS positions (
@@ -296,6 +305,8 @@ class TradingAgent:
 
         # 飞书主动推送开关（可配置）
         self._feishu_enabled = os.getenv("FEISHU_PUSH_ENABLED", "true").lower() == "true"
+        # 实例级飞书推送器（允许外部注入，覆盖模块级默认值）
+        self._feishu = _feishu if not isinstance(_feishu, type(_feishu_sentinel)) else None
 
         self.capital = initial_capital
         self.position: Optional[Dict] = None
@@ -347,19 +358,49 @@ class TradingAgent:
         # 策略实例（支持通达信公式）
         self.strategy_obj = self._build_strategy(strategy)
 
+        # ── 启动时同步：先查交易所实际持仓，再覆盖本地DB ──
+        if self.shangshu is not None and hasattr(self.shangshu, 'fetch_balance'):
+            try:
+                loop = asyncio.get_event_loop()
+                # 在同步上下文中用 run_until_complete（避免 asyncio.run() 的嵌套 loop 问题）
+                balance = loop.run_until_complete(self.shangshu.fetch_balance())
+                if balance and balance.get('frozen', 0) <= 0:
+                    conn = sqlite3.connect(DB_PATH)
+                    _enable_wal(conn)
+                    c = conn.cursor()
+                    c.execute("UPDATE positions SET status='exchange_closed' WHERE symbol=? AND status='open' AND exchange=?", (self.symbol, self.exchange))
+                    conn.commit()
+                    rows = c.rowcount
+                    conn.close()
+                    if rows > 0:
+                        logger.warning(f"[{agent_id}] 同步清除{rows}条幽灵持仓（交易所无持仓）")
+                    self.position = None
+                    logger.info(f"[{agent_id}] 启动同步完成：交易所无持仓，DB已校正")
+                else:
+                    logger.info(f"[{agent_id}] 启动同步完成：交易所有持仓，DB保留")
+            except Exception as e:
+                logger.warning(f"[{agent_id}] 启动同步失败（不影响启动）：{e}")
+
         self._load_open_position()
         logger.info(f"[{agent_id}] Agent 初始化: {symbol} @ {exchange} "
                    f"策略={strategy} | "
                    f"门下省:{'✓' if menxia else '✗'} | "
                    f"尚书省:{'✓' if shangshu else '✗'}")
 
-    def _build_strategy(self, strategy_type: str):
-        """根据策略类型构建策略实例（通过注册表）"""
+    def _build_strategy(self, strategy_type: str, rotator_kwargs: dict = None):
+        """根据策略类型构建策略实例（通过注册表）。rotator_kwargs 由 StrategyRotator 传入。"""
         config = StrategyConfig(symbol=self.symbol, timeframe=self.timeframe)
 
-        # 自动轮动模式：初始默认 MACD
+        # 自动轮动模式：初始默认多策略投票（RSI+MACD+BOLL），StrategyRotator 会根据市场状态轮动
         if strategy_type == "AUTO":
-            return build_strategy("MACD", config)
+            rsi_s = build_strategy("RSI", config, rsi_period=self.rsi_period,
+                                   oversold=self.oversold, overbought=self.overbought)
+            macd_s = build_strategy("MACD", config)
+            boll_s = build_strategy("BOLLINGER", config, period=20, std_dev=2.0)
+            return MultiStrategyVote(
+                strategies=[(rsi_s, 0.4), (macd_s, 0.3), (boll_s, 0.3)],
+                threshold=0.3, name="RSI+MACD+BOLL",
+            )
 
         # 多策略投票
         if strategy_type == "VOTE":
@@ -388,6 +429,16 @@ class TradingAgent:
                                "overbought": self.overbought}
         elif strategy_type == "BOLLINGER":
             strategy_kwargs = {"period": 20, "std_dev": 2.0}
+        elif strategy_type == "ATRSTOP":
+            strategy_kwargs = {
+                "ema_period": ATRSTOP_EMA_PERIOD,
+                "atr_period": ATRSTOP_ATR_PERIOD,
+                "atr_multiplier": ATRSTOP_ATR_MULTIPLIER
+            }
+        elif strategy_type == "SMA":
+            strategy_kwargs = {"fast_period": 10, "slow_period": 30}
+        elif strategy_type == "KDJ":
+            pass  # KDJ 使用 FormulaStrategy 包装，无需额外参数
 
         # ── 多因子趋势策略（MULTIFACTOR）─────────────────────────────
         elif strategy_type == "MULTIFACTOR":
@@ -441,6 +492,9 @@ class TradingAgent:
                 z_loss=STAT_ARB_Z_LOSS,
             )
 
+        # 合并轮动器传入的参数
+        if rotator_kwargs:
+            strategy_kwargs.update(rotator_kwargs)
         return build_strategy(strategy_type, config, **strategy_kwargs)
 
     # -------------------- 数据获取 --------------------
@@ -605,19 +659,47 @@ class TradingAgent:
                 return Signal.SELL, current_rsi, prev_rsi
             return Signal.HOLD, current_rsi, prev_rsi
 
-        # ── 内置策略（RSI / SMA / MACD / BOLLINGER） ──
+        # ── 内置策略（RSI / SMA / MACD / BOLLINGER / AUTO-VOTE） ──
         closes = [c["close"] for c in candles]
+
+        # 始终计算 RSI 用于日志和辅助判断
+        rsi_vals = compute_rsi(closes, self.rsi_period)
+        current_rsi = rsi_vals[-1] if len(rsi_vals) > 0 else 50.0
+        prev_rsi = rsi_vals[-2] if len(rsi_vals) > 1 else 50.0
+
+        # 委托给策略对象计算信号（而非硬编码 RSI 交叉）
+        try:
+            entry_trend = self.strategy_obj.populate_entry_trend(candles)
+            exit_trend = self.strategy_obj.populate_exit_trend(candles)
+            last_entry = entry_trend[-1] if entry_trend else Signal.HOLD
+            last_exit = exit_trend[-1] if exit_trend else Signal.HOLD
+
+            if isinstance(last_exit, Signal):
+                last_exit = last_exit.value
+            if isinstance(last_entry, Signal):
+                last_entry = last_entry.value
+
+            # 卖出优先于买入
+            if last_exit == Signal.SELL.value:
+                return Signal.SELL, current_rsi, prev_rsi
+            if last_entry == Signal.BUY.value:
+                return Signal.BUY, current_rsi, prev_rsi
+        except Exception:
+            pass
+
+        # 回退：RSI 交叉 + 深度超卖双重判断
         if len(closes) < self.rsi_period + 2:
-            return Signal.HOLD, 50.0, 50.0
+            return Signal.HOLD, current_rsi, prev_rsi
 
-        rsi = compute_rsi(closes, self.rsi_period)
-        current_rsi = rsi[-1]
-        prev_rsi = rsi[-2]
-
+        # RSI 交叉买入：上穿超卖线
         if (current_rsi >= self.oversold and current_rsi > prev_rsi and prev_rsi <= self.oversold):
             return Signal.BUY, current_rsi, prev_rsi
+        # RSI 交叉卖出：下穿超买线
         if (current_rsi <= self.overbought and current_rsi < prev_rsi and prev_rsi >= self.overbought):
             return Signal.SELL, current_rsi, prev_rsi
+        # 深度超卖兜底：RSI < 20 直接触发买入（避免持续阴跌中永远不买）
+        if current_rsi < 20.0 and current_rsi > prev_rsi:
+            return Signal.BUY, current_rsi, prev_rsi
 
         return Signal.HOLD, current_rsi, prev_rsi
 
@@ -729,6 +811,7 @@ class TradingAgent:
             self.capital -= position_cost   # 做多：支付买入成本
 
         conn = sqlite3.connect(DB_PATH)
+        _enable_wal(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO positions (symbol, timeframe, entry_price, entry_time,
@@ -741,7 +824,10 @@ class TradingAgent:
 
         # 通知门下省记录
         if self.menxia:
-            self.menxia.record_open(self.symbol, exec_price, quantity, stop_loss, take_profit)
+            self.menxia.record_open(
+                self.symbol, exec_price, quantity, stop_loss, take_profit,
+                side="short" if is_short else "long",
+            )
 
         # ── TradeHistory 记录开仓 ──
         if self._trade_history:
@@ -768,8 +854,8 @@ class TradingAgent:
 
         # 飞书推送：开仓通知
         display_side_open = "SELL" if is_short else "BUY"
-        if _feishu and self._feishu_enabled:
-            _feishu.send_position_alert(
+        if self._feishu and self._feishu_enabled:
+            self._feishu.send_position_alert(
                 symbol=self.symbol,
                 side=display_side_open,
                 price=exec_price,
@@ -793,6 +879,7 @@ class TradingAgent:
         entry_price = self.position["entry_price"]
         quantity = self.position["quantity"]
         ai_verdict = self.position.get("ai_verdict", "")
+        entry_time = self.position.get("entry_time", timestamp)
         pos_side_c = self.position.get("side", "long")
 
         if pos_side_c == "short":
@@ -819,6 +906,10 @@ class TradingAgent:
                 logger.error(f"[{self.agent_id}] 尚书省实盘平仓失败: {result.message}")
                 return False
             exec_price = result.exec_price
+            # 市价单成交价回填：exec_price=0 时用信号价（两种路径行为统一）
+            if exec_price <= 0:
+                exec_price = price
+            # 平仓后用真实成交价重新计算 PnL（覆盖之前的预估值）
             if pos_side_c == "short":
                 pnl_pct = (entry_price - exec_price) / entry_price * 100
             else:
@@ -831,21 +922,21 @@ class TradingAgent:
             exec_price = price
 
         if pos_side_c == "short":
-            # 平空后：回补成本返还
             self.capital -= quantity * exec_price
         else:
-            # 平多后：卖出所得加入资金
             self.capital += quantity * exec_price
 
         conn = sqlite3.connect(DB_PATH)
+        _enable_wal(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO trades (symbol, timeframe, entry_price, entry_time,
-                               exit_price, exit_time, quantity, pnl_pct, pnl_abs, exit_reason, ai_verdict)
+                                exit_price, exit_time, quantity, pnl_pct, pnl_abs, exit_reason, ai_verdict)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (self.symbol, self.timeframe, entry_price, self.position["entry_time"],
+        """, (self.symbol, self.timeframe, entry_price, entry_time,
               exec_price, timestamp, quantity, pnl_pct, pnl_abs, reason, ai_verdict))
-        c.execute("UPDATE positions SET status = ? WHERE status = 'open'", (reason,))
+        c.execute("UPDATE positions SET status = ? WHERE status = 'open' AND symbol = ?",
+                  (reason, self.symbol))
         conn.commit()
         conn.close()
 
@@ -856,7 +947,7 @@ class TradingAgent:
         # ── TradeHistory 记录平仓 ──
         if self._trade_history and self._current_trade_id is not None:
             try:
-                entry_ts = self.position["entry_time"] if self.position else timestamp
+                entry_ts = entry_time
                 holding_hours = (timestamp - entry_ts) / 3600.0
                 self._trade_history.record_close(
                     trade_id=self._current_trade_id,
@@ -873,8 +964,8 @@ class TradingAgent:
 
         # 飞书推送：平仓通知
         display_close_side_c = "BUY" if pos_side_c == "short" else "SELL"
-        if _feishu and self._feishu_enabled:
-            _feishu.send_position_alert(
+        if self._feishu and self._feishu_enabled:
+            self._feishu.send_position_alert(
                 symbol=self.symbol,
                 side=display_close_side_c,
                 price=exec_price,
@@ -890,7 +981,7 @@ class TradingAgent:
             exec_price, pnl_pct, reason, rsi
         )
 
-        self.position = None
+        self.position = None  # SQL 写入完成后再清空内存引用
 
         # ── 在线参数优化：每次平仓后评估是否需要调参 ──
         if self._optimizer:
@@ -1017,7 +1108,7 @@ class TradingAgent:
                         logger.info(f"[{self.agent_id}] 策略轮动: {self.strategy_name} → {new_strategy} "
                                     f"({pick['reason']})")
                         self.strategy_name = new_strategy
-                        self.strategy_obj = self._build_strategy(new_strategy)
+                        self.strategy_obj = self._build_strategy(new_strategy, pick.get("kwargs", {}))
                         result["strategy"] = new_strategy
                         result["rotation"] = pick
             except Exception as e:
@@ -1211,8 +1302,14 @@ class TradingAgent:
                     if routing_info:
                         result["routing"] = routing_info
                 else:
-                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="buy")
-                    result["signal"] = "BUY"
+                    # 趋势过滤：熊市禁止做多
+                    trend = (self._current_regime or {}).get("trend", "")
+                    if trend == "downtrend":
+                        logger.warning(f"[{self.agent_id}] 趋势过滤：熊市禁止做多({self.symbol})")
+                        result["signal"] = "HOLD（趋势过滤:熊市禁多）"
+                    else:
+                        await self._open_position(current_price, current_ts, rsi, ai_verdict, side="buy")
+                        result["signal"] = "BUY"
                     if routing_info:
                         result["routing"] = routing_info
             elif filtered_sig == Signal.SELL and self.position is not None and self.position.get("side") == "long":
@@ -1237,8 +1334,14 @@ class TradingAgent:
                     logger.warning(f"[{self.agent_id}] 门校省否决开空: {reason_short}")
                     result["signal"] = f"门校省否决({reason_short})"
                 else:
-                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="sell")
-                    result["signal"] = "SHORT"
+                    # 趋势过滤：牛市禁止做空
+                    trend = (self._current_regime or {}).get("trend", "")
+                    if trend == "uptrend":
+                        logger.warning(f"[{self.agent_id}] 趋势过滤：牛市禁止做空({self.symbol})")
+                        result["signal"] = "HOLD（趋势过滤:牛市禁空）"
+                    else:
+                        await self._open_position(current_price, current_ts, rsi, ai_verdict, side="sell")
+                        result["signal"] = "SHORT"
             elif filtered_sig == Signal.HOLD and signal_val == Signal.BUY:
                 result["signal"] = "HOLD（AI否决）"
         else:
@@ -1286,11 +1389,54 @@ class TradingAgent:
                 return self.capital + qty * current_price
         return self.capital
 
+    # ── 与交易所持仓同步（每次启动时校正本地DB）─────────────────────────────
+    def _sync_exchange_position(self):
+        """
+        启动时查询交易所实际持仓，对比本地DB并校正。
+        防止：用户在交易所手动开仓/平仓后，系统仍从DB读旧数据导致账户不一致。
+
+        实盘模式下读取 frozen 保证金 > 0 → 有持仓；freeze=0 → 无持仓（清空DB）。
+        模拟模式（shangshu=None）不做同步，避免误判。
+        """
+        if self.shangshu is None:
+            # 模拟模式，不查交易所
+            return
+
+        try:
+            balance = self.shangshu.fetch_balance()
+            if balance is None:
+                logger.warning(f"[{self.agent_id}] 同步持仓失败：无法获取账户余额")
+                return
+
+            frozen = balance.get('frozen', 0)
+            logger.info(f"[{self.agent_id}] 同步持仓检查：frozen={frozen}")
+
+            if frozen <= 0:
+                # 交易所无持仓 → 清空本地DB对应交易对的open记录
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("""
+                    UPDATE positions SET status='exchange_closed' 
+                    WHERE symbol=? AND status='open' AND exchange=?
+                """, (self.symbol, self.exchange))
+                conn.commit()
+                rows = c.rowcount
+                conn.close()
+                if rows > 0:
+                    logger.warning(f"[{self.agent_id}] 发现{rows}条幽灵持仓已清除（交易所无持仓）")
+                # 内存中无持仓
+                self.position = None
+            else:
+                logger.info(f"[{self.agent_id}] 交易所有持仓（frozen={frozen}），保留本地DB数据")
+        except Exception as e:
+            logger.error(f"[{self.agent_id}] 持仓同步异常：{e}")
+
     # -------------------- 持久化 --------------------
 
     def _load_open_position(self):
         """从数据库恢复未平持仓"""
         conn = sqlite3.connect(DB_PATH)
+        _enable_wal(conn)
         c = conn.cursor()
         c.execute("""
             SELECT symbol, entry_price, entry_time, stop_loss, take_profit, quantity, exchange, side
@@ -1324,6 +1470,7 @@ class TradingAgent:
 
     def _log_equity(self, timestamp: int, price: float, equity: float, rsi: float):
         conn = sqlite3.connect(DB_PATH)
+        _enable_wal(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO equity_log (agent_id, timestamp, price, equity, position_value, in_position, rsi)
@@ -1336,6 +1483,7 @@ class TradingAgent:
 
     def _log_signal(self, signal_type: str, price: float, rsi: float, ai_verdict: str):
         conn = sqlite3.connect(DB_PATH)
+        _enable_wal(conn)
         c = conn.cursor()
         c.execute("""
             INSERT INTO signal_log (agent_id, signal_type, price, rsi, ai_verdict, message)
@@ -1376,7 +1524,7 @@ class MultiAgentOrchestrator:
         if _MENXIA_AVAILABLE:
             # 飞书告警回调（风控等级变化时推送到群）
             def _risk_alert(level: str, msg: str):
-                if _feishu:
+                if self._feishu:
                     daily_loss = getattr(self.menxia, '_daily_loss', 0.0) * 100
                     total_exp = 0.0
                     try:
@@ -1384,7 +1532,7 @@ class MultiAgentOrchestrator:
                         total_exp = status.get('total_exposure_pct', 0.0)
                     except Exception:
                         pass
-                    _feishu.send_risk_alert(
+                    self._feishu.send_risk_alert(
                         level=level,
                         message=msg,
                         daily_loss_pct=daily_loss,

@@ -330,7 +330,9 @@ class AISignalFilter:
 - HOLD：信号模糊，暂不执行，继续观察
 - confidence > 0.5 时 VERDICT = APPROVE/REJECT 才有效
 - confidence <= 0.5 时 VERDICT 强制为 HOLD
-- 作为交易辅助，倾向支持而非否决技术信号：模棱两可时给 APPROVE"""
+- 严格风控：价格连续下跌且24h跌幅 > 5% 时对买入信号应谨慎，倾向 REJECT 或 HOLD
+- 模棱两可时给 HOLD，让系统继续观察而非贸然入场
+- 只有宏观情绪和技术信号方向一致时才给 APPROVE"""
 
     def _build_user_prompt(self, ctx: MarketContext) -> str:
         action = "买入(做多)" if ctx.technical_signal == "BUY" else ("卖出(做空)" if ctx.technical_signal == "SELL" else "持仓")
@@ -435,11 +437,24 @@ RSI(8)：{ctx.rsi:.2f}
         if technical_signal == Signal.HOLD:
             return Signal.HOLD, "技术信号HOLD，无需AI验证"
 
-        # 构建缓存键
-        sig_name = {Signal.BUY: "BUY", Signal.SELL: "SELL"}.get(technical_signal, "HOLD")
+        # ── 极端行情前置拦截：避免在剧烈下跌中盲目买入 ──
         ctx = market_context
-        ctx.technical_signal = sig_name
-        cache_key = self._get_cache_key(ctx)
+        if technical_signal == Signal.BUY:
+            # 24h 跌幅 > 8%：强制否决买入
+            if ctx.price_change_24h_pct < -8.0:
+                return Signal.HOLD, f"AI否决(24h跌幅{ctx.price_change_24h_pct:.1f}%极端，禁止买入)"
+            # RSI < 15 极深超卖 + 仍在下跌：建议观望
+            if ctx.rsi < 15.0 and ctx.price_change_24h_pct < -3.0:
+                return Signal.HOLD, f"AI否决(RSI={ctx.rsi:.1f}极深超卖+仍在下跌，等待企稳)"
+        if technical_signal == Signal.SELL:
+            # 24h 涨幅 > 10%：强制否决卖出（做空）
+            if ctx.price_change_24h_pct > 10.0:
+                return Signal.HOLD, f"AI否决(24h涨幅{ctx.price_change_24h_pct:.1f}%极端，禁止做空)"
+
+        # 构建缓存键（极端行情拦截已完成，更新 ctx.technical_signal 后用于 AI 查询）
+        sig_name = {Signal.BUY: "BUY", Signal.SELL: "SELL"}.get(technical_signal, "HOLD")
+        market_context.technical_signal = sig_name
+        cache_key = self._get_cache_key(market_context)
 
         # 检查缓存
         if self._is_cache_valid(cache_key):
