@@ -887,6 +887,18 @@ def get_funding_rate(symbol: str = "BTC", exchange: str = "binance",
                 return float(items[0].get("fundingRate", 0))
             return None
 
+        elif exchange.lower() == "gateio":
+            # Gate.io USDT永续合约资金费率
+            # GET /api/v4/futures/usdt/contracts/{contract}  → funding_rate（当前费率）
+            url = f"https://api.gateio.ws/api/v4/futures/usdt/contracts/{symbol.upper()}_USDT"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code != 200:
+                logger.warning(f"Gate.io funding rate HTTP {resp.status_code}: {resp.text[:100]}")
+                return None
+            data = resp.json()
+            fr = float(data.get("funding_rate", 0) or 0)
+            return fr
+
         else:
             logger.warning(f"资金费率暂不支持交易所: {exchange}")
             return None
@@ -1003,6 +1015,164 @@ def get_multi_factor_data(symbol: str = "BTC") -> Optional[Dict]:
         "errors": errors,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ============================================================
+# CoinGlass 情绪数据采集（2026-05-18 新增）
+# 数据源优先级：CoinGlass Open API → Gate.io/Binance（降级）
+# ============================================================
+
+def get_coinglass_sentiment_data(symbol: str = "BTC",
+                                  exchange: str = "binance") -> Optional[Dict]:
+    """
+    获取 CoinGlass 情绪数据包（资金费率 + 多空比 + ETF流动 + OI变化）
+
+    优先使用 CoinGlass Open API，API 不可用时降级到 Gate.io / Binance。
+
+    Args:
+        symbol:   币种符号，如 "BTC", "ETH", "SUI"
+        exchange: 交易所，"binance" / "gateio" / "bybit"
+
+    Returns:
+        {
+            "funding_rate":       float,  # 资金费率（正=多头付空头）
+            "ls_ratio":           float,  # 多空比（>1=多头主导）
+            "etf_flow_usd":       float,  # ETF净流入（USD，正=流入）
+            "oi_change_pct":      float,  # 未平仓合约变化%
+            "liq_cluster_level":  float,  # 清算集群（+1=上方密集，-1=下方，0=无信号）
+            "liq_cluster_strength": float, # 清算集群强度（0~1）
+            "sentiment_score":    float,  # 综合情绪分（0~100，50=中性）
+            "data_source":        str,    # "coinglass" / "gateio" / "binance" / "unknown"
+        }
+    """
+    result = {
+        "funding_rate":         0.0,
+        "ls_ratio":             1.0,
+        "etf_flow_usd":         0.0,
+        "oi_change_pct":        0.0,
+        "liq_cluster_level":    0.0,
+        "liq_cluster_strength": 0.0,
+        "sentiment_score":      50.0,
+        "data_source":          "unknown",
+    }
+
+    # ── ① 尝试 CoinGlass Open API ────────────────────────────
+    try:
+        cg_funding_url = (
+            f"https://open-api.coinglass.com/public/v2/funding_rate?"
+            f"exchange={exchange.capitalize()}&symbol={symbol}"
+        )
+        resp = requests.get(cg_funding_url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("data"):
+                # 取最新一条资金费率
+                fr_list = data["data"]
+                if isinstance(fr_list, list) and len(fr_list) > 0:
+                    latest = fr_list[0]
+                    result["funding_rate"] = float(latest.get("rate", 0))
+                    result["data_source"] = "coinglass"
+        # 如果返回500则降级（CoinGlass 服务器当前不稳定）
+    except Exception:
+        pass
+
+    # ── ② 降级：使用 Gate.io / Binance 资金费率 ──────────────
+    if result["data_source"] != "coinglass":
+        fr = get_funding_rate(symbol=symbol, exchange="gateio")
+        if fr is None:
+            fr = get_funding_rate(symbol=symbol, exchange="binance")
+        if fr is not None:
+            result["funding_rate"] = fr
+            result["data_source"] = "gateio" if fr == get_funding_rate(symbol=symbol, exchange="gateio") else "binance"
+
+    # ── ③ 多空比（跨所对比）────────────────────────────────
+    try:
+        ls_url = (
+            f"https://open-api.coinglass.com/public/v2/"
+            f"top_traders_long_short_ratio?"
+            f"exchange={exchange.capitalize()}&symbol={symbol}"
+        )
+        resp = requests.get(ls_url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict) and data.get("data"):
+                ls_list = data["data"]
+                if isinstance(ls_list, list) and len(ls_list) > 0:
+                    latest = ls_list[0]
+                    long_pct  = float(latest.get("longAccount", 50))
+                    short_pct = float(latest.get("shortAccount", 50))
+                    if long_pct + short_pct > 0:
+                        result["ls_ratio"] = long_pct / short_pct
+    except Exception:
+        pass
+
+    # ── ④ ETF 资金流（BTC/ETH 专用）────────────────────────
+    if symbol.upper() in ("BTC", "ETH"):
+        try:
+            etf_url = (
+                f"https://open-api.coinglass.com/public/v2/"
+                f"etf_flows?symbol={symbol.upper()}"
+            )
+            resp = requests.get(etf_url, timeout=8)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data.get("data"):
+                    etf_list = data["data"]
+                    if isinstance(etf_list, list) and len(etf_list) > 0:
+                        result["etf_flow_usd"] = float(etf_list[0].get("flow", 0))
+        except Exception:
+            pass
+
+    # ── ⑤ 未平仓合约变化（Gate.io API）──────────────────────
+    try:
+        oi_url = (
+            f"https://api.gateio.ws/api/v4/futures/usdt/positions/{symbol.upper()}/total"
+        )
+        resp = requests.get(oi_url, timeout=8)
+        if resp.status_code == 200:
+            data = resp.json()
+            size = float(data.get("size", 0) or 0)
+            entry_price = float(data.get("entry_price", 0) or 0)
+            if entry_price > 0 and size != 0:
+                # 计算仓位价值变化估算
+                result["oi_change_pct"] = (size * entry_price) / 1_000_000  # 简化估算
+    except Exception:
+        pass
+
+    # ── ⑥ 清算集群打分（基于资金费率和OI的启发式估算）──────
+    # 当资金费率极高时，上方清算密集；极低时下方清算密集
+    fr = result["funding_rate"]
+    if abs(fr) > 0.0003:  # 超过0.03%的资金费率才有清算集群信号
+        if fr > 0:
+            # 正资金费率 → 多头给空头钱 → 上方空头清算密集
+            result["liq_cluster_level"] = min(1.0, fr / 0.001)  # 归一化到0~1
+        else:
+            # 负资金费率 → 空头给多头钱 → 下方多头清算密集
+            result["liq_cluster_level"] = -min(1.0, abs(fr) / 0.001)
+        result["liq_cluster_strength"] = min(1.0, abs(fr) / 0.0005)
+
+    # ── ⑦ 综合情绪分（简化版，0~100）───────────────────────
+    sentiment = 50.0
+    # 资金费率维度（40%）：负→多方有利
+    if fr < -0.0001:
+        sentiment += 40 * min(1.0, abs(fr) / 0.001)
+    elif fr > 0.0001:
+        sentiment -= 40 * min(1.0, fr / 0.001)
+    # 多空比维度（30%）
+    ls = result["ls_ratio"]
+    if ls < 0.9:
+        sentiment += 30 * (0.9 - ls) / 0.9
+    elif ls > 1.1:
+        sentiment -= 30 * (ls - 1.1) / 1.1
+    # ETF流入（20%）
+    etf = result["etf_flow_usd"]
+    if etf > 100_000_000:  # 单日净流入>1亿美元
+        sentiment += 10
+    elif etf < -100_000_000:
+        sentiment -= 10
+    result["sentiment_score"] = max(0.0, min(100.0, sentiment))
+
+    return result
 
 
 # ============================================================

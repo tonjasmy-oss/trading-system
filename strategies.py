@@ -999,16 +999,280 @@ class ATRStopStrategy(Strategy):
 
 # ============================================================
 # 策略注册表 — 新策略在此一行注册，自动接入回测和实盘
+# （完整注册表在文件末尾，见下方 STRATEGY_REGISTRY）
 # ============================================================
 
-STRATEGY_REGISTRY: Dict[str, type] = {
-    "RSI": RSIStrategy,
-    "SMA": SMAcrossStrategy,
-    "MACD": MACDStrategy,
-    "BOLLINGER": BollingerBandsStrategy,
-    "KDJ": KDJStrategy,
-    "ATRSTOP": ATRStopStrategy,
-}
+
+# ============================================================
+# 策略N+1：CoinGlass 情绪驱动 + 清算集群策略
+# 数据来源：CoinGlass（优先）/ Gate.io ccxt（降级）
+# 架构：中书省信号生成层专用策略
+# ============================================================
+
+class CoinGlassSentimentStrategy(Strategy):
+    """
+    CoinGlass 情绪驱动 + 清算集群顺势策略
+
+    核心逻辑：
+    入场信号 = 资金费率情绪(35%) + 多空比(25%) + 清算集群(25%) + 价格结构(15%)
+
+    数据源优先级：
+      1. CoinGlass Open API（资金费率、多空比、ETF、期权数据）
+      2. Gate.io ccxt（价格数据、技术指标）
+
+    规则：
+      · 综合打分 ≥ 65  → 买入信号
+      · 综合打分 ≤ 35  → 卖出信号
+      · 资金费率极端（|rate| > 0.1%） → 强制反向信号
+      · ATR突破确认趋势方向
+
+    参数：
+      · funding_weight     资金费率权重（默认 0.35）
+      · ls_weight         多空比权重（默认 0.25）
+      · liq_weight        清算集群权重（默认 0.25）
+      · structure_weight  价格结构权重（默认 0.15）
+      · score_buy_thresh  买入阈值（默认 65）
+      · score_sell_thresh 卖出阈值（默认 35）
+      · extreme_rate      极端资金费率阈值（默认 0.001，即0.1%）
+      · atr_period        ATR周期（默认 14）
+      · ema_fast/fast    EMA快慢线周期
+      · rsi_period        RSI周期（默认 14）
+    """
+
+    def __init__(self, config=None,
+                 funding_weight: float = 0.35,
+                 ls_weight: float = 0.25,
+                 liq_weight: float = 0.25,
+                 structure_weight: float = 0.15,
+                 score_buy_thresh: float = 65.0,
+                 score_sell_thresh: float = 35.0,
+                 extreme_rate: float = 0.001,
+                 atr_period: int = 14,
+                 ema_fast: int = 10,
+                 ema_slow: int = 28,
+                 rsi_period: int = 14):
+        super().__init__(config)
+        self.funding_weight = funding_weight
+        self.ls_weight = ls_weight
+        self.liq_weight = liq_weight
+        self.structure_weight = structure_weight
+        self.score_buy_thresh = score_buy_thresh
+        self.score_sell_thresh = score_sell_thresh
+        self.extreme_rate = extreme_rate
+        self.atr_period = atr_period
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.rsi_period = rsi_period
+        # 外部情绪数据（由实盘引擎注入）
+        self._funding_rate: float = 0.0          # CoinGlass资金费率
+        self._ls_ratio: float = 1.0              # 多空比
+        self._etf_flow: float = 0.0              # ETF净流入（USD）
+        self._oi_change_pct: float = 0.0         # 未平仓合约变化%
+        self._liq_cluster_level: float = 0.0      # 清算集群位置（0=无，+1=上方密集，-1=下方密集）
+        self._liq_cluster_strength: float = 0.0  # 清算集群强度（0~1）
+        self._data_source: str = "none"          # 数据来源标记
+
+    def set_sentiment_data(self,
+                           funding_rate: float = 0.0,
+                           ls_ratio: float = 1.0,
+                           etf_flow: float = 0.0,
+                           oi_change_pct: float = 0.0,
+                           liq_cluster_level: float = 0.0,
+                           liq_cluster_strength: float = 0.0,
+                           source: str = "coinglass"):
+        """由实盘引擎或数据层注入外部情绪数据"""
+        self._funding_rate = funding_rate
+        self._ls_ratio = ls_ratio
+        self._etf_flow = etf_flow
+        self._oi_change_pct = oi_change_pct
+        self._liq_cluster_level = liq_cluster_level
+        self._liq_cluster_strength = liq_cluster_strength
+        self._data_source = source
+
+    def populate_indicators(self, candles: List[Dict]) -> Dict[str, List[float]]:
+        closes = [float(c["close"]) for c in candles]
+        highs  = [float(c["high"]) for c in candles]
+        lows   = [float(c["low"])  for c in candles]
+        vols   = [float(c.get("volume", 0)) for c in candles]
+
+        ema_fast_val = self.EMA(closes, self.ema_fast)
+        ema_slow_val = self.EMA(closes, self.ema_slow)
+        rsi_val = self.RSI(closes, self.rsi_period)
+        atr_val = compute_atr(candles, self.atr_period)
+
+        # ATR历史均值（用于判断当前ATR是否扩张）
+        atr_mean = sum(atr_val[-self.atr_period:]) / self.atr_period if len(atr_val) >= self.atr_period else atr_val[-1] if atr_val else 0.0
+        atr_ratio = atr_val[-1] / atr_mean if atr_mean > 0 else 1.0
+
+        # 价格动量（5日涨跌幅）
+        momentum = (closes[-1] / closes[-6] - 1) if len(closes) > 5 else 0.0
+
+        self._indicators = {
+            "close":        closes,
+            "ema_fast":     ema_fast_val,
+            "ema_slow":     ema_slow_val,
+            "rsi":          rsi_val,
+            "atr":          atr_val,
+            "atr_ratio":    atr_ratio,
+            "momentum":     momentum,
+            "volume":       vols,
+        }
+        return self._indicators
+
+    def populate_entry_trend(self, candles: List[Dict]) -> List[int]:
+        if not self._indicators:
+            self.populate_indicators(candles)
+
+        closes   = self._indicators["close"]
+        ema_fast = self._indicators["ema_fast"]
+        ema_slow = self._indicators["ema_slow"]
+        rsi      = self._indicators["rsi"]
+        atr_ratio = self._indicators["atr_ratio"]
+        momentum  = self._indicators["momentum"]
+
+        signals = [Signal.HOLD] * len(candles)
+        scores  = self._compute_composite_score(len(candles) - 1)
+
+        for i in range(3, len(candles)):
+            score = self._compute_composite_score(i)
+
+            # ① 极端资金费率 → 强制反向（优先判断）
+            if abs(self._funding_rate) > self.extreme_rate:
+                if self._funding_rate > self.extreme_rate:
+                    # 资金费率极高（年化>90%），强制做空
+                    if score < self.score_sell_thresh:
+                        signals[i] = Signal.SELL
+                else:
+                    # 资金费率极低（年化<-90%），强制做多
+                    if score > self.score_buy_thresh:
+                        signals[i] = Signal.BUY
+                continue
+
+            # ② 常规打分区间
+            if score >= self.score_buy_thresh:
+                # 多头信号：需EMA多头排列确认
+                if ema_fast[i] > ema_slow[i]:
+                    signals[i] = Signal.BUY
+            elif score <= self.score_sell_thresh:
+                # 空头信号：需EMA空头排列确认
+                if ema_fast[i] < ema_slow[i]:
+                    signals[i] = Signal.SELL
+
+        return signals
+
+    def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
+        if not self._indicators:
+            self.populate_indicators(candles)
+
+        closes    = self._indicators["close"]
+        ema_fast  = self._indicators["ema_fast"]
+        ema_slow  = self._indicators["ema_slow"]
+        rsi       = self._indicators["rsi"]
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            # 止损：RSI超买+EMA死叉
+            if rsi[i] > 70 and ema_fast[i] < ema_slow[i] and ema_fast[i-1] >= ema_slow[i-1]:
+                signals[i] = Signal.SELL
+            # 止盈：RSI超卖+EMA金叉
+            elif rsi[i] < 30 and ema_fast[i] > ema_slow[i] and ema_fast[i-1] <= ema_slow[i-1]:
+                signals[i] = Signal.SELL
+            # 追踪止损：价格跌破EMA慢线
+            elif ema_slow[i] > 0 and closes[i] < ema_slow[i] and closes[i-1] >= ema_slow[i-1]:
+                signals[i] = Signal.SELL
+        return signals
+
+    def _compute_composite_score(self, index: int) -> float:
+        """
+        计算综合打分（0~100）
+
+        资金费率维度（35%）：
+          · rate > 0.05%  → 极度多头 → 0分（反向做空情绪）
+          · rate < -0.03% → 极度空头 → 100分（反向做多情绪）
+          · rate = 0%      → 50分
+
+        多空比维度（25%）：
+          · ratio < 0.9   → 机构偏空，散户偏多 → 75分（做多机会）
+          · ratio > 1.1   → 机构偏多，散户偏空 → 25分（做空机会）
+          · ratio = 1.0   → 50分
+
+        清算集群维度（25%）：
+          · cluster_level > 0（上方密集）→ 卖压重 → 偏低分（对多头不利）
+          · cluster_level < 0（下方密集）→ 买压重 → 偏高分（对空头不利）
+          · cluster_strength越大，分数越极端
+
+        价格结构维度（15%）：
+          · EMA多头排列 → +15分
+          · ATR扩张（突破）→ +10分（封顶15）
+          · RSI超卖 → +10分（封顶15）
+        """
+        score = 50.0  # 基准分
+
+        # ── ① 资金费率打分（35%权重）─────────────────────────
+        funding_score = 50.0
+        fr = self._funding_rate
+        if fr > 0.0005:       # > 0.05%，年化45%+，极度看多
+            funding_score = max(0, 50 - (fr - 0.0005) * 50000)
+        elif fr < -0.0003:    # < -0.03%，年化-27%，极度看空
+            funding_score = min(100, 50 + abs(fr + 0.0003) * 50000)
+        # funding_score 越高 → 对做多有利的情绪环境
+        funding_contrib = funding_score * self.funding_weight  # 0~35
+
+        # ── ② 多空比打分（25%权重）──────────────────────────
+        ls_score = 50.0
+        ls = self._ls_ratio
+        if ls < 0.9:         # 机构偏空 → 散户偏多 → 做多机会
+            ls_score = min(100, 75 + (0.9 - ls) * 100)
+        elif ls > 1.1:       # 机构偏多 → 散户偏空 → 做空机会
+            ls_score = max(0, 25 - (ls - 1.1) * 100)
+        ls_contrib = ls_score * self.ls_weight  # 0~25
+
+        # ── ③ 清算集群打分（25%权重）─────────────────────────
+        # cluster_level: +1=上方空头密集（压力），-1=下方多头密集（支撑）
+        # 下方密集（支撑强）→ 有利于做多 → 高分
+        # 上方密集（压力重）→ 有利于做空 → 低分
+        liq_base = 50.0
+        liq_contrib_raw = -self._liq_cluster_level * self._liq_cluster_strength * 50  # -50~+50
+        liq_contrib = (liq_base + liq_contrib_raw) * self.liq_weight  # 约12.5~37.5
+
+        # ── ④ 价格结构打分（15%权重）────────────────────────
+        ema_fast = self._indicators.get("ema_fast", [])
+        ema_slow = self._indicators.get("ema_slow", [])
+        rsi_arr  = self._indicators.get("rsi", [])
+        atr_ratio = self._indicators.get("atr_ratio", [1.0])
+
+        structure_score = 0.0
+        if index < len(ema_fast) and index < len(ema_slow):
+            if ema_fast[index] > ema_slow[index]:  # 多头排列
+                structure_score += 7.5
+            else:
+                structure_score -= 7.5  # 空头排列
+
+        if index < len(rsi_arr):
+            if rsi_arr[index] < 35:               # 超卖
+                structure_score += 5.0
+            elif rsi_arr[index] > 65:             # 超买
+                structure_score -= 5.0
+
+        if atr_ratio > 1.3:  # ATR扩张，趋势加速
+            structure_score += 2.5
+
+        structure_contrib = (50 + structure_score) * self.structure_weight  # 约35~65区间
+
+        total = funding_contrib + ls_contrib + liq_contrib + structure_contrib
+        return max(0.0, min(100.0, total))
+
+    def get_sentiment_summary(self) -> dict:
+        """返回当前情绪数据快照（用于日志和Dashboard展示）"""
+        return {
+            "funding_rate":       self._funding_rate,
+            "ls_ratio":           self._ls_ratio,
+            "etf_flow_usd":       self._etf_flow,
+            "oi_change_pct":      self._oi_change_pct,
+            "liq_cluster_level":  self._liq_cluster_level,
+            "liq_cluster_strength": self._liq_cluster_strength,
+            "data_source":        self._data_source,
+        }
 
 
 def build_strategy(name: str, config: StrategyConfig, **kwargs) -> Strategy:
@@ -1623,5 +1887,6 @@ STRATEGY_REGISTRY: Dict[str, type] = {
     "MULTIFACTOR": MultiFactorTrendStrategy,
     "FUNDING_ARB": FundingRateArbitrageStrategy,
     "STAT_ARB":   StatisticalArbitrageStrategy,
+    "COINGLASS":  CoinGlassSentimentStrategy,   # 情绪+清算集群策略（2026-05-18）
 }
 
