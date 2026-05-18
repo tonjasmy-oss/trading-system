@@ -382,6 +382,22 @@ class TradingAgent:
             except Exception as e:
                 logger.warning(f"[{agent_id}] 启动同步失败（不影响启动）：{e}")
 
+        # ── 余额同步：覆盖 initial_capital 为交易所真实 USDT 可用余额 ──
+        if self.shangshu is not None and hasattr(self.shangshu, 'fetch_balance'):
+            try:
+                loop = asyncio.get_event_loop()
+                bal = loop.run_until_complete(self.shangshu.fetch_balance())
+                usdt = bal.get("USDT", {})
+                free_usdt = usdt.get("free", 0)
+                if free_usdt > 0:
+                    self.initial_capital = float(free_usdt)
+                    self.capital = float(free_usdt)
+                    logger.info(f"[{agent_id}] 余额同步: 初始资金 → ${free_usdt:.4f} USDT")
+                else:
+                    logger.info(f"[{agent_id}] 余额同步: 交易所可用余额=0，保持模拟资金 ${self.initial_capital:.2f}")
+            except Exception as e:
+                logger.warning(f"[{agent_id}] 余额同步失败，保持模拟资金 ${self.initial_capital:.2f}：{e}")
+
         self._load_open_position()
         logger.info(f"[{agent_id}] Agent 初始化: {symbol} @ {exchange} "
                    f"策略={strategy} | "
