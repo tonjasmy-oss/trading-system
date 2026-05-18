@@ -55,6 +55,7 @@ from config import (
     STAT_ARB_PAIR_SYMBOL, STAT_ARB_LOOKBACK, STAT_ARB_Z_ENTRY,
     STAT_ARB_Z_EXIT, STAT_ARB_Z_LOSS,
     BLACK_SWAN_DROP_PCT, MAX_DRAWDOWN_LOCK_PCT,
+    ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER,
 )
 from crypto_api import (
     get_crypto_price, get_ohlcv,
