@@ -10,6 +10,7 @@ API 文档: https://www.weex.com/api-doc
 import base64
 import hashlib
 import hmac
+import os
 import json
 import logging
 import socket
@@ -36,6 +37,8 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api-contract.weex.com"   # 合约 API
 TUNNEL_HOST = "127.0.0.1"
 TUNNEL_PORT = 8892                            # SSH 隧道：localhost:8892 → api-contract.weex.com:443
+SOCKS_HOST = os.getenv("WEEX_SOCKS_HOST", "127.0.0.1")
+SOCKS_PORT = int(os.getenv("WEEX_SOCKS_PORT", "10808"))  # SOCKS5 代理
 TIMEOUT = 15
 API_HOST = "api-contract.weex.com"            # CloudFront SNI 所需
 
@@ -146,6 +149,17 @@ def _get_session() -> requests.Session:
 # 隧道支持（通过 VPS 代理访问 Weex，解决国际访问限制）
 # ============================================================
 
+def _is_socks_active() -> bool:
+    """检测 SOCKS5 代理是否可用"""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex((SOCKS_HOST, SOCKS_PORT)) == 0
+        sock.close()
+        return result
+    except Exception:
+        return False
+
 def _is_tunnel_active() -> bool:
     """检测 Weex 隧道是否可用（连接 localhost:8892）"""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -170,9 +184,14 @@ def _get_verify_ssl() -> bool:
 
 
 def _get_http_session() -> requests.Session:
-    """获取 HTTP session：隧道模式用 SNI 修复 session，直连用默认"""
+    """获取 HTTP session：隧道优先，SOCKS5 次之，直连兜底"""
     if _is_tunnel_active():
         return _get_session()
+    if _is_socks_active():
+        import socks
+        sess = requests.Session()
+        sess.proxies = {"https": f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}"}
+        return sess
     return requests.Session()
 
 
