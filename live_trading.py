@@ -467,18 +467,13 @@ class TradingAgent:
             logger.info(f"[{self.agent_id}] 初始化多因子趋势策略")
             from strategies import MultiFactorTrendStrategy
             return MultiFactorTrendStrategy(
-                symbol=self.symbol,
-                timeframe=self.timeframe,
+                config=StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
                 min_score=MULTIFACTOR_MIN_SCORE,
                 ema_period=MULTIFACTOR_EMA_PERIOD,
                 atr_period=MULTIFACTOR_ATR_PERIOD,
                 atr_multiplier=MULTIFACTOR_ATR_MULTIPLIER,
-                max_position=MULTIFACTOR_MAX_POSITION,
+                max_position_pct=MULTIFACTOR_MAX_POSITION,
                 trailing_pct=MULTIFACTOR_TRAILING_PCT,
-                stop_loss_pct=MULTIFACTOR_STOP_LOSS_PCT,
-                tp1_pct=MULTIFACTOR_TP1_PCT,
-                tp2_pct=MULTIFACTOR_TP2_PCT,
-                funding_threshold=MULTIFACTOR_FUNDING_THRESH,
             )
 
         # ── 资金费率套利策略（FUNDING_ARB）───────────────────────────
@@ -486,10 +481,10 @@ class TradingAgent:
             logger.info(f"[{self.agent_id}] 初始化资金费率套利策略")
             from strategies import FundingRateArbitrageStrategy
             return FundingRateArbitrageStrategy(
-                symbol=self.symbol,
-                min_rate=FUNDING_ARB_MIN_RATE,
-                max_rate=FUNDING_ARB_MAX_RATE,
-                rebalance_h=FUNDING_ARB_REBALANCE_H,
+                config=StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+                min_funding_rate=FUNDING_ARB_MIN_RATE,
+                max_funding_rate=FUNDING_ARB_MAX_RATE,
+                rebalance_hours=FUNDING_ARB_REBALANCE_H,
             )
 
         # ── 统计套利策略（STAT_ARB）─────────────────────────────────
@@ -506,12 +501,12 @@ class TradingAgent:
                 pass
             pair_base = stat_pairs.get(self.symbol, pair_symbol)
             return StatisticalArbitrageStrategy(
-                symbol=self.symbol,
+                config=StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
                 pair_symbol=pair_base,
                 lookback=STAT_ARB_LOOKBACK,
                 z_entry=STAT_ARB_Z_ENTRY,
                 z_exit=STAT_ARB_Z_EXIT,
-                z_loss=STAT_ARB_Z_LOSS,
+                z_exit_loss=STAT_ARB_Z_LOSS,
             )
 
         # 合并轮动器传入的参数

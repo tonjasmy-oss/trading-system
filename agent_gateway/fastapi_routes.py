@@ -14,12 +14,13 @@ import os
 # 配置
 # ============================================================
 
-_agent_token_env = os.getenv("AGENT_TOKEN")
+_agent_token_env = os.getenv("AGENT_TOKEN", "")
 if not _agent_token_env:
-    raise RuntimeError(
-        "[Agent Gateway] AGENT_TOKEN environment variable is REQUIRED. "
-        "No hardcoded default token is allowed. "
-        "Set it before starting: export AGENT_TOKEN=<your-secure-token>"
+    import warnings
+    warnings.warn(
+        "[Agent Gateway] AGENT_TOKEN not set. "
+        "API routes requiring token will return 401. "
+        "Set it via: export AGENT_TOKEN=<your-secure-token>"
     )
 
 AGENT_TOKENS = {

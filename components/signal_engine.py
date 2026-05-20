@@ -328,27 +328,23 @@ class SignalEngine:
     def _build_strategy(self):
         config = StrategyConfig(symbol=self.symbol, timeframe=self.timeframe)
         s = self.strategy_name
-        if s == "RSI":
-            return RSIStrategy(config=config, rsi_period=self.rsi_period,
-                               oversold=self.oversold, overbought=self.overbought)
-        elif s == "SMA":
-            return SMAcrossStrategy(config=config)
-        elif s == "MACD":
-            return MACDStrategy(config=config)
-        elif s == "BOLLINGER":
-            return BollingerBandsStrategy(config=config)
-        elif s == "VOTE":
-            rsi_strat = RSIStrategy(config=config, rsi_period=self.rsi_period,
-                                    oversold=self.oversold, overbought=self.overbought)
-            macd_strat = MACDStrategy(config=config)
-            boll_strat = BollingerBandsStrategy(config=config)
-            return MultiStrategyVote(
-                strategies=[(rsi_strat, 0.4), (macd_strat, 0.3), (boll_strat, 0.3)],
-                threshold=0.3, name="RSI+MACD+BOLL")
-        elif s == "FORMULA":
+        # FORMULA 和 VOTE 在本地处理
+        if s == "FORMULA":
             formula_str = self.formula or BUILTIN_FORMULAS.get('KDJ', BUILTIN_FORMULAS['MACD'])
             return FormulaStrategy(config=config, formula=formula_str,
                                    symbol=self.symbol, timeframe=self.timeframe)
+        if s == "VOTE":
+            rsi_s = RSIStrategy(config=config, rsi_period=self.rsi_period, oversold=self.oversold, overbought=self.overbought)
+            macd_s = MACDStrategy(config=config)
+            boll_s = BollingerBandsStrategy(config=config)
+            return MultiStrategyVote(strategies=[(rsi_s,0.4),(macd_s,0.3),(boll_s,0.3)], threshold=0.3, name="RSI+MACD+BOLL")
+
+        # 通用策略：委托给 strategies.build_strategy() 注册表
+        try:
+            from strategies import build_strategy
+            return build_strategy(s, config, rsi_period=self.rsi_period, oversold=self.oversold, overbought=self.overbought)
+        except (ValueError, ImportError):
+            return RSIStrategy(config=config, rsi_period=self.rsi_period, oversold=self.oversold, overbought=self.overbought)
         else:
             return RSIStrategy(config=config, rsi_period=self.rsi_period,
                               oversold=self.oversold, overbought=self.overbought)
