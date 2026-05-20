@@ -1276,10 +1276,21 @@ class CoinGlassSentimentStrategy(Strategy):
 
 
 def build_strategy(name: str, config: StrategyConfig, **kwargs) -> Strategy:
-    """根据策略名称和配置构建策略实例"""
+    """根据策略名称和配置构建策略实例（含 AI 生成策略自动发现）"""
     cls = STRATEGY_REGISTRY.get(name.upper())
     if cls:
         return cls(config=config, **kwargs)
+
+    # 尝试从 generated_strategies 注册中心加载
+    try:
+        from generated_strategies import get_strategy_class
+        gen_cls = get_strategy_class(name)
+        if gen_cls:
+            logger.info(f"[build_strategy] 加载生成策略: {name} → {gen_cls.__name__}")
+            return gen_cls(config=config, **kwargs)
+    except ImportError:
+        pass
+
     raise ValueError(f"未知策略: {name}，可用: {list(STRATEGY_REGISTRY.keys())}")
 
 
