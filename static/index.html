@@ -424,13 +424,9 @@
       }
     #app { padding-bottom: 42px; }
 
-/* 隐藏左侧导航栏的"联系我们" */
-.ant-menu-item:has(span:contains("联系我们")),
-a[href*="contact"]:has(span),
-.menu-footer-item {
-    display: none !important;
-}
-/* 备用 - 隐藏文本包含"联系我们"的菜单项 */
+/* 隐藏侧边栏中所有"联系我们"相关元素（:has 选择器仅支持 Chrome 105+/Safari 15.4+） */
+.ant-layout-sider li:has(a[href*="contact"]),
+.ant-menu-item:has(a[href*="contact"]) { display: none !important; }
 
 </style><script defer="defer" src="/js/chunk-vendors.770fbe72.js" type="module"></script><script defer="defer" src="/js/app.0088777d.js" type="module"></script><link href="/css/chunk-vendors.b8cb9e53.css" rel="stylesheet"><link href="/css/app.2a8ece5e.css" rel="stylesheet"><script defer="defer" src="/js/chunk-vendors-legacy.d254617c.js" nomodule></script><script defer="defer" src="/js/app-legacy.7dbfa569.js" nomodule></script></head><body><noscript><strong>We're sorry but vue-antd-pro doesn't work properly without JavaScript enabled. Please enable it to continue.</strong></noscript><div id="app"><div class="first-loading-wrp"><h2>Landing</h2><div class="loading-wrp"><div class="pixel-cat-container"><div class="ground"></div><div class="pixel-cat"><div class="cat-head"><div class="cat-ear-left"></div><div class="cat-ear-right"></div><div class="cat-eye-left"></div><div class="cat-eye-right"></div><div class="cat-nose"></div><div class="cat-whiskers"></div></div><div class="cat-body"></div><div class="cat-leg-front-left"></div><div class="cat-leg-front-right"></div><div class="cat-leg-back-left"></div><div class="cat-leg-back-right"></div><div class="cat-tail"></div></div></div></div><div class="brand-text">trading-system</div></div></div>
 <div id="global-footer" style="
@@ -458,22 +454,78 @@ a[href*="contact"]:has(span),
 
 
 <script>
-// 隐藏左侧导航栏的"联系我们"菜单项（Vue 渲染后执行）
-var _hideCount = 0;
-function _hideSidebarContact() {
-    if (_hideCount > 0) return;
-    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    var node;
-    while (node = walker.nextNode()) {
-        if (node.textContent && node.textContent.trim() === '联系我们') {
-            var el = node.parentElement;
-            if (!el || el.closest('#global-footer')) continue;
-            var li = el.closest('li') || el.closest('[class*="menu-item"]');
-            if (li) { li.style.display = 'none'; _hideCount++; break; }
+// 彻底隐藏侧边栏中的"联系我们"——MutationObserver + 定时器双保险
+(function() {
+    var HIDDEN = false;
+    var ATTEMPTS = 0;
+    var MAX = 20;
+
+    function hide() {
+        if (HIDDEN || ATTEMPTS >= MAX) return;
+        ATTEMPTS++;
+
+        // 方案 A: 通过已知 CSS 选择器
+        var selectors = [
+            '.ant-menu-item', '.ant-menu-submenu-title',
+            '.footer-toolbar-item', '.sider-footer-item',
+            'li', '.menu-item', '[class*="footer"]', '[class*="sider"]'
+        ];
+        for (var si = 0; si < selectors.length; si++) {
+            var items = document.querySelectorAll(selectors[si]);
+            for (var i = 0; i < items.length; i++) {
+                var el = items[i];
+                // 跳过底部通栏自身
+                if (el.closest('#global-footer')) continue;
+                var txt = (el.textContent || '').trim();
+                // 精确匹配"联系我们"且长度较短（避免匹配长文本）
+                if (txt === '联系我们' || (txt.indexOf('联系我们') !== -1 && txt.length < 20)) {
+                    // 向上找到侧边栏容器内的 li
+                    var target = el.closest('.ant-layout-sider li') || el.closest('aside li')
+                              || el.closest('.ant-menu-item') || (el.tagName === 'LI' ? el : el.closest('li'));
+                    if (target) {
+                        target.style.cssText = 'display:none !important;visibility:hidden;height:0;overflow:hidden;';
+                        HIDDEN = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 方案 B: 扫描所有文本节点
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        var node;
+        while (node = walker.nextNode()) {
+            var t = (node.textContent || '').trim();
+            if (t === '联系我们') {
+                var p = node.parentElement;
+                if (!p || p.closest('#global-footer')) continue;
+                // 向上找到侧边栏中的 li
+                var li = p.closest('.ant-layout-sider li') || p.closest('aside li')
+                       || p.closest('[class*="sider"] li') || p.closest('li');
+                if (li) {
+                    li.style.cssText = 'display:none !important;visibility:hidden;height:0;overflow:hidden;';
+                    HIDDEN = true;
+                    return;
+                }
+            }
         }
     }
-}
-[800, 2000, 5000, 10000].forEach(function(ms) { setTimeout(_hideSidebarContact, ms); });
+
+    // 定时器：0.5s / 1.5s / 3s / 5s / 8s / 12s
+    [500, 1500, 3000, 5000, 8000, 12000].forEach(function(ms) {
+        setTimeout(hide, ms);
+    });
+
+    // MutationObserver：DOM 变化时再试
+    if (window.MutationObserver) {
+        var observer = new MutationObserver(function() {
+            if (!HIDDEN && ATTEMPTS < MAX) hide();
+        });
+        setTimeout(function() {
+            observer.observe(document.body, { childList: true, subtree: true });
+        }, 1000);
+    }
+})();
 </script>
 
 </body></html>
