@@ -2,8 +2,10 @@
 Web Dashboard 模块 - 交易监控系统
 所有功能集成到 Web 界面
 """
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Request
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+import os as _os
 from pydantic import BaseModel
 from typing import List, Optional
 import uvicorn
@@ -256,9 +258,9 @@ class ModeRequest(BaseModel):
 
 # ========== API 接口 ==========
 
-@app.get("/")
+@app.get("/api/status")
 async def root():
-    return {"message": "交易监控系统 API", "version": "2.0.0", "status": _monitor_status}
+    return {"message": "交易监控系统 API", "version": "3.0.0", "status": _monitor_status}
 
 @app.get("/api/system/status")
 async def get_system_status():
@@ -1153,6 +1155,105 @@ async def compare_strategies(symbol: str = "ETH/USDT", timeframe: str = "4h",
                 "rankings": rankings}
     except Exception as e:
         return {"error": str(e)}
+
+# ================================================================
+# P10 实验管线 API（v2.1 新增：AI 策略生成 + 市场状态 + 反思）
+# ================================================================
+
+@app.get("/api/experiment/regime")
+async def detect_regime(
+    symbol: str = "ETH/USDT",
+    timeframe: str = "4h",
+):
+    """检测当前市场状态（趋势/震荡/高波动）"""
+    try:
+        from experiment import MarketRegimeDetector
+        from history_cache import get_ohlcv as cache_ohlcv
+        detector = MarketRegimeDetector()
+        ohlcv = cache_ohlcv(symbol, timeframe)
+        if ohlcv:
+            if isinstance(ohlcv[0], list):
+                ohlcv = [{"close": r[4], "high": r[2], "low": r[3], "open": r[1], "volume": r[5]} for r in ohlcv]
+            return detector.detect(ohlcv).to_dict()
+        return {"error": "no data", "symbol": symbol, "timeframe": timeframe}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/experiment/run")
+async def run_experiment(
+    symbol: str = "ETH/USDT",
+    timeframe: str = "4h",
+    use_ai: bool = False,
+):
+    """运行 AI 策略实验管线（市场状态 → 策略生成 → 批量回测 → 评分 → 进化 → 最优输出）"""
+    try:
+        from experiment import ExperimentRunner
+        runner = ExperimentRunner(symbol=symbol, timeframe=timeframe)
+        result = runner.run(use_ai=use_ai)
+        return result.to_dict()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/experiment/reflect")
+async def reflect_trade(trade_data: dict):
+    """交易后反思（AI 复盘入场/出场逻辑）"""
+    try:
+        from reflection import ReflectionService
+        svc = ReflectionService()
+        result = svc.reflect_on_trade(trade_data)
+        return result.to_dict() if result else {"error": "reflection failed"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/experiment/summary")
+async def reflection_summary(days: int = 7):
+    """获取反思汇总（胜率/教训/校准建议）"""
+    try:
+        from reflection import ReflectionService
+        svc = ReflectionService()
+        summary = svc.generate_summary(days=days)
+        return {
+            "total_trades": summary.total_trades,
+            "correct": summary.correct_trades,
+            "incorrect": summary.incorrect_trades,
+            "accuracy": summary.accuracy,
+            "avg_pnl_pct": summary.avg_pnl_pct,
+            "calibration_suggestions": summary.calibration_suggestions,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ================================================================
+# P11 数据源状态 API（v2.1 新增）
+# ================================================================
+
+@app.get("/api/data/status")
+async def data_providers_status():
+    """获取所有数据源的健康状态（限流/熔断统计）"""
+    try:
+        from data_providers import DataProviderFactory
+        # 触发懒加载
+        DataProviderFactory.get("CRYPTO")
+        DataProviderFactory.get("CN_STOCK")
+        return DataProviderFactory.get_all_status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/api/data/reset")
+async def reset_data_providers():
+    """重置所有数据源（恢复熔断/清空限流计数）"""
+    try:
+        from data_providers import DataProviderFactory
+        DataProviderFactory.reset_all()
+        return {"success": True, "message": "数据源已重置"}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 # ========== HTML Dashboard ==========
 
@@ -2592,6 +2693,41 @@ async def get_stock_order_status(market: str, order_id: str):
         return {"order_id": order_id, "status": "filled"}
     return {"order_id": order_id, "status": "unknown"}
 
+
+
+# ================================================================
+# QuantDinger API 兼容路由（v2.1：让 QD Vue 前端可调用 TS 后端）
+# ================================================================
+try:
+    from qd_compat import router as qd_router
+    app.include_router(qd_router)
+    print("[Dashboard] QD API compat routes mounted")
+except Exception as e:
+    print(f"[Dashboard] QD compat not available: {e}")
+
+# ================================================================
+# 静态文件服务 + SPA 回退（v2.1：集成 QuantDinger Vue 前端）
+# ================================================================
+_STATIC_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "static")
+if _os.path.isdir(_STATIC_DIR):
+    # 挂载静态资源（js/css/img/maps）
+    app.mount("/js", StaticFiles(directory=_os.path.join(_STATIC_DIR, "js")), name="static_js")
+    app.mount("/css", StaticFiles(directory=_os.path.join(_STATIC_DIR, "css")), name="static_css")
+    app.mount("/img", StaticFiles(directory=_os.path.join(_STATIC_DIR, "img")), name="static_img")
+    app.mount("/maps", StaticFiles(directory=_os.path.join(_STATIC_DIR, "maps")), name="static_maps")
+    # 根路径静态文件（slogo.png, logo.png, avatar2.jpg, favicon 等）
+    app.mount("/", StaticFiles(directory=_STATIC_DIR, html=True), name="static_root")
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str, request: Request):
+        """SPA 回退：非 API/static 路径返回 index.html"""
+        # 跳过 API 和已有静态资源
+        if full_path.startswith("api/") or full_path.startswith("js/") or full_path.startswith("css/"):
+            raise HTTPException(status_code=404)
+        index_path = _os.path.join(_STATIC_DIR, "index.html")
+        if _os.path.isfile(index_path):
+            return FileResponse(index_path)
+        raise HTTPException(status_code=404)
 
 
 def run_server(host: str = "0.0.0.0", port: int = 8081):

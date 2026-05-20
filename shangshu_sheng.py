@@ -775,17 +775,40 @@ class WeexAdapter(ExchangeAdapter):
             )
             if not bal:
                 return {}
-            # 转换为 ccxt 风格
+            # 转换为 ccxt 风格（Weex 顶层 total/available 含未实现盈亏+保证金，比 balances 子项准确）
             result = {}
+            total_all = float(bal.get("total", 0))
+            available_all = float(bal.get("available", 0))
+            frozen_all = float(bal.get("frozen", 0))
+            # 顶层 total 是合约账户总权益（含未实现盈亏），差额 = 占用保证金
+            margin_used = total_all - available_all
             for b in bal.get("balances", []):
                 asset = b.get("asset", "")
-                total = float(b.get("total", 0))
                 free = float(b.get("free", 0))
-                result[asset] = {"total": total, "free": free, "frozen": total - free}
+                locked = float(b.get("locked", 0))
+                # per-asset total: 如果只有一个资产用顶层 total，否则 free+locked 作为保守估计
+                asset_total = total_all if len(bal.get("balances", [])) == 1 else free + locked
+                result[asset] = {"total": asset_total, "free": free, "frozen": locked}
+            # 确保 USDT 条目存在
+            if "USDT" not in result:
+                result["USDT"] = {"total": total_all, "free": available_all, "frozen": frozen_all}
             return result
         except Exception as e:
             logger.error(f"[尚书省] Weex 余额查询失败: {e}")
             return {}
+
+    async def fetch_positions(self, symbol: Optional[str] = None) -> Optional[List[Dict]]:
+        """从 Weex API 查询实时持仓列表"""
+        from weex import fetch_positions as weex_positions
+        try:
+            pos = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: weex_positions(self.api_key, self.api_secret, self.api_passphrase, symbol)
+            )
+            return pos
+        except Exception as e:
+            logger.error(f"[尚书省] Weex 查询持仓失败: {e}")
+            return None
 
     async def get_position(self, symbol: str) -> Optional[PositionInfo]:
         """从数据库读取 Weex 实盘持仓（live_trading.db positions 表）"""

@@ -1,0 +1,58 @@
+# Trading System Docker Compose
+# 复用 QuantDinger 的 PostgreSQL + Redis，
+# 添加 trading-system 作为独立服务
+
+services:
+  # ========================
+  # Trading System Backend
+  # ========================
+  trading-system:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: trading-system
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      - DATABASE_URL=postgresql://quantdinger:quantdinger123@postgres:5432/quantdinger
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - DB_TYPE=postgresql
+      - TZ=Asia/Shanghai
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_BASE_URL=${AI_BASE_URL:-}
+      - AI_MODEL=${AI_MODEL:-deepseek-chat}
+      - CRYPTO_EXCHANGE=${CRYPTO_EXCHANGE:-binance}
+      - CRYPTO_API_KEY=${CRYPTO_API_KEY:-}
+      - CRYPTO_API_SECRET=${CRYPTO_API_SECRET:-}
+      - WEEX_API_KEY=${WEEX_API_KEY:-}
+      - WEEX_API_SECRET=${WEEX_API_SECRET:-}
+      - WEEX_API_PASSPHRASE=${WEEX_API_PASSPHRASE:-}
+      - FEISHU_APP_ID=${FEISHU_APP_ID:-}
+      - FEISHU_APP_SECRET=${FEISHU_APP_SECRET:-}
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
+      - LIVE_TRADING_ENABLED=${LIVE_TRADING_ENABLED:-false}
+    volumes:
+      - trading_data:/app/data
+      - ./config.py:/app/config.py:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - trading-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  trading_data:
+    driver: local
+
+networks:
+  trading-network:
+    driver: bridge

@@ -359,13 +359,16 @@ class TradingAgent:
         # 策略实例（支持通达信公式）
         self.strategy_obj = self._build_strategy(strategy)
 
-        # ── 启动时同步：先查交易所实际持仓，再覆盖本地DB ──
+        # ── 启动时同步：通过余额差额推断交易所持仓（Weex v3 无独立持仓 API）──
         if self.shangshu is not None and hasattr(self.shangshu, 'fetch_balance'):
             try:
                 loop = asyncio.get_event_loop()
-                # 在同步上下文中用 run_until_complete（避免 asyncio.run() 的嵌套 loop 问题）
                 balance = loop.run_until_complete(self.shangshu.fetch_balance())
-                if balance and balance.get('frozen', 0) <= 0:
+                usdt = balance.get('USDT', {}) if balance else {}
+                total_usdt = usdt.get('total', 0)
+                free_usdt = usdt.get('free', 0)
+                margin_locked = total_usdt - free_usdt  # 总余额 - 可用 = 占用保证金
+                if balance and margin_locked <= 0.01:
                     conn = sqlite3.connect(DB_PATH)
                     _enable_wal(conn)
                     c = conn.cursor()
@@ -376,9 +379,9 @@ class TradingAgent:
                     if rows > 0:
                         logger.warning(f"[{agent_id}] 同步清除{rows}条幽灵持仓（交易所无持仓）")
                     self.position = None
-                    logger.info(f"[{agent_id}] 启动同步完成：交易所无持仓，DB已校正")
+                    logger.info(f"[{agent_id}] 启动同步完成：交易所无持仓（保证金占用≈0），DB已校正")
                 else:
-                    logger.info(f"[{agent_id}] 启动同步完成：交易所有持仓，DB保留")
+                    logger.info(f"[{agent_id}] 启动同步完成：交易所可能有持仓（保证金占用≈${margin_locked:.2f}），DB保留")
             except Exception as e:
                 logger.warning(f"[{agent_id}] 启动同步失败（不影响启动）：{e}")
 
@@ -389,12 +392,14 @@ class TradingAgent:
                 bal = loop.run_until_complete(self.shangshu.fetch_balance())
                 usdt = bal.get("USDT", {})
                 free_usdt = usdt.get("free", 0)
-                if free_usdt > 0:
+                total_usdt = usdt.get("total", 0)
+                frozen_usdt = usdt.get("frozen", 0)
+                if total_usdt > 0:
                     self.initial_capital = float(free_usdt)
                     self.capital = float(free_usdt)
-                    logger.info(f"[{agent_id}] 余额同步: 初始资金 → ${free_usdt:.4f} USDT")
+                    logger.info(f"[{agent_id}] 余额同步: total=${total_usdt:.4f} available=${free_usdt:.4f} frozen=${frozen_usdt:.4f} → 可用资金 ${free_usdt:.4f} USDT")
                 else:
-                    logger.info(f"[{agent_id}] 余额同步: 交易所可用余额=0，保持模拟资金 ${self.initial_capital:.2f}")
+                    logger.info(f"[{agent_id}] 余额同步: 交易所余额=0，保持模拟资金 ${self.initial_capital:.2f}")
             except Exception as e:
                 logger.warning(f"[{agent_id}] 余额同步失败，保持模拟资金 ${self.initial_capital:.2f}：{e}")
 
@@ -1535,6 +1540,7 @@ class MultiAgentOrchestrator:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self.live_trading = live_trading and _SHANGSHU_AVAILABLE
+        self._feishu = _feishu if not isinstance(_feishu, type(_feishu_sentinel)) else None
 
         # ── 门下省：风控审核服务（所有 Agent 共享）──
         self.menxia: Optional[MenxiaSheng] = None

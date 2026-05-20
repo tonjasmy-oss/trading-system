@@ -18,6 +18,8 @@ REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 
 # 数据库
 DB_PATH = os.getenv("DB_PATH", "trading_system.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+DB_TYPE = os.getenv("DB_TYPE", "sqlite")  # "sqlite" 或 "postgresql"
 
 # 加密货币交易所配置（ccxt 统一数据层）
 # 支持: binance, gateio, kraken, bitfinex, okx, bybit, bitget, hyperliquid, weex

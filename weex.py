@@ -581,6 +581,63 @@ def fetch_balance(
         return None
 
 
+def fetch_positions(
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str = "",
+    symbol: Optional[str] = None,
+) -> Optional[List[Dict]]:
+    """
+    获取合约持仓列表
+
+    GET /capi/v3/position
+
+    Args:
+        symbol: 可选，指定交易对（如 SUIUSDT），为空则返回所有
+
+    Returns:
+        list of dict: [{
+            symbol: str,
+            positionSide: "LONG" | "SHORT",
+            quantity: float,
+            entryPrice: float,
+            markPrice: float,
+            unrealizedPnl: float,
+            leverage: int,
+            ...
+        }]
+    """
+    params = {}
+    if symbol:
+        params["symbol"] = _to_weex_symbol(symbol)
+    data = _get("/capi/v3/position", params=params,
+                api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
+    if not data:
+        return None
+
+    try:
+        positions = data if isinstance(data, list) else data.get("data", data)
+        if not isinstance(positions, list):
+            positions = [positions] if isinstance(positions, dict) else []
+        
+        result = []
+        for p in positions:
+            result.append({
+                "symbol": _from_weex_symbol(p.get("symbol", "")),
+                "side": (p.get("positionSide") or "LONG").lower(),
+                "quantity": float(p.get("quantity", 0)),
+                "entry_price": float(p.get("entryPrice", 0)),
+                "mark_price": float(p.get("markPrice", 0)),
+                "unrealized_pnl": float(p.get("unrealizedPnl", 0)),
+                "leverage": int(p.get("leverage", 1)),
+                "raw": p,
+            })
+        return result
+    except Exception as e:
+        logger.error(f"Weex 解析持仓失败: {e}, raw={data}")
+        return None
+
+
 def create_order(
     api_key: str,
     api_secret: str,
@@ -617,9 +674,14 @@ def create_order(
     # 数量对齐合约步长
     rounded_qty = _round_quantity(symbol, amount)
 
-    # positionSide: Weex 合约默认单向模式用 LONG/SHORT（根据 side 推断）
+    # positionSide: Weex 合约默认单向模式用 LONG/SHORT
+    # reduce_only 时：平多 → LONG，平空 → SHORT（与 side 相反！）
+    # 开仓时：买 → LONG，卖 → SHORT（与 side 一致）
     if position_side is None:
-        position_side = "LONG" if side.upper() == "BUY" else "SHORT"
+        if reduce_only:
+            position_side = "LONG" if side.upper() == "SELL" else "SHORT"
+        else:
+            position_side = "LONG" if side.upper() == "BUY" else "SHORT"
 
     params: Dict[str, Any] = {
         "symbol": weex_sym,
