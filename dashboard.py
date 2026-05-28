@@ -394,7 +394,7 @@ def _get_agent_list() -> list:
 
 @app.get("/light", response_class=HTMLResponse)
 async def dashboard_light():
-    """轻量级仪表盘 — 单页实时状态，适合移动端"""
+    """轻量级仪表盘 — 单页实时状态，适合移动端（v2：分组行情 + 双向布局 + PC自适应）"""
     return """<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -403,12 +403,15 @@ async def dashboard_light():
 <title>交易系统 · Light</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#c9d1d9;font:14px/1.5 system-ui;padding:12px;max-width:600px;margin:0 auto}
-@media(min-width:768px){body{max-width:900px;padding:20px;font-size:15px}}
+body{background:#0d1117;color:#c9d1d9;font:14px/1.5 system-ui;padding:12px;margin:0 auto}
+@media(min-width:768px){body{padding:24px;font-size:15px;max-width:1200px}}
+@media(min-width:1200px){body{max-width:1400px}}
 h2{font-size:15px;color:#58a6ff;margin:16px 0 8px}
 @media(min-width:768px){h2{font-size:17px}}
+h3{font-size:12px;color:#8b949e;margin:10px 0 4px;font-weight:400;text-transform:uppercase;letter-spacing:.5px}
+@media(min-width:768px){h3{font-size:13px;margin:12px 0 6px}}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin-bottom:12px}
-@media(min-width:768px){.grid{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}}
+@media(min-width:768px){.grid{grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px}}
 .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;text-align:center}
 @media(min-width:768px){.card{padding:14px}}
 .card .label{font-size:11px;color:#8b949e}
@@ -421,12 +424,41 @@ h2{font-size:15px;color:#58a6ff;margin:16px 0 8px}
 .row:last-child{border-bottom:none}
 .symbol{font-weight:600}
 .pnl-pos{color:#3fb950}.pnl-neg{color:#f85149}
+.col2{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:4px}
+@media(min-width:640px){.col2{grid-template-columns:1fr 1fr;gap:16px}}
+.col2 .col-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+@media(min-width:768px){.col2 .col-card{padding:16px}}
+.col2 h2{margin-top:0;font-size:14px}
+@media(min-width:768px){.col2 h2{font-size:15px}}
+.price-row{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:8px}
+@media(min-width:640px){.price-row{grid-template-columns:1fr 1fr;gap:16px}}
+.price-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(95px,1fr));gap:5px;margin-bottom:4px}
+@media(min-width:768px){.price-grid{grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px}}
+.price-cell{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:7px;text-align:center}
+.price-cell .sym{font-size:10px;color:#8b949e}
+.price-cell .prc{font-size:13px;font-weight:700}
+@media(min-width:768px){.price-cell .prc{font-size:14px}}
+.price-cell .chg{font-size:10px;margin-top:1px}
 .footer{display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap;font-size:11px;color:#484f58;text-align:center;margin-top:16px}
 @media(min-width:768px){.footer{font-size:12px}}
 .btn-dashboard{display:inline-block;padding:4px 14px;background:#238636;color:#fff;border-radius:6px;text-decoration:none;font-size:12px;font-weight:600}
 .btn-dashboard:hover{background:#2ea043}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 .live{animation:pulse 2s infinite}
+.btn-add{display:inline-flex;align-items:center;gap:4px;background:#238636;color:#fff;border:none;border-radius:6px;padding:2px 10px;font-size:12px;cursor:pointer;margin-left:8px;vertical-align:middle}
+.btn-add:hover{background:#2ea043}
+.btn-del{position:absolute;top:2px;right:4px;background:none;border:none;color:#f85149;font-size:14px;cursor:pointer;padding:0 3px;line-height:1;opacity:.5}
+.btn-del:hover{opacity:1}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:999;justify-content:center;align-items:center}
+.modal-overlay.show{display:flex}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:20px;width:90%;max-width:360px}
+.modal h3{font-size:15px;color:#58a6ff;margin:0 0 12px}
+.modal label{display:block;font-size:12px;color:#8b949e;margin-bottom:4px}
+.modal input,.modal select{width:100%;padding:8px 10px;background:#0d1117;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;font-size:14px;margin-bottom:12px}
+.modal .btn-row{display:flex;gap:8px;justify-content:flex-end}
+.modal .btn-ok{background:#238636;color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px}
+.modal .btn-ok:hover{background:#2ea043}
+.modal .btn-cancel{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px}
 </style>
 </head>
 <body>
@@ -436,44 +468,135 @@ h2{font-size:15px;color:#58a6ff;margin:16px 0 8px}
   <span style="font-size:11px;color:#8b949e;margin-left:auto" id="time">--:--:--</span>
 </div>
 
+<h2>📈 实时行情 <button class="btn-add" onclick="showAddModal()">+ 添加</button></h2>
+<div id="price-section">
+  <div class="price-cell"><div class="sym">加载中...</div></div>
+</div>
+
 <h2>🏛 系统状态</h2>
 <div class="grid" id="sys-grid"></div>
 
-<h2>📡 监控标的</h2>
-<div id="agents"><div class="row"><span class="m">加载中...</span></div></div>
+<div class="col2">
+  <div class="col-card">
+    <h2>📡 监控标的</h2>
+    <div id="agents"><div class="row"><span class="m">加载中...</span></div></div>
+  </div>
+  <div class="col-card">
+    <h2>💼 持仓</h2>
+    <div id="positions"><div class="row"><span class="m">加载中...</span></div></div>
+  </div>
+</div>
 
-<h2>💼 持仓</h2>
-<div id="positions"><div class="row"><span class="m">加载中...</span></div></div>
+<div class="col2">
+  <div class="col-card">
+    <h2>💰 盈亏</h2>
+    <div class="row"><span>持仓盈亏</span><span id="pos-pnl">--</span></div>
+    <div class="row"><span>当日盈亏</span><span id="day-pnl">--</span></div>
+    <div class="row"><span>累计盈亏</span><span id="total-pnl">--</span></div>
+  </div>
+  <div class="col-card">
+    <h2>📊 组合</h2>
+    <div id="portfolio"><div class="row"><span class="m">加载中...</span></div></div>
+  </div>
+</div>
 
-<h2>💰 盈亏</h2>
-<div class="row"><span>持仓盈亏</span><span id="pos-pnl">--</span></div>
-<div class="row"><span>当日盈亏</span><span id="day-pnl">--</span></div>
-<div class="row"><span>累计盈亏</span><span id="total-pnl">--</span></div>
-
-<h2>📊 组合</h2>
-<div id="portfolio"><div class="row"><span class="m">加载中...</span></div></div>
+<!-- 添加标的弹窗 -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <h3>➕ 添加监控标的</h3>
+    <label>标的代码</label>
+    <input id="addSymbol" placeholder="如 AAPL / 000001 / BTC" autocomplete="off">
+    <label>市场</label>
+    <select id="addMarket">
+      <option value="CN">A股</option>
+      <option value="HK">港股</option>
+      <option value="US">美股</option>
+      <option value="CRYPTO">加密货币</option>
+    </select>
+    <div class="btn-row">
+      <button class="btn-cancel" onclick="hideAddModal()">取消</button>
+      <button class="btn-ok" onclick="doAddSymbol()">确认添加</button>
+    </div>
+  </div>
+</div>
 
 <div class="footer"><span>⏱ <span id="uptime">--</span> · 自动刷新 30s</span><a class="btn-dashboard" href="/dashboard">📊 完整版</a></div>
 
 <script>
 const $=id=>document.getElementById(id);
+const MKT_GROUPS=[
+  {key:'CN',label:'A股市场',icon:'🇨🇳',cur:'¥'},
+  {key:'HK',label:'港股市场',icon:'🇭🇰',cur:'¥'},
+  {key:'US',label:'美股市场',icon:'🇺🇸',cur:'$'},
+  {key:'CRYPTO',label:'加密货币',icon:'₿',cur:'$'}
+];
 
 async function load(){
   try{
-    const [ss,pos,pv,st]=await Promise.all([
+    const [ss,prices,pos,pv,st]=await Promise.all([
       fetch('/api/sansheng/status').then(r=>r.json()),
+      fetch('/api/market/prices').then(r=>r.json()),
       fetch('/api/positions').then(r=>r.json()),
       fetch('/api/portfolio/value').then(r=>r.json()),
       fetch('/api/system/status').then(r=>r.json())
     ]);
-    renderSys(ss);
-    renderAgents(ss.agents||[]);
-    renderPositions(pos);
-    renderPnL(ss,pos);
-    renderPortfolio(pv);
-    renderUptime(st.uptime||0);
+    try{renderPrices(prices)}catch(e){$('price-section').innerHTML='<div style="color:#f85149">行情错误: '+e.message+'</div>'}
+    try{renderSys(ss)}catch(e){}
+    try{renderAgents(ss.agents||[])}catch(e){}
+    try{renderPositions(pos)}catch(e){}
+    try{renderPnL(ss,pos)}catch(e){}
+    try{renderPortfolio(pv)}catch(e){}
+    try{renderUptime(st.uptime||0)}catch(e){}
     $('time').textContent=new Date().toLocaleTimeString();
-  }catch(e){}
+  }catch(e){
+    $('price-section').innerHTML='<div class="price-cell" style="color:#f85149">⚠ 加载失败: '+e.message+'</div>';
+    console.error('Light load error:',e);
+  }
+}
+
+function renderPrices(arr){
+  if(!arr||!arr.length){$('price-section').innerHTML='<div class="price-cell"><div class="sym">暂无行情</div></div>';return}
+  var h='';
+  // 第一行: A股 + 港股
+  h+=renderPriceRow(arr,['CN','HK']);
+  // 第二行: 美股 + 加密货币
+  h+=renderPriceRow(arr,['US','CRYPTO']);
+  $('price-section').innerHTML=h;
+}
+function renderPriceRow(arr,keys){
+  // 收集各组数据，计算最大标的数用于网格补齐
+  var groups=[],maxN=0;
+  for(var i=0;i<keys.length;i++){
+    var g=MKT_GROUPS.find(function(g){return g.key===keys[i];});
+    var items=arr.filter(function(p){return p.market===keys[i];});
+    groups.push({group:g,items:items});
+    if(items.length>maxN) maxN=items.length;
+  }
+  maxN=Math.max(maxN,1);
+  var row='<div class="price-row">';
+  for(var i=0;i<groups.length;i++){
+    var g=groups[i].group,items=groups[i].items;
+    row+='<div><h3>'+g.icon+' '+g.label+'</h3><div class="price-grid">';
+    for(var j=0;j<maxN;j++){
+      if(j<items.length){
+        var p=items[j];
+        var c=p.change_pct||0;
+        var cls=c>0?'g':c<0?'r':'m';
+        var price=Number(p.price||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4});
+        row+='<div class="price-cell" style="position:relative" data-sym="'+p.symbol+'" data-mkt="'+g.key+'">'
+          +'<button class="btn-del" title="移除">×</button>'
+          +'<div class="sym">'+p.symbol+'</div>'
+          +'<div class="prc '+cls+'">'+g.cur+price+'</div>'
+          +'<div class="chg '+cls+'">'+(c>=0?'+':'')+c.toFixed(2)+'%</div>'
+          +'</div>';
+      }else{
+        row+='<div class="price-cell" style="visibility:hidden"><div class="sym">-</div><div class="prc m">-</div><div class="chg">-</div></div>';
+      }
+    }
+    row+='</div></div>';
+  }
+  row+='</div>';
+  return row;
 }
 
 function renderSys(d){
@@ -551,8 +674,43 @@ function renderUptime(s){
   $('uptime').textContent=`运行 ${h}h ${m}m ${sec}s`;
 }
 
-load();
-setInterval(load,30000);
+function showAddModal(){$('addModal').classList.add('show');$('addSymbol').value='';$('addSymbol').focus()}
+function hideAddModal(){$('addModal').classList.remove('show')}
+$('addModal').addEventListener('click',function(e){if(e.target===this)hideAddModal()});
+
+async function doAddSymbol(){
+  var sym=$('addSymbol').value.trim();
+  var mkt=$('addMarket').value;
+  if(!sym){alert('请输入标的代码');return}
+  try{
+    var r=await fetch('/api/symbols',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,market:mkt})});
+    var d=await r.json();
+    if(d.success){hideAddModal();load()}else{alert(d.detail||'添加失败')}
+  }catch(e){alert('请求失败: '+e.message)}
+}
+
+async function doRemoveSymbol(sym,mkt){
+  if(!sym||!mkt)return;
+  if(!confirm('确认移除 '+sym+' ('+mkt+')？'))return;
+  try{
+    var r=await fetch('/api/symbols/'+mkt+'/'+sym,{method:'DELETE'});
+    var d=await r.json();
+    if(d.success)load();else alert(d.detail||'移除失败')
+  }catch(e){alert('请求失败: '+e.message)}
+}
+
+// 事件委托 + 启动（DOM就绪后执行）
+document.addEventListener("DOMContentLoaded",function(){
+  var ps=$('price-section');
+  if(ps)ps.addEventListener('click',function(e){
+    var btn=e.target.closest('.btn-del');
+    if(!btn)return;
+    var cell=btn.closest('.price-cell');
+    doRemoveSymbol(cell.getAttribute('data-sym'),cell.getAttribute('data-mkt'));
+  });
+  load();
+  setInterval(load,30000);
+});
 </script>
 </body>
 </html>"""
@@ -797,47 +955,118 @@ async def get_price_api(symbol: str, market: str):
 
 @app.get("/api/market/prices")
 async def get_all_prices():
-    """获取所有市场实时行情"""
+    """获取所有市场实时行情（内置标的 + 用户自定义标的）"""
     from stock_api import get_stock
     from crypto_api import get_crypto_price
     
+    custom = _load_custom_symbols()
     prices = []
+    seen = set()
     
-    # A股
-    for symbol in ["600000", "000001", "000002", "600519"]:
-        data = get_stock(symbol, "CN")
-        if data:
-            prices.append(data)
+    def _add_symbols(symbols, market, fetcher):
+        for symbol in symbols:
+            key = f"{symbol}_{market}"
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if market == "CRYPTO":
+                    data = fetcher(symbol)
+                    if data:
+                        prices.append({
+                            "symbol": data.get("symbol"),
+                            "market": "CRYPTO",
+                            "name": data.get("symbol"),
+                            "price": data.get("price"),
+                            "prev_close": data.get("price") * (1 - data.get("change_24h", 0) / 100) if data.get("change_24h") else data.get("price"),
+                            "change": data.get("price") * data.get("change_24h", 0) / 100 if data.get("change_24h") else 0,
+                            "change_pct": data.get("change_24h", 0),
+                            "high_24h": data.get("high_24h"),
+                            "low_24h": data.get("low_24h"),
+                        })
+                else:
+                    data = fetcher(symbol, market)
+                    if data:
+                        prices.append(data)
+            except Exception:
+                pass
+
+    # 内置标的
+    _add_symbols(["600000", "000001", "000002", "600519"], "CN", get_stock)
+    _add_symbols(["00700", "09988", "03690"], "HK", get_stock)
+    _add_symbols(["AAPL", "TSLA", "NVDA", "MSFT"], "US", get_stock)
+    _add_symbols(["BTC", "ETH", "BNB", "SOL"], "CRYPTO", get_crypto_price)
     
-    # 港股
-    for symbol in ["00700", "09988", "03690"]:
-        data = get_stock(symbol, "HK")
-        if data:
-            prices.append(data)
-    
-    # 美股
-    for symbol in ["AAPL", "TSLA", "NVDA", "MSFT"]:
-        data = get_stock(symbol, "US")
-        if data:
-            prices.append(data)
-    
-    # 加密货币
-    for symbol in ["BTC", "ETH", "BNB", "SOL"]:
-        data = get_crypto_price(symbol)
-        if data:
-            prices.append({
-                "symbol": data.get("symbol"),
-                "market": "CRYPTO",
-                "name": data.get("symbol"),
-                "price": data.get("price"),
-                "prev_close": data.get("price") * (1 - data.get("change_24h", 0) / 100) if data.get("change_24h") else data.get("price"),
-                "change": data.get("price") * data.get("change_24h", 0) / 100 if data.get("change_24h") else 0,
-                "change_pct": data.get("change_24h", 0),
-                "high_24h": data.get("high_24h"),
-                "low_24h": data.get("low_24h"),
-            })
+    # 用户自定义标的（追加，自动去重）
+    for market in ["CN", "HK", "US", "CRYPTO"]:
+        fetcher = get_crypto_price if market == "CRYPTO" else get_stock
+        _add_symbols(custom.get(market, []), market, fetcher)
     
     return prices
+
+
+# ── 自定义标的管理 API ──
+import json as _json
+from threading import Lock as _Lock
+
+_SYMBOLS_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "monitor_symbols.json")
+_symbols_lock = _Lock()
+
+def _load_custom_symbols():
+    """从文件加载自定义标的"""
+    if _os.path.exists(_SYMBOLS_FILE):
+        try:
+            with open(_SYMBOLS_FILE) as f:
+                return _json.load(f)
+        except Exception:
+            pass
+    return {"CN": [], "HK": [], "US": [], "CRYPTO": []}
+
+def _save_custom_symbols(data):
+    """持久化自定义标的"""
+    with open(_SYMBOLS_FILE, "w") as f:
+        _json.dump(data, f, ensure_ascii=False, indent=2)
+
+class SymbolRequest(BaseModel):
+    symbol: str
+    market: str  # CN/HK/US/CRYPTO
+
+@app.get("/api/symbols")
+async def list_custom_symbols():
+    """获取自定义标的列表"""
+    return _load_custom_symbols()
+
+@app.post("/api/symbols")
+async def add_custom_symbol(req: SymbolRequest):
+    """添加自定义标的"""
+    symbol = req.symbol.strip().upper()
+    market = req.market.upper()
+    if market not in ("CN", "HK", "US", "CRYPTO"):
+        raise HTTPException(status_code=400, detail=f"不支持的市场: {market}")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="标的不为空")
+    with _symbols_lock:
+        data = _load_custom_symbols()
+        if symbol not in data[market]:
+            data[market].append(symbol)
+            _save_custom_symbols(data)
+            return {"success": True, "symbol": symbol, "market": market}
+        return {"success": False, "detail": "already exists"}
+
+@app.delete("/api/symbols/{market}/{symbol}")
+async def remove_custom_symbol(symbol: str, market: str):
+    """删除自定义标的"""
+    market = market.upper()
+    symbol = symbol.strip().upper()
+    if market not in ("CN", "HK", "US", "CRYPTO"):
+        raise HTTPException(status_code=400, detail=f"不支持的市场: {market}")
+    with _symbols_lock:
+        data = _load_custom_symbols()
+        if symbol in data[market]:
+            data[market].remove(symbol)
+            _save_custom_symbols(data)
+            return {"success": True, "symbol": symbol, "market": market}
+        return {"success": False, "detail": "not found"}
 
 @app.post("/api/alert/test")
 async def test_alert(req: AlertRequest):
