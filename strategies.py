@@ -1885,6 +1885,97 @@ class StatisticalArbitrageStrategy(Strategy):
 
 
 # ============================================================
+# Donchian Channel 突破策略（海龟交易核心）
+# ============================================================
+
+class DonchianChannelStrategy(Strategy):
+    """
+    Donchian Channel 突破策略 — 海龟交易核心 + EMA 趋势过滤
+
+    规则：
+      - 多头：收盘价突破 N 日最高价（上轨）AND 价格在 EMA 上方（上升趋势）
+      - 空头：收盘价跌破 N 日最低价（下轨）AND 价格在 EMA 下方（下降趋势）
+      - 止损/止盈由回测引擎统一管理
+
+    特点：
+      - 趋势跟踪 + 方向过滤：震荡市假突破被 EMA 趋势条件大量拦截
+      - 多空双向：突破上轨 + 趋势向上 → 做多；跌破下轨 + 趋势向下 → 做空
+      - EMA 周期越长，过滤越严格；默认 50 适合 4h 中期趋势
+
+    参数：
+      - channel_period: 通道周期（默认 20）
+      - trend_ema_period: 趋势过滤 EMA 周期（默认 50）
+    """
+
+    def __init__(self, config: Optional[StrategyConfig] = None,
+                 channel_period: int = 20,
+                 trend_ema_period: int = 50):
+        super().__init__(config)
+        self.channel_period = channel_period
+        self.trend_ema_period = trend_ema_period
+
+    def populate_indicators(self, candles: List[Dict]) -> Dict[str, List[float]]:
+        closes = [c["close"] for c in candles]
+        highs  = [c["high"]  for c in candles]
+        lows   = [c["low"]   for c in candles]
+        n = len(candles)
+
+        upper  = [0.0] * n
+        lower  = [0.0] * n
+        middle = [0.0] * n
+
+        # 通道用前 N 根 K 线计算（不含当前 K 线），否则 close[i] 永远无法突破上轨
+        for i in range(self.channel_period, n):
+            upper[i]  = max(highs[i - self.channel_period:i])
+            lower[i]  = min(lows[i - self.channel_period:i])
+            middle[i] = (upper[i] + lower[i]) / 2
+
+        # 趋势过滤 EMA
+        trend_ema = self.EMA(closes, self.trend_ema_period)
+
+        self._indicators = {
+            "upper":     upper,
+            "lower":     lower,
+            "middle":    middle,
+            "close":     closes,
+            "trend_ema": trend_ema,
+        }
+        return self._indicators
+
+    def populate_entry_trend(self, candles: List[Dict]) -> List[int]:
+        upper     = self._indicators.get("upper", [])
+        closes    = self._indicators.get("close", [])
+        trend_ema = self._indicators.get("trend_ema", [])
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            if upper[i] == 0 or upper[i - 1] == 0 or trend_ema[i] == 0:
+                continue
+            # 突破上轨 AND 价格在 EMA 上方（上升趋势确认）
+            price_break = closes[i] > upper[i] and closes[i - 1] <= upper[i - 1]
+            trend_up    = closes[i] > trend_ema[i]
+            if price_break and trend_up:
+                signals[i] = Signal.BUY
+        return signals
+
+    def populate_exit_trend(self, candles: List[Dict]) -> List[int]:
+        lower     = self._indicators.get("lower", [])
+        closes    = self._indicators.get("close", [])
+        trend_ema = self._indicators.get("trend_ema", [])
+
+        signals = [Signal.HOLD] * len(candles)
+        for i in range(1, len(candles)):
+            if lower[i] == 0 or lower[i - 1] == 0 or trend_ema[i] == 0:
+                continue
+            # 跌破下轨 AND 价格在 EMA 下方（下降趋势确认）
+            price_break = closes[i] < lower[i] and closes[i - 1] >= lower[i - 1]
+            trend_down  = closes[i] < trend_ema[i]
+            if price_break and trend_down:
+                signals[i] = Signal.SELL
+        return signals
+
+
+# ============================================================
 # 策略注册表更新
 # ============================================================
 
@@ -1899,5 +1990,6 @@ STRATEGY_REGISTRY: Dict[str, type] = {
     "FUNDING_ARB": FundingRateArbitrageStrategy,
     "STAT_ARB":   StatisticalArbitrageStrategy,
     "COINGLASS":  CoinGlassSentimentStrategy,   # 情绪+清算集群策略（2026-05-18）
+    "DONCHIAN":   DonchianChannelStrategy,      # 海龟通道突破策略（2026-05-22）
 }
 

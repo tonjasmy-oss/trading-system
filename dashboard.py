@@ -325,7 +325,238 @@ async def get_sansheng_status():
         "menxia_available": menxia_ok,
         "shangshu_available": shangshu_ok,
         "menxia": menxia_info,
+        "modules": _get_module_status(),
+        "agents": _get_agent_list(),
     }
+
+
+def _get_module_status() -> dict:
+    """检测各功能模块的可用状态"""
+    modules = {}
+    # AI 信号过滤
+    try:
+        from llm_utils import get_llm
+        modules["ai_filter"] = True
+    except Exception:
+        modules["ai_filter"] = False
+    # 在线参数优化器
+    try:
+        from components.online_optimizer import OnlineParameterOptimizer
+        modules["optimizer"] = True
+    except Exception:
+        modules["optimizer"] = False
+    # 反思复盘
+    try:
+        from reflection import ReflectionService
+        modules["reflection"] = True
+    except Exception:
+        modules["reflection"] = False
+    # 飞书推送
+    try:
+        from feishu_alert import FeishuAlert
+        modules["feishu"] = True
+    except Exception:
+        modules["feishu"] = False
+    return modules
+
+
+def _get_agent_list() -> list:
+    """获取 Agent 标的列表及其策略、行情"""
+    from config import AGENT_SYMBOLS
+    import sqlite3
+    agents = []
+    db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+    for i, item in enumerate(AGENT_SYMBOLS.split(",")):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        sym = parts[0].strip() if len(parts) > 0 else "?"
+        strat = parts[1].strip() if len(parts) > 1 else "?"
+        exch = parts[2].strip() if len(parts) > 2 else "?"
+        tf = parts[3].strip() if len(parts) > 3 else "?"
+        agent_id = f"agent_{i+1}"
+        price = None
+        try:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT price FROM equity_log WHERE agent_id=? AND price>0 ORDER BY id DESC LIMIT 1",
+                (agent_id,)
+            ).fetchone()
+            conn.close()
+            if row:
+                price = round(row[0], 4)
+        except Exception:
+            pass
+        agents.append({"agent": agent_id, "symbol": sym, "strategy": strat, "exchange": exch, "timeframe": tf, "price": price})
+    return agents
+
+
+@app.get("/light", response_class=HTMLResponse)
+async def dashboard_light():
+    """轻量级仪表盘 — 单页实时状态，适合移动端"""
+    return """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>交易系统 · Light</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font:14px/1.5 system-ui;padding:12px;max-width:600px;margin:0 auto}
+@media(min-width:768px){body{max-width:900px;padding:20px;font-size:15px}}
+h2{font-size:15px;color:#58a6ff;margin:16px 0 8px}
+@media(min-width:768px){h2{font-size:17px}}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:8px;margin-bottom:12px}
+@media(min-width:768px){.grid{grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px}}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px;text-align:center}
+@media(min-width:768px){.card{padding:14px}}
+.card .label{font-size:11px;color:#8b949e}
+@media(min-width:768px){.card .label{font-size:12px}}
+.card .val{font-size:13px;font-weight:600;margin-top:4px}
+@media(min-width:768px){.card .val{font-size:15px}}
+.g{color:#3fb950}.r{color:#f85149}.y{color:#d2991d}.m{color:#8b949e}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #21262d;font-size:13px}
+@media(min-width:768px){.row{font-size:14px;padding:8px 0}}
+.row:last-child{border-bottom:none}
+.symbol{font-weight:600}
+.pnl-pos{color:#3fb950}.pnl-neg{color:#f85149}
+.footer{display:flex;justify-content:center;align-items:center;gap:12px;flex-wrap:wrap;font-size:11px;color:#484f58;text-align:center;margin-top:16px}
+@media(min-width:768px){.footer{font-size:12px}}
+.btn-dashboard{display:inline-block;padding:4px 14px;background:#238636;color:#fff;border-radius:6px;text-decoration:none;font-size:12px;font-weight:600}
+.btn-dashboard:hover{background:#2ea043}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.live{animation:pulse 2s infinite}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+  <span class="live" style="width:8px;height:8px;background:#3fb950;border-radius:50%;display:inline-block"></span>
+  <span style="font-size:16px;font-weight:600">交易系统</span>
+  <span style="font-size:11px;color:#8b949e;margin-left:auto" id="time">--:--:--</span>
+</div>
+
+<h2>🏛 系统状态</h2>
+<div class="grid" id="sys-grid"></div>
+
+<h2>📡 监控标的</h2>
+<div id="agents"><div class="row"><span class="m">加载中...</span></div></div>
+
+<h2>💼 持仓</h2>
+<div id="positions"><div class="row"><span class="m">加载中...</span></div></div>
+
+<h2>💰 盈亏</h2>
+<div class="row"><span>持仓盈亏</span><span id="pos-pnl">--</span></div>
+<div class="row"><span>当日盈亏</span><span id="day-pnl">--</span></div>
+<div class="row"><span>累计盈亏</span><span id="total-pnl">--</span></div>
+
+<h2>📊 组合</h2>
+<div id="portfolio"><div class="row"><span class="m">加载中...</span></div></div>
+
+<div class="footer"><span>⏱ <span id="uptime">--</span> · 自动刷新 30s</span><a class="btn-dashboard" href="/dashboard">📊 完整版</a></div>
+
+<script>
+const $=id=>document.getElementById(id);
+
+async function load(){
+  try{
+    const [ss,pos,pv,st]=await Promise.all([
+      fetch('/api/sansheng/status').then(r=>r.json()),
+      fetch('/api/positions').then(r=>r.json()),
+      fetch('/api/portfolio/value').then(r=>r.json()),
+      fetch('/api/system/status').then(r=>r.json())
+    ]);
+    renderSys(ss);
+    renderAgents(ss.agents||[]);
+    renderPositions(pos);
+    renderPnL(ss,pos);
+    renderPortfolio(pv);
+    renderUptime(st.uptime||0);
+    $('time').textContent=new Date().toLocaleTimeString();
+  }catch(e){}
+}
+
+function renderSys(d){
+  const mods=d.modules||{};
+  const cards=[
+    ['📡 监控',d.live_trading?'运行中':'停止',d.live_trading?'g':'m'],
+    ['🎯 模式',d.testnet?'测试网':d.live_trading?'实盘':'模拟',d.testnet?'y':d.live_trading?'g':'m'],
+    ['📋 风控',(d.menxia||{}).level||'normal',(d.menxia||{}).level==='normal'?'g':'r'],
+    ['⚙️ 执行',d.shangshu_available&&d.live_trading?d.exchange||'在线':'离线',d.shangshu_available?'g':'m'],
+    ['🤖 AI',mods.ai_filter?'启用':'关闭',mods.ai_filter?'g':'m'],
+    ['🔧 优化',mods.optimizer?'启用':'关闭',mods.optimizer?'g':'m'],
+    ['📝 反思',mods.reflection?'启用':'关闭',mods.reflection?'g':'m'],
+    ['📨 推送',mods.feishu?'启用':'关闭',mods.feishu?'g':'m'],
+    ['🔄 守护',d.live_trading?'运行中':'未启用',d.live_trading?'g':'m'],
+    ['🗄 数据库',d.menxia_available?'已连接':'离线',d.menxia_available?'g':'r'],
+  ];
+  $('sys-grid').innerHTML=cards.map(([lab,val,cls])=>
+    `<div class="card"><div class="label">${lab}</div><div class="val ${cls}">${val}</div></div>`
+  ).join('');
+}
+
+function renderAgents(arr){
+  if(!arr||!arr.length){$('agents').innerHTML='<div class="row"><span class="m">无标的</span></div>';return}
+  $('agents').innerHTML=arr.map(a=>{
+    const p=a.price?'$$'+a.price:'--';
+    return `<div class="row">
+      <span class="symbol">${a.symbol}</span>
+      <span style="color:#58a6ff;font-size:11px">${a.strategy}</span>
+      <span style="color:#8b949e;font-size:11px">${a.timeframe}</span>
+      <span style="color:#8b949e;font-size:11px">${a.exchange}</span>
+      <span>${p}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderPnL(ss,pos){
+  const mx=ss.menxia||{};
+  const day=mx.daily_loss_pct||0;
+  const dayCls=day<=-5?'r':day<0?'y':'g';
+  $('day-pnl').innerHTML=`<span class="${dayCls}">${day.toFixed(2)}%</span>`;
+  let totalPnl=0;
+  if(pos&&pos.length)pos.forEach(p=>totalPnl+=Number(p.pnl||0));
+  const cls=totalPnl>=0?'pnl-pos':'pnl-neg';
+  $('pos-pnl').innerHTML=`<span class="${cls}">$${totalPnl.toFixed(2)}</span>`;
+  $('total-pnl').innerHTML=`<span class="${cls}">$${totalPnl.toFixed(2)}</span>`;
+}
+
+function renderPositions(arr){
+  if(!arr||!arr.length){$('positions').innerHTML='<div class="row"><span class="m">无持仓</span></div>';return}
+  $('positions').innerHTML=arr.map(p=>{
+    const cls=p.pnl_pct>=0?'pnl-pos':'pnl-neg';
+    return `<div class="row">
+      <span class="symbol">${p.symbol}</span>
+      <span>${p.side}</span>
+      <span>${Number(p.quantity).toFixed(p.symbol.startsWith('XAUT')?4:2)}</span>
+      <span>$${Number(p.avg_price).toFixed(4)}</span>
+      <span>$${Number(p.current_price).toFixed(4)}</span>
+      <span class="${cls}">${Number(p.pnl_pct).toFixed(2)}%</span>
+    </div>`;
+  }).join('');
+}
+
+function renderPortfolio(d){
+  const tp=d.total_pnl_pct||0;
+  const cls=tp>=0?'pnl-pos':'pnl-neg';
+  $('portfolio').innerHTML=`
+    <div class="row"><span>总成本</span><span>$${Number(d.total_cost||0).toFixed(2)}</span></div>
+    <div class="row"><span>总市值</span><span>$${Number(d.total_value||0).toFixed(2)}</span></div>
+    <div class="row"><span>总盈亏</span><span class="${cls}">$${Number(d.total_pnl||0).toFixed(2)} (${Number(tp).toFixed(2)}%)</span></div>
+  `;
+}
+
+function renderUptime(s){
+  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;
+  $('uptime').textContent=`运行 ${h}h ${m}m ${sec}s`;
+}
+
+load();
+setInterval(load,30000);
+</script>
+</body>
+</html>"""
+
 
 @app.post("/api/monitor")
 async def monitor_control(action: MonitorAction):
@@ -1388,6 +1619,30 @@ DASHBOARD_HTML = """
                     <div class="sys-stat-label">⚙️ 尚书省</div>
                     <div class="sys-stat-value"><span id="shangshu-status" class="status-badge" style="background:#00c853;color:#000;">就绪</span></div>
                 </div>
+                <div class="sys-stat-card" id="stat-ai">
+                    <div class="sys-stat-label">🤖 AI 信号过滤</div>
+                    <div class="sys-stat-value"><span id="ai-filter-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-optimizer">
+                    <div class="sys-stat-label">🔧 参数优化器</div>
+                    <div class="sys-stat-value"><span id="optimizer-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-reflection">
+                    <div class="sys-stat-label">📝 反思复盘</div>
+                    <div class="sys-stat-value"><span id="reflection-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-feishu">
+                    <div class="sys-stat-label">📨 飞书推送</div>
+                    <div class="sys-stat-value"><span id="feishu-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-daemon">
+                    <div class="sys-stat-label">🔄 实盘守护</div>
+                    <div class="sys-stat-value"><span id="daemon-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
+                <div class="sys-stat-card" id="stat-db">
+                    <div class="sys-stat-label">🗄 数据库</div>
+                    <div class="sys-stat-value"><span id="db-status" class="status-badge" style="background:#555;color:#fff;">检测中...</span></div>
+                </div>
             </div>
             <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;">
                 <div style="font-size:12px;color:#888;">
@@ -1862,6 +2117,41 @@ DASHBOARD_HTML = """
                     ssEl.style.background = '#555';
                     ssCard.className = 'sys-stat-card';
                 }
+
+                // ── 功能模块状态 ──
+                const mods = data.modules || {};
+                function setModStatus(id, ok, label) {
+                    const el = document.getElementById(id);
+                    const card = document.getElementById('stat-' + id.split('-')[0]);
+                    if (!el) return;
+                    if (ok) {
+                        el.textContent = label || '已启用';
+                        el.style.background = '#00c853'; el.style.color = '#000';
+                    } else {
+                        el.textContent = '未启用';
+                        el.style.background = '#555'; el.style.color = '#fff';
+                    }
+                }
+                setModStatus('ai-filter-status', mods.ai_filter);
+                setModStatus('optimizer-status', mods.optimizer);
+                setModStatus('reflection-status', mods.reflection);
+                setModStatus('feishu-status', mods.feishu);
+
+                // 实盘守护进程
+                const daemonEl = document.getElementById('daemon-status');
+                if (data.live_trading) {
+                    daemonEl.textContent = '运行中';
+                    daemonEl.style.background = '#00c853'; daemonEl.style.color = '#000';
+                } else {
+                    daemonEl.textContent = '未启用';
+                    daemonEl.style.background = '#555'; daemonEl.style.color = '#fff';
+                }
+
+                // 数据库
+                const dbEl = document.getElementById('db-status');
+                dbEl.textContent = data.menxia_available ? '已连接' : '离线';
+                dbEl.style.background = data.menxia_available ? '#00c853' : '#ff5722';
+                dbEl.style.color = '#000';
             } catch(e) { console.error('三省六部状态加载失败:', e); }
         }
         

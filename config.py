@@ -75,7 +75,8 @@ OPTIMAL_PARAMS = {
     "BTC/USDT": dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.040, take_profit=0.080),
     "ETH/USDT": dict(rsi_period=14, oversold=30.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
     "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
-    "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.012, take_profit=0.025),  # Grid Search 2026-05-09
+    "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.03, take_profit=0.05,
+                      channel_period=30, trend_ema_period=10),  # Donchian 2h Grid Search 2026-05-22
     "XAUT/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),  # Weex回测最优
     # KYVE/USDT, PYTH/USDT: 无交易所历史数据（数据不足0条），暂沿用全局默认值 stop_loss=0.025 take_profit=0.050
 }
@@ -120,7 +121,7 @@ AGENT_CHECK_INTERVAL = int(os.getenv("AGENT_CHECK_INTERVAL", "60"))
 # 示例: ETH/USDT:RSI:binance,SOL/USDT:RSI:hyperliquid,SUI/USDT:SMA:binance
 AGENT_SYMBOLS = os.getenv(
     "AGENT_SYMBOLS",
-    "BTC/USDT:VOTE:binance,ETH/USDT:AUTO:binance,SOL/USDT:VOTE:binance,SUI/USDT:AUTO:binance,ARB/USDT:VOTE:binance,AVAX/USDT:VOTE:binance,OP/USDT:VOTE:binance,LINK/USDT:VOTE:binance"
+    "BTC/USDT:VOTE:binance,ETH/USDT:AUTO:binance,SOL/USDT:VOTE:binance,SUI/USDT:AUTO:binance,ARB/USDT:VOTE:binance,AVAX/USDT:VOTE:binance,OP/USDT:VOTE:binance,LINK/USDT:VOTE:binance,XAUT/USDT:DONCHIAN:gateio"
 )
 
 # ============================================================

@@ -129,6 +129,14 @@ except ImportError:
     OnlineParameterOptimizer = None
     _OPTIMIZER_AVAILABLE = False
 
+# 交易后反思复盘
+try:
+    from reflection import ReflectionService
+    _REFLECTION_AVAILABLE = True
+except ImportError:
+    ReflectionService = None
+    _REFLECTION_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -244,6 +252,9 @@ class TradingAgent:
         stop_loss_pct: float = 0.025,
         take_profit_pct: float = 0.04,
         initial_capital: float = INITIAL_CAPITAL,
+        # Donchian Channel 参数
+        channel_period: int = 20,
+        trend_ema_period: int = 50,
         # 三省六部（2026-05-02）：门下省审核 + 尚书省执行
         menxia: Optional["MenxiaSheng"] = None,
         shangshu: Optional["ShangshuSheng"] = None,
@@ -251,7 +262,7 @@ class TradingAgent:
     ):
         self.agent_id = agent_id
         self.symbol = symbol          # "ETH/USDT"
-        self.strategy_name = strategy  # "RSI" | "SMA" | "BOLLINGER" | "FORMULA"
+        self.strategy_name = strategy  # "RSI" | "SMA" | "BOLLINGER" | "DONCHIAN"
         self.exchange = exchange      # "binance" | "hyperliquid" | "gateio"
         self.timeframe = timeframe
         self.rsi_period = rsi_period
@@ -260,6 +271,8 @@ class TradingAgent:
         self.stop_loss_pct = stop_loss_pct
         self.take_profit_pct = take_profit_pct
         self.initial_capital = initial_capital
+        self.channel_period = channel_period
+        self.trend_ema_period = trend_ema_period
         self.formula = formula       # 通达信公式（strategy=FORMULA 时）
 
         # 三省六部注入
@@ -461,6 +474,11 @@ class TradingAgent:
             strategy_kwargs = {"fast_period": 10, "slow_period": 30}
         elif strategy_type == "KDJ":
             pass  # KDJ 使用 FormulaStrategy 包装，无需额外参数
+        elif strategy_type == "DONCHIAN":
+            strategy_kwargs = {
+                "channel_period": self.channel_period,
+                "trend_ema_period": self.trend_ema_period,
+            }
 
         # ── 多因子趋势策略（MULTIFACTOR）─────────────────────────────
         elif strategy_type == "MULTIFACTOR":
@@ -596,15 +614,12 @@ class TradingAgent:
                 limit=limit,
             )
         elif self.exchange == "weex":
-            from weex import fetch_ohlcv as weex_ohlcv
-            candles = weex_ohlcv(
+            # Weex 用于交易执行，数据从 Gate.io 拉取（Weex 不支持部分周期如 2h）
+            return get_ohlcv(
                 symbol=self.symbol.split("/")[0],
                 timeframe=self.timeframe,
                 limit=limit,
             )
-            # weex_ohlcv returns [{timestamp, open, high, low, close, volume}]
-            # already in the correct format
-            return candles
         else:
             # Binance / Gate.io
             return get_ohlcv(
@@ -961,6 +976,9 @@ class TradingAgent:
         if self.menxia:
             self.menxia.record_close(self.symbol, pnl_pct)
 
+        # 保存 trade_id 供后续反思复盘使用（TradeHistory 块内会置 None）
+        _reflection_trade_id = self._current_trade_id
+
         # ── TradeHistory 记录平仓 ──
         if self._trade_history and self._current_trade_id is not None:
             try:
@@ -1027,6 +1045,25 @@ class TradingAgent:
                     )
             except Exception as e:
                 logger.warning(f"[{self.agent_id}] 在线优化异常: {e}")
+
+        # ── 交易后反思复盘（AI 分析入场/出场逻辑）──
+        if _REFLECTION_AVAILABLE and _reflection_trade_id is not None:
+            try:
+                _ref_svc = ReflectionService(
+                    api_key=os.getenv("DEEPSEEK_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+                    base_url="https://api.deepseek.com/v1",
+                    model="deepseek-chat",
+                )
+                _ref_svc.reflect_on_trade({
+                    "id": _reflection_trade_id,
+                    "symbol": self.symbol,
+                    "entry_price": entry_price,
+                    "exit_price": exec_price,
+                    "pnl_pct": pnl_pct,
+                    "exit_reason": reason,
+                })
+            except Exception:
+                pass  # 反思失败不影响主流程
 
         return True
 
@@ -1213,6 +1250,10 @@ class TradingAgent:
             }
 
         # 信号检测（已完成持仓检查）
+        # ── 初始化决策链变量（避免各分支未赋值导致 UnboundLocalError）──
+        routing_info: Dict = {}
+        can_open, reason = (False, "")
+        trend = ""
         signal_val, _, _ = self._detect_signals(candles)
         signal_names = {Signal.BUY: "BUY", Signal.SELL: "SELL", Signal.HOLD: "HOLD"}
         result["signal"] = signal_names.get(signal_val, "HOLD")
@@ -1372,6 +1413,22 @@ class TradingAgent:
 
         self._log_equity(current_ts, current_price, equity, rsi)
         self._log_signal(signal_names.get(signal_val, "HOLD"), current_price, rsi, result["ai_verdict"])
+
+        # ── 决策链结构化摘要日志 ──
+        decision_chain = {
+            "raw": signal_names.get(signal_val, "HOLD"),
+            "ai_filter": ai_verdict or "N/A",
+            "menxia": "通过" if can_open else ("N/A" if not reason else f"否决({reason})"),
+            "signal_router": routing_info.get("chosen_strategy", "N/A") if routing_info else "N/A",
+            "trend_filter": "放行" if not trend else (f"禁多" if trend == "downtrend" else f"禁空" if trend == "uptrend" else trend),
+            "final": result.get("signal", "?"),
+        }
+        logger.info(
+            f"[{self.agent_id}] 📊 决策链: "
+            f"技术={decision_chain['raw']} → AI={decision_chain['ai_filter']} → "
+            f"门下={decision_chain['menxia']} → 路由={decision_chain['signal_router']} → "
+            f"趋势={decision_chain['trend_filter']} → 最终={decision_chain['final']}"
+        )
 
         # 持仓状态
         if self.position:
@@ -1536,6 +1593,8 @@ class MultiAgentOrchestrator:
         self._thread: Optional[threading.Thread] = None
         self.live_trading = live_trading and _SHANGSHU_AVAILABLE
         self._feishu = _feishu if not isinstance(_feishu, type(_feishu_sentinel)) else None
+        self._last_trade_time: float = time.time()  # 上次成交时间
+        self._idle_alert_hours: float = float(os.getenv("IDLE_ALERT_HOURS", "12"))  # 无交易告警阈值
 
         # ── 门下省：风控审核服务（所有 Agent 共享）──
         self.menxia: Optional[MenxiaSheng] = None
@@ -1619,10 +1678,12 @@ class MultiAgentOrchestrator:
                 strategy = raw_strategy
 
             exchange = parts[2].strip().lower() if len(parts) > 2 else "binance"
-            # 自定义公式（FORMULA:名称 语法，第四个字段指定公式名）
+            # 第4字段：timeframe（如 2h/4h/1h），默认 4h
+            timeframe = parts[3].strip() if len(parts) > 3 else "4h"
+            # 自定义公式（FORMULA:名称 语法，第5字段指定公式名）
             custom_formula_str = None
-            if len(parts) > 3:
-                custom_formula_str = parts[3].strip()
+            if len(parts) > 4:
+                custom_formula_str = parts[4].strip()
 
             # 解析公式字符串（FORMULA:builtin_name 或 FORMULA:custom_name）
             resolved_formula = None
@@ -1643,19 +1704,23 @@ class MultiAgentOrchestrator:
             ob_val = params.get("overbought", STRATEGY_RSI_OVERBOUGHT)
             sl_val = params.get("stop_loss", STRATEGY_STOP_LOSS)
             tp_val = params.get("take_profit", STRATEGY_TAKE_PROFIT)
+            ch_val = params.get("channel_period", 20)
+            ema_val = params.get("trend_ema_period", 50)
 
             agent = TradingAgent(
                 agent_id=f"agent_{i+1}",
                 symbol=symbol,
                 strategy=strategy,
                 exchange=exchange,
-                timeframe="4h",
+                timeframe=timeframe,
                 rsi_period=rsi_p,
                 oversold=os_val,
                 overbought=ob_val,
                 stop_loss_pct=sl_val,
                 take_profit_pct=tp_val,
                 initial_capital=LIVE_INITIAL_CAPITAL,
+                channel_period=ch_val,
+                trend_ema_period=ema_val,
                 formula=resolved_formula,
                 # 三省六部注入
                 menxia=self.menxia,
@@ -1670,6 +1735,9 @@ class MultiAgentOrchestrator:
         for agent in self.agents:
             try:
                 result = await agent.check_once()
+                # 跟踪最后成交时间
+                if result.get("signal") in ("BUY", "SHORT", "EXIT（平多）", "COVER（平空）"):
+                    self._last_trade_time = time.time()
                 results.append(result)
             except Exception as e:
                 logger.error(f"[{agent.agent_id}] 检查失败: {e}")
@@ -1678,6 +1746,15 @@ class MultiAgentOrchestrator:
                     "symbol": agent.symbol,
                     "error": str(e),
                 })
+
+        # ── 长时间无交易告警 ──
+        idle_hours = (time.time() - self._last_trade_time) / 3600
+        if idle_hours >= self._idle_alert_hours:
+            logger.warning(
+                f"⚠️  IDLE_ALERT: 已 {idle_hours:.1f}h 无交易信号（阈值={self._idle_alert_hours}h），"
+                f"请检查 API 连通性与市场状态"
+            )
+
         return results
 
     def get_all_status(self) -> List[Dict]:
@@ -1905,16 +1982,35 @@ def main():
         orchestrator.print_status()
 
     elif args.daemon:
-        print(f"多 Agent 后台常驻模式已启动（{len(orchestrator.agents)} 个 Agent）")
-        print(f"检查间隔: {AGENT_CHECK_INTERVAL}s")
-        print("按 Ctrl+C 停止")
-        orchestrator.start_background()
+        # ── 进程互斥锁：防止双实例并行 ──
+        pid_file = os.path.join(os.path.dirname(__file__), ".live_daemon.pid")
+        if os.path.exists(pid_file):
+            try:
+                old_pid = int(open(pid_file).read().strip())
+                os.kill(old_pid, 0)
+                print(f"❌ 已有 live_trading 进程运行 (PID {old_pid})，拒绝启动")
+                print(f"   如需强制重启，请先执行: kill {old_pid}")
+                return
+            except (OSError, ValueError):
+                os.remove(pid_file)
+        with open(pid_file, "w") as f:
+            f.write(str(os.getpid()))
         try:
+            print(f"多 Agent 后台常驻模式已启动（{len(orchestrator.agents)} 个 Agent）")
+            print(f"PID: {os.getpid()}  →  {pid_file}")
+            print(f"检查间隔: {AGENT_CHECK_INTERVAL}s")
+            print("按 Ctrl+C 停止")
+            orchestrator.start_background()
             while True:
                 time.sleep(10)
         except KeyboardInterrupt:
             print("\n正在停止...")
             orchestrator.stop_background()
+        finally:
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
 
     else:
         print(f"实盘模拟引擎 v2 已启动")

@@ -34,6 +34,8 @@ from strategies import Strategy, SMAcrossStrategy, RSIStrategy, Signal, Strategy
 from tdx_compiler import FormulaStrategy, BUILTIN_FORMULAS
 from history_cache import get_ohlcv as cache_get_ohlcv, get_latest_timestamp, save_ohlcv, init_cache_db
 
+MAX_CACHE_LIMIT = 15000
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -138,8 +140,8 @@ class BacktestEngine:
         symbol    = self.config.symbol
         timeframe = self.config.timeframe
 
-        # 尝试从缓存读取（最多 5000 条）
-        candles = cache_get_ohlcv(symbol, timeframe, limit=5000)
+        # 尝试从缓存读取
+        candles = cache_get_ohlcv(symbol, timeframe, limit=MAX_CACHE_LIMIT)
         logger.info(f"缓存命中 {len(candles)} 条 {symbol} {timeframe} 数据")
 
         # 缓存不足：从线上补充最近 6 个月数据
@@ -153,7 +155,7 @@ class BacktestEngine:
                 if online_data:
                     save_ohlcv(symbol, timeframe, online_data)
                     logger.info(f"线上补充 {len(online_data)} 条，已写入缓存")
-                    candles = cache_get_ohlcv(symbol, timeframe, limit=5000)
+                    candles = cache_get_ohlcv(symbol, timeframe, limit=MAX_CACHE_LIMIT)
                 else:
                     logger.error("线上补充数据失败")
             except Exception as e:
@@ -510,7 +512,12 @@ def parse_args():
     parser.add_argument("symbol",      nargs="?", default="BTC/USDT",  help="交易对，如 BTC/USDT")
     parser.add_argument("timeframe",   nargs="?", default="1h",        help="K线周期：1m/5m/15m/1h/4h/1d")
     parser.add_argument("strategy",    nargs="?", default="SMAcrossStrategy",
-                        choices=["SMAcrossStrategy", "RSIStrategy"], help="策略名称")
+                        choices=["SMAcrossStrategy", "RSIStrategy", "DonchianChannelStrategy"],
+                        help="策略名称")
+    parser.add_argument("--channel-period", type=int, default=20,
+                        help="Donchian 通道周期（默认 20）")
+    parser.add_argument("--trend-ema-period", type=int, default=50,
+                        help="Donchian EMA 趋势过滤周期（默认 50）")
     parser.add_argument("--capital-pct",  type=float, default=1.0,   help="每次下单资金比例（0~1），默认 1.0")
     parser.add_argument("--stop-loss",     type=float, default=0.05,  help="止损比例，默认 0.05（5%%）")
     parser.add_argument("--take-profit",   type=float, default=0.10,  help="止盈比例，默认 0.10（10%%）")
@@ -534,10 +541,11 @@ def parse_args():
 
 
 def main_compare(args):
-    """对比全部6个策略并排行"""
+    """对比全部7个策略并排行"""
     from strategies import (
         RSIStrategy, SMAcrossStrategy, MACDStrategy,
         BollingerBandsStrategy, KDJStrategy, ATRStopStrategy,
+        DonchianChannelStrategy,
     )
 
     config = StrategyConfig(
@@ -556,10 +564,12 @@ def main_compare(args):
         "BOLLINGER": BollingerBandsStrategy(config, period=20, std_dev=2.0),
         "KDJ":       KDJStrategy(config),
         "ATRSTOP":   ATRStopStrategy(config, ema_period=ATRSTOP_EMA_PERIOD, atr_period=ATRSTOP_ATR_PERIOD, atr_multiplier=ATRSTOP_ATR_MULTIPLIER),
+        "DONCHIAN":  DonchianChannelStrategy(config, channel_period=args.channel_period,
+                                            trend_ema_period=args.trend_ema_period),
     }
 
     init_cache_db()
-    candles = cache_get_ohlcv(args.symbol, args.timeframe, limit=5000)
+    candles = cache_get_ohlcv(args.symbol, args.timeframe, limit=MAX_CACHE_LIMIT)
     if len(candles) < 100:
         print(f"数据不足（{len(candles)} 条），跳过对比")
         return
@@ -681,6 +691,13 @@ def main():
                 oversold    = args.rsi_oversold,
                 overbought  = args.rsi_overbought,
             )
+        elif args.strategy == "DonchianChannelStrategy":
+            from strategies import DonchianChannelStrategy
+            strategy = DonchianChannelStrategy(
+                config           = config,
+                channel_period   = args.channel_period,
+                trend_ema_period = args.trend_ema_period,
+            )
         else:
             raise ValueError(f"未知策略: {args.strategy}")
         logger.info(f"策略: {args.strategy}")
@@ -799,7 +816,7 @@ def walk_forward(symbol: str, timeframe: str, strategy: Strategy,
                  train_months: int = 3, test_months: int = 1,
                  initial_capital: float = 10000) -> dict:
     init_cache_db()
-    all_candles = cache_get_ohlcv(symbol, timeframe, limit=5000)
+    all_candles = cache_get_ohlcv(symbol, timeframe, limit=MAX_CACHE_LIMIT)
     if len(all_candles) < 200:
         return {"error": "数据不足"}
     months_map = {}

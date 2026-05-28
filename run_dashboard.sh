@@ -105,7 +105,6 @@ LOG_FILE="nohup_$(date +%Y%m%d).out"
 python3 -m uvicorn dashboard:app \
     --host "$HOST" \
     --port "$PORT" \
-    --reload \
     > "$LOG_FILE" 2>&1 &
 
 # 清理 7 天前的旧日志

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api-contract.weex.com"   # 合约 API
 TUNNEL_HOST = "127.0.0.1"
-TUNNEL_PORT = 8892                            # SSH 隧道：localhost:8892 → api-contract.weex.com:443
+TUNNEL_PORT = int(os.getenv("WEEX_TUNNEL_PORT", "8893"))  # SSH 隧道端口（可通过环境变量覆盖）
 SOCKS_HOST = os.getenv("WEEX_SOCKS_HOST", "127.0.0.1")
 SOCKS_PORT = int(os.getenv("WEEX_SOCKS_PORT", "10808"))  # SOCKS5 代理
 TIMEOUT = 15
@@ -135,6 +135,8 @@ class _SNIAdapter(HTTPAdapter):
 
 # 全局 session，隧道模式下复用（自动处理 SNI）
 _sni_session: Optional[requests.Session] = None
+# SOCKS5 session 缓存，避免每次创建新连接导致 SSL EOF
+_socks_session: Optional[requests.Session] = None
 
 
 def _get_session() -> requests.Session:
@@ -143,6 +145,17 @@ def _get_session() -> requests.Session:
         _sni_session = requests.Session()
         _sni_session.mount("https://", _SNIAdapter())
     return _sni_session
+
+
+def _get_socks_session() -> requests.Session:
+    """获取 SOCKS5 session（缓存复用，避免频繁建连触发 SSL EOF）"""
+    global _socks_session
+    if _socks_session is None:
+        import socks
+        _socks_session = requests.Session()
+        _socks_session.proxies = {"https": f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}"}
+        _socks_session.mount("https://", _SNIAdapter())
+    return _socks_session
 
 
 # ============================================================
@@ -188,10 +201,7 @@ def _get_http_session() -> requests.Session:
     if _is_tunnel_active():
         return _get_session()
     if _is_socks_active():
-        import socks
-        sess = requests.Session()
-        sess.proxies = {"https": f"socks5h://{SOCKS_HOST}:{SOCKS_PORT}"}
-        return sess
+        return _get_socks_session()
     return requests.Session()
 
 
@@ -283,80 +293,161 @@ def _sign_v3(
 # HTTP 辅助
 # ============================================================
 
+# SSL 重试配置
+_SSL_RETRY_MAX = 3
+_SSL_RETRY_BACKOFF_BASE = 2.0   # 秒: 2, 4, 8
+
+
+def _reset_socks_session():
+    """重置 SOCKS session（SSL 错误后强制重建连接）"""
+    global _socks_session
+    if _socks_session is not None:
+        try:
+            _socks_session.close()
+        except Exception:
+            pass
+        _socks_session = None
+
+
 def _get(endpoint: str, params: Optional[Dict] = None,
          api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
-    """GET 请求"""
-    url = f"{_get_base_url()}{endpoint}"
-    sess = _get_http_session()
-    try:
-        if api_key and api_secret:
-            headers = _sign_v3(api_key, api_secret, api_passphrase, "GET", endpoint)
-        else:
-            headers = {"User-Agent": "trading-system/2.0"}
-        # 隧道模式下显式设置 Host 头以通过 CloudFront
-        if _is_tunnel_active():
-            headers["Host"] = API_HOST
-        resp = sess.get(url, params=params, headers=headers,
-                        timeout=TIMEOUT, verify=_get_verify_ssl())
-        return _parse_response(resp)
-    except requests.exceptions.Timeout:
-        logger.warning(f"Weex GET 超时: {endpoint}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"Weex 连接失败: {endpoint}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Weex GET 异常: {endpoint}: {e}")
-        return None
+    """GET 请求（带 SSL 重试）"""
+    last_ssl_error = None
+    for attempt in range(_SSL_RETRY_MAX + 1):
+        try:
+            # 每次重试重新签名（timestamp 会更新）
+            if api_key and api_secret:
+                headers = _sign_v3(api_key, api_secret, api_passphrase, "GET", endpoint)
+            else:
+                headers = {"User-Agent": "trading-system/2.0"}
+            if _is_tunnel_active():
+                headers["Host"] = API_HOST
+            url = f"{_get_base_url()}{endpoint}"
+            sess = _get_http_session()
+            resp = sess.get(url, params=params, headers=headers,
+                            timeout=TIMEOUT, verify=_get_verify_ssl())
+            return _parse_response(resp)
+        except requests.exceptions.SSLError as e:
+            last_ssl_error = e
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex SSL 错误 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+        except requests.exceptions.Timeout:
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex GET 超时 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+            else:
+                logger.error(f"Weex GET 超时重试耗尽: {endpoint}")
+                return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Weex 连接失败: {endpoint}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Weex GET 异常: {endpoint}: {e}")
+            return None
+    logger.error(f"Weex GET SSL 重试耗尽 ({_SSL_RETRY_MAX + 1} 次): {endpoint}")
+    return None
 
 
 def _post(endpoint: str, params: Optional[Dict] = None,
           api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
-    """POST 请求"""
-    url = f"{_get_base_url()}{endpoint}"
-    sess = _get_http_session()
-    try:
-        headers = _sign_v3(api_key, api_secret, api_passphrase, "POST", endpoint, params or {})
-        if _is_tunnel_active():
-            headers["Host"] = API_HOST
-        body = json.dumps(params or {}, separators=(",", ":"))
-        logger.debug(f"Weex POST {endpoint} body={body}")
-        resp = sess.post(url, data=body, headers=headers,
-                         timeout=TIMEOUT, verify=_get_verify_ssl())
-        return _parse_response(resp)
-    except requests.exceptions.Timeout:
-        logger.warning(f"Weex POST 超时: {endpoint}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"Weex 连接失败: {endpoint}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Weex POST 异常: {endpoint}: {e}")
-        return None
+    """POST 请求（带 SSL 重试）"""
+    for attempt in range(_SSL_RETRY_MAX + 1):
+        try:
+            headers = _sign_v3(api_key, api_secret, api_passphrase, "POST", endpoint, params or {})
+            if _is_tunnel_active():
+                headers["Host"] = API_HOST
+            body = json.dumps(params or {}, separators=(",", ":"))
+            logger.debug(f"Weex POST {endpoint} body={body}")
+            url = f"{_get_base_url()}{endpoint}"
+            sess = _get_http_session()
+            resp = sess.post(url, data=body, headers=headers,
+                             timeout=TIMEOUT, verify=_get_verify_ssl())
+            return _parse_response(resp)
+        except requests.exceptions.SSLError as e:
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex SSL 错误 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+        except requests.exceptions.Timeout:
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex POST 超时 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+            else:
+                logger.error(f"Weex POST 超时重试耗尽: {endpoint}")
+                return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Weex 连接失败: {endpoint}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Weex POST 异常: {endpoint}: {e}")
+            return None
+    logger.error(f"Weex POST SSL 重试耗尽 ({_SSL_RETRY_MAX + 1} 次): {endpoint}")
+    return None
 
 
 def _delete(endpoint: str, params: Optional[Dict] = None,
             api_key: str = "", api_secret: str = "", api_passphrase: str = "") -> Optional[Dict]:
-    """DELETE 请求"""
-    url = f"{_get_base_url()}{endpoint}"
-    sess = _get_http_session()
-    try:
-        headers = _sign_v3(api_key, api_secret, api_passphrase, "DELETE", endpoint, params or {})
-        if _is_tunnel_active():
-            headers["Host"] = API_HOST
-        body = json.dumps(params or {}, separators=(",", ":"))
-        resp = sess.delete(url, data=body, headers=headers,
-                           timeout=TIMEOUT, verify=_get_verify_ssl())
-        return _parse_response(resp)
-    except requests.exceptions.Timeout:
-        logger.warning(f"Weex DELETE 超时: {endpoint}")
-        return None
-    except requests.exceptions.ConnectionError as e:
-        logger.warning(f"Weex 连接失败: {endpoint}: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Weex DELETE 异常: {endpoint}: {e}")
-        return None
+    """DELETE 请求（带 SSL 重试）"""
+    for attempt in range(_SSL_RETRY_MAX + 1):
+        try:
+            headers = _sign_v3(api_key, api_secret, api_passphrase, "DELETE", endpoint, params or {})
+            if _is_tunnel_active():
+                headers["Host"] = API_HOST
+            body = json.dumps(params or {}, separators=(",", ":"))
+            url = f"{_get_base_url()}{endpoint}"
+            sess = _get_http_session()
+            resp = sess.delete(url, data=body, headers=headers,
+                               timeout=TIMEOUT, verify=_get_verify_ssl())
+            return _parse_response(resp)
+        except requests.exceptions.SSLError as e:
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex SSL 错误 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+        except requests.exceptions.Timeout:
+            if attempt < _SSL_RETRY_MAX:
+                wait = _SSL_RETRY_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"Weex DELETE 超时 (attempt {attempt + 1}/{_SSL_RETRY_MAX + 1}), "
+                    f"{wait:.0f}s 后重试: {endpoint}"
+                )
+                _reset_socks_session()
+                time.sleep(wait)
+            else:
+                logger.error(f"Weex DELETE 超时重试耗尽: {endpoint}")
+                return None
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(f"Weex 连接失败: {endpoint}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Weex DELETE 异常: {endpoint}: {e}")
+            return None
+    logger.error(f"Weex DELETE SSL 重试耗尽 ({_SSL_RETRY_MAX + 1} 次): {endpoint}")
+    return None
 
 
 def _parse_response(resp: requests.Response) -> Optional[Dict]:

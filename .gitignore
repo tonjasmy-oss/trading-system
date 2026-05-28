@@ -47,7 +47,15 @@ Thumbs.db
 *.key
 .agent_token
 .dashboard.pid
+.live_daemon.pid
 
 # Results (keep structure, ignore large outputs)
 /backtest_results/
+
+# Data files (large JSON dumps)
+zec_*.json
+xaut_*.json
+
+# Session logs
+SESSION_LOG*.md
 /reports/

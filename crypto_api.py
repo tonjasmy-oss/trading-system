@@ -97,6 +97,8 @@ SYMBOL_MAP = {
     "APT": "APT/USDT",
     "ARB": "ARB/USDT",
     "OP": "OP/USDT",
+    "ZEC": "ZEC/USDT",
+    "HYPE": "HYPE/USDT",
 }
 
 # ccxt 支持的交易所 ID（均为公开接口，无需 API Key 即可获取行情）
