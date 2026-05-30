@@ -320,7 +320,7 @@ class TradingAgent:
         # 飞书主动推送开关（可配置）
         self._feishu_enabled = os.getenv("FEISHU_PUSH_ENABLED", "true").lower() == "true"
         # 实例级飞书推送器（允许外部注入，覆盖模块级默认值）
-        self._feishu = _feishu if not isinstance(_feishu, type(_feishu_sentinel)) else None
+        self._feishu = _feishu if _feishu is not _feishu_sentinel else None
 
         self.capital = initial_capital
         self.position: Optional[Dict] = None
@@ -1592,7 +1592,7 @@ class MultiAgentOrchestrator:
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self.live_trading = live_trading and _SHANGSHU_AVAILABLE
-        self._feishu = _feishu if not isinstance(_feishu, type(_feishu_sentinel)) else None
+        self._feishu = _feishu if _feishu is not _feishu_sentinel else None
         self._last_trade_time: float = time.time()  # 上次成交时间
         self._idle_alert_hours: float = float(os.getenv("IDLE_ALERT_HOURS", "12"))  # 无交易告警阈值
 
