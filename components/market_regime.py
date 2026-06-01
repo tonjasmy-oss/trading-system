@@ -78,6 +78,90 @@ def detect_volume(volume: float, volume_ma: float) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# 策略推荐引擎 — 基于市场状态推荐最优策略族
+# ─────────────────────────────────────────────────────────────
+
+# (trend, volatility) → [(strategy_name, fit_score, reason), ...]
+# fit_score: 0-100，表示策略与当前市场的适配度
+STRATEGY_RECOMMENDATIONS = {
+    ("uptrend", "high"): [
+        ("DONCHIAN",   95, "强趋势+高波动，通道突破捕捉主升浪"),
+        ("ATRSTOP",    90, "ATR动态止损，跟随趋势防止假突破"),
+        ("MULTIFACTOR", 80, "多因子确认，过滤高波动噪音"),
+        ("SMA",        60, "均线趋势跟随，但高波动下假信号增多"),
+    ],
+    ("uptrend", "medium"): [
+        ("DONCHIAN",   92, "中等趋势+波动，通道突破策略最优"),
+        ("SMA",        85, "均线趋势，中等波动下信号较可靠"),
+        ("ATRSTOP",    82, "趋势跟随+动态止损"),
+        ("MULTIFACTOR", 75, "多因子综合评分"),
+    ],
+    ("uptrend", "low"): [
+        ("SMA",        90, "低波动趋势市，均线策略简洁高效"),
+        ("DONCHIAN",   70, "低波动下突破信号少，但信号质量高"),
+        ("ATRSTOP",    65, "低波动ATR止损空间小"),
+    ],
+    ("downtrend", "high"): [
+        ("RSI",        88, "高波动下跌市，超卖反弹机会多"),
+        ("DONCHIAN",   75, "通道向下突破做空"),
+        ("BOLLINGER",  70, "布林带下轨反弹"),
+        ("FUNDING_ARB", 60, "高波动时资金费率套利有空间"),
+    ],
+    ("downtrend", "medium"): [
+        ("RSI",        85, "下跌趋势中捕捉超卖反弹"),
+        ("DONCHIAN",   72, "通道向下突破做空"),
+        ("KDJ",        68, "摆动指标捕捉底部"),
+    ],
+    ("downtrend", "low"): [
+        ("RSI",        80, "低波动下跌中抓反弹"),
+        ("KDJ",        72, "低波动下KDJ信号更精确"),
+        ("FUNDING_ARB", 65, "资金费率套利"),
+    ],
+    ("ranging", "high"): [
+        ("BOLLINGER",  92, "震荡市+高波动，布林带均值回归最优"),
+        ("ATRSTOP",    78, "ATR动态止损防止假突破"),
+        ("STAT_ARB",   65, "统计套利在震荡市中有效"),
+    ],
+    ("ranging", "medium"): [
+        ("BOLLINGER",  90, "震荡市均值回归，布林带首选"),
+        ("KDJ",        82, "摆动交易，捕捉区间高低点"),
+        ("RSI",        75, "超买超卖区间交易"),
+        ("FUNDING_ARB", 65, "资金费率套利"),
+    ],
+    ("ranging", "low"): [
+        ("KDJ",        88, "低波动震荡，摆动指标最优"),
+        ("BOLLINGER",  80, "窄幅布林带突破"),
+        ("FUNDING_ARB", 72, "低波动时套利稳定"),
+    ],
+}
+
+# 默认兜底
+FALLBACK_RECOMMENDATIONS = [
+    ("MACD", 60, "市场状态未知，回退到MACD"),
+]
+
+
+def recommend_strategies(trend: str, volatility: str, top_n: int = 3) -> list:
+    """
+    根据市场状态推荐策略族。
+    
+    Args:
+        trend: "uptrend" | "downtrend" | "ranging" | "unknown"
+        volatility: "high" | "medium" | "low" | "unknown"
+        top_n: 返回前 N 个推荐
+    
+    Returns:
+        [{"strategy": "BOLLINGER", "fit_score": 92, "reason": "..."}, ...]
+    """
+    key = (trend.lower(), volatility.lower())
+    recs = STRATEGY_RECOMMENDATIONS.get(key, FALLBACK_RECOMMENDATIONS)
+    return [
+        {"strategy": s, "fit_score": score, "reason": reason}
+        for s, score, reason in recs[:top_n]
+    ]
+
+
+# ─────────────────────────────────────────────────────────────
 # 主类
 # ─────────────────────────────────────────────────────────────
 
@@ -387,3 +471,16 @@ def backfill_regime(db_dir: str = ".", symbol: Optional[str] = None):
 
     logger.info(f"[MarketRegime] 批量标注完成: {updated} 条")
     return updated
+
+
+def score_strategy_fit(strategy_name: str, trend: str, volatility: str) -> int:
+    """
+    评估指定策略对当前市场状态的适配度（0-100）。
+    未在推荐列表中的策略默认得分为 30（不推荐）。
+    """
+    key = (trend.lower(), volatility.lower())
+    recs = STRATEGY_RECOMMENDATIONS.get(key, FALLBACK_RECOMMENDATIONS)
+    for s, score, _ in recs:
+        if s.upper() == strategy_name.upper():
+            return score
+    return 30  # 不在推荐列表中

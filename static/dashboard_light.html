@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Trading System · Light</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0d1117;color:#c9d1d9;min-height:100vh;-webkit-text-size-adjust:100%}
+.header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px}
+.header h1{font-size:16px;color:#58a6ff;white-space:nowrap}
+.header .status{font-size:11px;color:#8b949e;text-align:right}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;padding:10px;max-width:1400px;margin:0 auto}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;overflow:hidden}
+.card-header{background:#1c2129;padding:10px 14px;font-size:13px;font-weight:600;color:#58a6ff;border-bottom:1px solid #30363d;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card-body{padding:10px 14px}
+.row{display:flex;justify-content:space-between;padding:5px 0;font-size:13px;border-bottom:1px solid #21262d;gap:8px}
+.row:last-child{border-bottom:none}
+.row .label{color:#8b949e;flex-shrink:0}
+.row .value{color:#c9d1d9;font-weight:500;text-align:right;word-break:break-all}
+.value-up{color:#3fb950}
+.value-down{color:#f85149}
+.price-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px}
+.price-item{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:8px;text-align:center}
+.price-item .sym{font-size:11px;color:#8b949e}
+.price-item .prc{font-size:15px;font-weight:700;margin:3px 0}
+.price-item .chg{font-size:10px}
+.trades-table{width:100%;font-size:11px;border-collapse:collapse}
+.trades-table th{text-align:left;padding:5px 6px;color:#8b949e;border-bottom:1px solid #30363d;white-space:nowrap}
+.trades-table td{padding:4px 6px;border-bottom:1px solid #21262d;white-space:nowrap}
+.trades-table tr:hover{background:#1c2129}
+.full-width{grid-column:1/-1}
+.footer{text-align:center;padding:14px 10px 20px;font-size:11px;color:#484f58;border-top:1px solid #30363d;margin-top:10px;line-height:1.8}
+.refresh-btn{background:#21262d;color:#c9d1d9;border:1px solid #30363d;padding:5px 14px;border-radius:5px;cursor:pointer;font-size:12px;white-space:nowrap;min-height:32px;-webkit-tap-highlight-color:transparent}
+.refresh-btn:active{background:#30363d}
+a{color:#58a6ff;text-decoration:none;font-size:11px}
+a:active,a:hover{text-decoration:underline}
+.scroll-x{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -14px;padding:0 14px}
+.loading-text{color:#8b949e;font-size:12px;text-align:center;padding:12px 0}
+
+/* ── 手机适配 ── */
+@media (max-width: 600px) {
+  .header{padding:8px 10px}
+  .header h1{font-size:14px}
+  .header .status{font-size:10px;width:100%;text-align:left}
+  .grid{grid-template-columns:1fr;gap:8px;padding:8px}
+  .card-header{font-size:12px;padding:8px 10px}
+  .card-body{padding:8px 10px}
+  .row{font-size:12px;padding:4px 0}
+  .price-grid{grid-template-columns:repeat(2,1fr);gap:5px}
+  .price-item .prc{font-size:14px}
+  .trades-table{font-size:10px}
+  .trades-table th,.trades-table td{padding:3px 4px}
+  .refresh-btn{padding:4px 10px;font-size:11px;min-height:28px}
+  .footer{font-size:10px;padding:12px 8px 18px}
+}
+</style>
+</head>
+<body>
+<div class="header">
+  <div><h1>📊 Trading System <span style="font-size:11px;color:#8b949e;font-weight:400">Light</span></h1></div>
+  <div class="status" id="sysStatus">加载中...</div>
+</div>
+
+<div class="grid" id="app">
+  <div class="card">
+    <div class="card-header">💰 行情 <button class="refresh-btn" onclick="refresh()">刷新</button></div>
+    <div class="card-body"><div class="price-grid" id="prices"><div class="loading-text">加载中...</div></div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">📦 持仓</div>
+    <div class="card-body" id="positions"><div class="loading-text">加载中...</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">💵 资产</div>
+    <div class="card-body" id="portfolio"><div class="loading-text">加载中...</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">⚖️ 风控</div>
+    <div class="card-body" id="sansheng"><div class="loading-text">加载中...</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">🎯 策略</div>
+    <div class="card-body" id="signal"><div class="loading-text">加载中...</div></div>
+  </div>
+
+  <div class="card full-width">
+    <div class="card-header">📋 最近成交</div>
+    <div class="card-body scroll-x">
+      <table class="trades-table"><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>入场</th><th>出场</th><th>盈亏</th><th>原因</th></tr></thead>
+      <tbody id="trades"><tr><td colspan="7" class="loading-text">加载中...</td></tr></tbody></table>
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  <a href="/">完整版 Dashboard</a> &nbsp;|&nbsp; 自动刷新: <span id="refreshCountdown">30s</span>
+</div>
+
+<script>
+const API = '';
+let countdown = 30, timer = null;
+
+async function fetchJSON(url) {
+  try { const r = await fetch(API+url); if(!r.ok) throw new Error(r.status); return await r.json(); }
+  catch(e) { return {error:e.message}; }
+}
+
+function fmtUSD(v) { return '$'+Number(v||0).toFixed(2); }
+function fmtTime(ts) {
+  if(!ts) return '-';
+  var d = new Date(typeof ts==='number'?(ts>1e12?ts:ts*1000):ts);
+  return d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+}
+function cls(v) { return v>0?'value-up':v<0?'value-down':''; }
+function clsPct(v) { var c=cls(v); return c+'">'+(v>=0?'+':'')+(v*100).toFixed(2)+'%</span>'; }
+function show(id,html) { document.getElementById(id).innerHTML=html; }
+
+async function refresh() {
+  countdown=30;
+  show('refreshCountdown','刷新中...');
+
+  var results;
+  try {
+    results = await Promise.all([
+      fetchJSON('/api/system/status'),
+      fetchJSON('/api/market/prices'),
+      fetchJSON('/api/positions'),
+      fetchJSON('/api/portfolio/value'),
+      fetchJSON('/api/sansheng/status'),
+      fetchJSON('/api/trades?limit=20')
+    ]);
+  } catch(e) { results = []; }
+
+  var sys=results[0]||{}, prices=results[1]||[], positions=results[2]||{},
+      portfolio=results[3]||{}, sansheng=results[4]||{}, trades=results[5]||[];
+
+  // 系统状态
+  if(!sys.error) show('sysStatus','🟢 '+Math.floor(sys.uptime/3600)+'h '+Math.floor(sys.uptime%3600/60)+'m');
+
+  // 行情 - 展示系统所有已添加标的的实时行情
+  if(!prices.error && prices.length) {
+    var mktLabel={CN:'A股',HK:'港股',US:'美股',CRYPTO:'币'};
+    var h='';
+    prices.forEach(function(p) {
+      var c = p.change_pct || 0;
+      var symbol = p.symbol || '?';
+      var label = mktLabel[p.market] || p.market || '';
+      var cur = (p.market === 'CN' || p.market === 'HK') ? '¥' : '$';
+      h += '<div class="price-item">'
+        + '<div class="sym">' + symbol + ' <span style="font-size:9px;color:#484f58">' + label + '</span></div>'
+        + '<div class="prc ' + cls(c) + '">' + cur + Number(p.price||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4}) + '</div>'
+        + '<div class="chg ' + cls(c) + '">' + (c>=0?'+':'') + c.toFixed(2) + '%</div>'
+        + '</div>';
+    });
+    show('prices', h);
+  } else {
+    show('prices', '<div class="loading-text">暂无行情数据</div>');
+  }
+
+  // 持仓
+  var pl=Array.isArray(positions)?positions:(positions.positions||[]);
+  if(pl.length===0) show('positions','<div class="row"><span class="label">状态</span><span class="value">空仓</span></div>');
+  else { h=''; pl.forEach(function(p){ var pnl=p.pnl_pct||0;
+    h+='<div class="row"><span class="label">'+(p.symbol||p.pair||'-')+'</span><span class="value">'+(p.side||'long')+' @ '+fmtUSD(p.entry_price||0)+'</span><span class="value '+cls(pnl)+'">'+(pnl>=0?'+':'')+(pnl*100).toFixed(2)+'%</span></div>'; });
+    show('positions',h); }
+
+  // 资产
+  if(!portfolio.error) { var tp=portfolio.total_pnl_pct||0;
+    show('portfolio','<div class="row"><span class="label">成本</span><span class="value">'+fmtUSD(portfolio.total_cost||0)+'</span></div><div class="row"><span class="label">市值</span><span class="value">'+fmtUSD(portfolio.total_value||0)+'</span></div><div class="row"><span class="label">盈亏</span><span class="value '+cls(tp)+'">'+(tp>=0?'+':'')+(tp*100).toFixed(2)+'%</span></div>'); }
+
+  // 风控
+  if(!sansheng.error) { var m=sansheng.menxia||{}, lm={normal:'🟢 正常',warning:'🟡 警告',danger:'🔴 危险',locked:'⛔ 锁定'};
+    show('sansheng','<div class="row"><span class="label">等级</span><span class="value">'+(lm[m.level]||m.level||'-')+'</span></div><div class="row"><span class="label">日亏损</span><span class="value">'+(m.daily_loss_pct||0).toFixed(2)+'%</span></div><div class="row"><span class="label">暴露</span><span class="value">'+(m.exposure_pct||0).toFixed(2)+'%</span></div><div class="row"><span class="label">持仓</span><span class="value">'+(m.open_positions||0)+' 个</span></div><div class="row"><span class="label">今交易</span><span class="value">'+(m.daily_trades||0)+' 笔</span></div><div class="row"><span class="label">可开</span><span class="value">'+(m.can_open?'✅':'❌')+'</span></div><div class="row"><span class="label">执行</span><span class="value">'+(sansheng.shangshu_available?'✅ Weex 实盘':'⚠️ 不可用')+'</span></div>'); }
+
+  // 策略信号
+  try {
+    var as=await fetchJSON('/api/agent/symbols');
+    if(as.agents && as.agents.length) {
+      var ag='';
+      as.agents.forEach(function(a,i){
+        ag+='<div class="row"><span class="label">'+(a.strategy||'?')+'</span><span class="value">'+(a.symbol||'?')+' @ '+(a.timeframe||'?')+'</span></div>';
+      });
+      ag+='<div class="row"><span class="label">Agent</span><span class="value">'+as.count+' 个运行中</span></div>';
+      show('signal',ag);
+    } else {
+      show('signal','<div class="row"><span class="label">信号</span><span class="value">等待</span></div>');
+    }
+  } catch(e) {
+    show('signal','<div class="row"><span class="label">引擎</span><span class="value">运行中</span></div><div class="row"><span class="label">策略</span><span class="value">ch=30 ema=10 sl=3% tp=5%</span></div><div class="row"><span class="label">周期</span><span class="value">2h 双向</span></div>');
+  }
+
+  // 成交
+  var tl=Array.isArray(trades)?trades.slice(0,20):[];
+  if(tl.length===0) show('trades','<tr><td colspan="7" style="text-align:center;color:#8b949e;white-space:normal">暂无成交</td></tr>');
+  else { h=''; tl.forEach(function(t){ var pnl=t.pnl_pct||0, dir=t.side||(t.quantity>0?'long':'short');
+    h+='<tr><td>'+fmtTime(t.exit_time||t.entry_time)+'</td><td>'+(t.symbol||'-')+'</td><td class="'+(dir==='long'?'value-up':'value-down')+'">'+dir+'</td><td>'+fmtUSD(t.entry_price||0)+'</td><td>'+fmtUSD(t.exit_price||0)+'</td><td class="'+cls(pnl)+'">'+(pnl>=0?'+':'')+(pnl*100).toFixed(2)+'%</td><td>'+(t.exit_reason||t.reason||'-')+'</td></tr>'; });
+    show('trades',h); }
+
+  show('refreshCountdown','30s');
+}
+
+setInterval(function(){
+  countdown--;
+  show('refreshCountdown',countdown+'s');
+  if(countdown<=0) refresh();
+},1000);
+
+refresh();
+</script>
+</body>
+</html>

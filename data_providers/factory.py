@@ -30,7 +30,6 @@ class DataProviderFactory:
         "CRYPTO": CryptoDataProvider,
         "CN_STOCK": StockDataProvider,
         "HK_STOCK": StockDataProvider,
-        "US_STOCK": StockDataProvider,
         "US_STOCK": USStockProvider,
         "STOCK": StockDataProvider,
         "FOREX": ForexProvider,

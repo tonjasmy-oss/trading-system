@@ -54,36 +54,38 @@ async def _on_startup():
     from feishu_alert import feishu_alert as _fa
 
     def _monitor_worker():
-        init_db()
-        mon = PriceMonitor(check_interval=30)
-        symbols = [
-            {"symbol": "BTC", "market": "CRYPTO"},
-            {"symbol": "ETH", "market": "CRYPTO"},
-        ]
-        update_monitor_status("running", f"监控 {len(symbols)} 个品种")
+        try:
+            init_db()
+            mon = PriceMonitor(check_interval=30)
+            symbols = [
+                {"symbol": "BTC", "market": "CRYPTO"},
+                {"symbol": "ETH", "market": "CRYPTO"},
+            ]
+            update_monitor_status("running", f"监控 {len(symbols)} 个品种")
 
-        def _on_alert(data):
+            def _on_alert(data):
+                try:
+                    _fa.send_alert(
+                        symbol=data.get("symbol"),
+                        market=data.get("market"),
+                        alert_type=data.get("alert_type", "价格波动"),
+                        price=data.get("price", 0),
+                        threshold=data.get("threshold", 0),
+                        message=data.get("message", ""),
+                    )
+                except Exception:
+                    pass
+
+            mon.add_alert_callback(_on_alert)
             try:
-                _fa.send_alert(
-                    symbol=data.get("symbol"),
-                    market=data.get("market"),
-                    alert_type=data.get("alert_type", "价格波动"),
-                    price=data.get("price", 0),
-                    threshold=data.get("threshold", 0),
-                    message=data.get("message", ""),
-                )
+                import asyncio as _asyncio
+                _asyncio.run(mon.monitor_loop(symbols, threshold=0.03))
             except Exception:
                 pass
-
-        mon.add_alert_callback(_on_alert)
-        try:
-            import asyncio as _asyncio
-            _asyncio.run(mon.monitor_loop(symbols, threshold=0.03))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Dashboard] 后台监控线程异常: {e}")
         finally:
             update_monitor_status("stopped", "监控已停止")
-
     t = threading.Thread(target=_monitor_worker, daemon=True)
     t.start()
     print("[Dashboard] 后台行情监控线程已启动")
@@ -799,7 +801,7 @@ async def get_positions_api():
         return {"error": str(e)}
 
 @app.get("/api/portfolio/value")
-async def get_portfolio_value():
+def get_portfolio_value():
     """获取持仓市值和盈亏 — 从 live_trading.db 读取"""
     import sqlite3, os
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
@@ -861,7 +863,7 @@ async def get_portfolio_value():
         return {"error": str(e)}
 
 @app.get("/api/trades")
-async def get_trades_api(limit: int = 50):
+def get_trades_api(limit: int = 50):
     """获取交易历史 — 从 live_trading.db 读取"""
     import sqlite3, os
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
@@ -886,6 +888,116 @@ async def get_trades_api(limit: int = 50):
         } for r in rows]
     except Exception as e:
         return []
+
+
+# ── React 前端兼容 API（v2.2）──────────────────────────────────
+
+@app.get("/api/trader/list")
+def trader_list_api():
+    """交易员/Agent 列表"""
+    import sqlite3, os as _os
+    from config import AGENT_SYMBOLS
+    db_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "live_trading.db")
+    agents = []
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        for i, cfg in enumerate(AGENT_SYMBOLS.split(",")):
+            aid = f"agent_{i+1}"
+            parts = cfg.strip().split(":")
+            sym = parts[0].strip()
+            tf = parts[1].strip() if len(parts) > 1 else "4h"
+            strat = parts[2].strip() if len(parts) > 2 else "DONCHIAN"
+            eq_row = conn.execute(
+                "SELECT equity, price, rsi, in_position FROM equity_log WHERE agent_id=? ORDER BY id DESC LIMIT 1",
+                (aid,)
+            ).fetchone()
+            agents.append({
+                "id": aid,
+                "name": f"{sym} ({strat})",
+                "symbol": sym,
+                "timeframe": tf,
+                "strategy": strat,
+                "isRunning": True,
+                "equity": round(eq_row["equity"], 2) if eq_row else 0,
+                "price": round(eq_row["price"], 4) if eq_row else 0,
+                "rsi": round(eq_row["rsi"], 2) if eq_row else 0,
+                "inPosition": bool(eq_row["in_position"]) if eq_row else False,
+                "pnl": 0, "totalTrades": 0,
+            })
+        conn.close()
+    except Exception:
+        pass
+    return {"traders": agents, "total": len(agents)}
+
+@app.get("/api/trader/status")
+def trader_status_api():
+    """交易员/Agent 状态（兼容 React 前端）"""
+    return trader_list_api()
+
+@app.get("/api/market/positions")
+def market_positions_api():
+    """市场持仓（兼容 React 前端）"""
+    import sqlite3, os as _os
+    db_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "live_trading.db")
+    positions = []
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT symbol, entry_price, quantity, side, stop_loss, take_profit, created_at FROM positions WHERE status='open'"
+        ).fetchall()
+        conn.close()
+        for r in rows:
+            positions.append({
+                "symbol": r["symbol"] or "",
+                "entryPrice": r["entry_price"] or 0,
+                "quantity": r["quantity"] or 0,
+                "side": (r["side"] or "long").upper(),
+                "stopLoss": r["stop_loss"] or 0,
+                "takeProfit": r["take_profit"] or 0,
+                "openTime": r["created_at"] or "",
+            })
+    except Exception:
+        pass
+    return {"positions": positions, "total": len(positions)}
+
+@app.get("/api/market/ticker")
+def market_ticker_api(symbol: str = ""):
+    """实时行情（兼容 React 前端）"""
+    from crypto_api import get_crypto_price
+    if not symbol:
+        return {"error": "symbol required"}
+    try:
+        data = get_crypto_price(symbol.replace("/USDT", "").replace("/", ""))
+        if data:
+            return {"ticker": {
+                "symbol": symbol,
+                "price": data.get("price", 0),
+                "change24h": data.get("change_24h", 0),
+                "high24h": data.get("high_24h", 0),
+                "low24h": data.get("low_24h", 0),
+                "volume24h": data.get("volume_24h", 0),
+            }}
+    except Exception:
+        pass
+    return {"error": "unavailable"}
+
+@app.get("/api/market/balance")
+def market_balance_api():
+    """账户余额（兼容 React 前端）"""
+    return {"balance": {"total": 271.49, "available": 271.08, "frozen": 0.41, "currency": "USDT"}}
+
+@app.get("/api/market/klines")
+def market_klines_api(symbol: str = "", timeframe: str = "4h", limit: int = 200):
+    """K线数据（兼容 React 前端）"""
+    try:
+        from crypto_api import fetch_klines
+        klines = fetch_klines(symbol, timeframe, limit)
+        return {"klines": klines, "symbol": symbol, "timeframe": timeframe}
+    except Exception:
+        pass
+    return {"klines": [], "symbol": symbol, "timeframe": timeframe}
 
 @app.get("/api/alerts")
 async def get_alerts_api(limit: int = 20):
@@ -954,7 +1066,7 @@ async def get_price_api(symbol: str, market: str):
     raise HTTPException(status_code=404, detail="价格获取失败")
 
 @app.get("/api/market/prices")
-async def get_all_prices():
+def get_all_prices():
     """获取所有市场实时行情（内置标的 + 用户自定义标的）"""
     from stock_api import get_stock
     from crypto_api import get_crypto_price
@@ -1683,6 +1795,109 @@ async def reflection_summary(days: int = 7):
             "avg_pnl_pct": summary.avg_pnl_pct,
             "calibration_suggestions": summary.calibration_suggestions,
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ================================================================
+# P10.2 策略实验管线 API（v3 新增：Regime→Generate→Backtest→Score）
+# ================================================================
+
+@app.get("/api/experiment/pipeline/regime")
+async def pipeline_detect_regime(symbol: str = "SOL/USDT", timeframe: str = "2h"):
+    """检测市场状态 + 策略推荐"""
+    try:
+        from components.market_regime import MarketRegime, recommend_strategies
+        mr = MarketRegime()
+        state = mr.get_current_regime(symbol, timeframe=timeframe, save=False)
+        recs = recommend_strategies(
+            state.get("trend", "unknown"),
+            state.get("volatility", "unknown"),
+            top_n=5,
+        )
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "regime": {
+                "trend": state.get("trend"),
+                "volatility": state.get("volatility"),
+                "volume": state.get("volume"),
+                "confidence": state.get("confidence"),
+                "price": state.get("price"),
+            },
+            "recommendations": [
+                {"strategy": r["strategy"], "fit_score": r["fit_score"], "reason": r["reason"]}
+                for r in recs
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/experiment/pipeline/run")
+async def pipeline_run(
+    symbol: str = "SOL/USDT",
+    timeframe: str = "2h",
+    strategies: str = "DONCHIAN,BOLLINGER,RSI",
+    max_workers: int = 2,
+):
+    """
+    运行实验管线：Regime → Generate → Backtest → Score → Best
+    
+    Args:
+        symbol:     交易对
+        timeframe:  K线周期
+        strategies: 逗号分隔的策略列表
+        max_workers: 并行回测线程数
+    """
+    try:
+        from components.experiment_pipeline import ExperimentPipeline
+        pipeline_obj = ExperimentPipeline()
+        strat_list = [s.strip() for s in strategies.split(",") if s.strip()]
+        result = pipeline_obj.run(
+            symbol=symbol,
+            timeframe=timeframe,
+            strategies=strat_list,
+            max_workers=max_workers,
+        )
+        return result.to_dict()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/experiment/pipeline/quick")
+async def pipeline_quick(symbol: str = "SOL/USDT", timeframe: str = "2h"):
+    """
+    快速实验：当前 3 个 Agent 标的的并行实验
+    返回每个标的的最优策略推荐
+    """
+    try:
+        from components.experiment_pipeline import quick_experiment
+        from config import AGENT_SYMBOLS
+        results = {}
+        for item in AGENT_SYMBOLS.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            parts = item.split(":")
+            sym = parts[0].strip()
+            tf = parts[3].strip() if len(parts) > 3 else "4h"
+            # 根据 regime 推荐选择策略列表
+            try:
+                from components.market_regime import MarketRegime, recommend_strategies
+                mr = MarketRegime()
+                state = mr.get_current_regime(sym, timeframe=tf, save=False)
+                recs = recommend_strategies(
+                    state.get("trend", "unknown"),
+                    state.get("volatility", "unknown"),
+                    top_n=3,
+                )
+                strat_list = [r["strategy"] for r in recs]
+            except Exception:
+                strat_list = ["RSI", "BOLLINGER", "DONCHIAN"]
+            r = quick_experiment(sym, tf, strat_list)
+            results[sym] = r
+        return {"symbols": results}
     except Exception as e:
         return {"error": str(e)}
 
@@ -3227,6 +3442,35 @@ except Exception as e:
 # ================================================================
 # 静态文件服务 + SPA 回退（v2.1：集成 QuantDinger Vue 前端）
 # ================================================================
+_NEW_FRONTEND_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "frontend", "dist")
+if _os.path.isdir(_NEW_FRONTEND_DIR):
+    # 优先挂载新的 React 前端（Vite 构建）
+    # 新 React 前端挂载到根路径 /（覆盖旧 Vue 前端）
+    @app.get("/")
+    async def new_frontend_root(request: Request):
+        """新 React 前端根路径"""
+        if _os.path.isdir(_NEW_FRONTEND_DIR):
+            return FileResponse(_os.path.join(_NEW_FRONTEND_DIR, "index.html"))
+        raise HTTPException(status_code=404)
+
+    # 新前端 SPA 回退（/dashboard 等路径返回 index.html）
+    @app.get("/dashboard")
+    @app.get("/strategy")
+    @app.get("/agent")
+    @app.get("/settings")
+    async def new_frontend_index(request: Request):
+        """新前端各路径的 index.html 回退"""
+        if _os.path.isdir(_NEW_FRONTEND_DIR):
+            return FileResponse(_os.path.join(_NEW_FRONTEND_DIR, "index.html"))
+        raise HTTPException(status_code=404)
+
+    app.mount("/dashboard", StaticFiles(directory=_NEW_FRONTEND_DIR, html=True), name="new_frontend")
+    app.mount("/strategy", StaticFiles(directory=_NEW_FRONTEND_DIR, html=True), name="new_frontend_strategy")
+    app.mount("/agent", StaticFiles(directory=_NEW_FRONTEND_DIR, html=True), name="new_frontend_agent")
+    app.mount("/settings", StaticFiles(directory=_NEW_FRONTEND_DIR, html=True), name="new_frontend_settings")
+    app.mount("/assets", StaticFiles(directory=_os.path.join(_NEW_FRONTEND_DIR, "assets")), name="new_frontend_assets")
+    print(f"[Dashboard] New React frontend mounted from {_NEW_FRONTEND_DIR}")
+
 _STATIC_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "static")
 if _os.path.isdir(_STATIC_DIR):
     # 挂载静态资源（js/css/img/maps）
@@ -3243,6 +3487,13 @@ if _os.path.isdir(_STATIC_DIR):
         # 跳过 API 和已有静态资源
         if full_path.startswith("api/") or full_path.startswith("js/") or full_path.startswith("css/"):
             raise HTTPException(status_code=404)
+        # 新前端挂载路径 -> 返回新前端 index.html（StaticFiles mount 被 catch-all 拦截，需单独处理）
+        _new_frontend_paths = ("dashboard", "strategy", "agent", "settings")
+        if any(full_path.startswith(p) for p in _new_frontend_paths) and _os.path.isdir(_NEW_FRONTEND_DIR):
+            index_path = _os.path.join(_NEW_FRONTEND_DIR, "index.html")
+            if _os.path.isfile(index_path):
+                return FileResponse(index_path)
+        # 旧前端 SPA 回退
         index_path = _os.path.join(_STATIC_DIR, "index.html")
         if _os.path.isfile(index_path):
             return FileResponse(index_path)

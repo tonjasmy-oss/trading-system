@@ -56,6 +56,7 @@ from config import (
     STAT_ARB_Z_EXIT, STAT_ARB_Z_LOSS,
     BLACK_SWAN_DROP_PCT, MAX_DRAWDOWN_LOCK_PCT,
     ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER,
+    STRATEGY_AUTO_ROTATE,
 )
 from crypto_api import (
     get_crypto_price, get_ohlcv,
@@ -148,6 +149,17 @@ try:
     _feishu = FeishuAlert()
 except Exception:
     logger.warning("飞书推送模块加载失败，将不发送主动通知")
+
+# 多通道通知（Telegram/Discord/Email/Webhook）
+_notify_mgr = None
+try:
+    from notify import get_notifier
+    _notify_mgr = get_notifier()
+    channels = _notify_mgr.channels if _notify_mgr else []
+    if channels:
+        logger.info(f"多通道通知已启用: {channels}")
+except Exception:
+    pass
 
 # ============================================================
 # 常量
@@ -321,6 +333,7 @@ class TradingAgent:
         self._feishu_enabled = os.getenv("FEISHU_PUSH_ENABLED", "true").lower() == "true"
         # 实例级飞书推送器（允许外部注入，覆盖模块级默认值）
         self._feishu = _feishu if _feishu is not _feishu_sentinel else None
+        self._notify_mgr = _notify_mgr  # 多通道通知管理器
 
         self.capital = initial_capital
         self.position: Optional[Dict] = None
@@ -336,15 +349,18 @@ class TradingAgent:
             except Exception as e:
                 logger.warning(f"[{agent_id}] AI 过滤器初始化失败: {e}")
 
-        # 策略轮动器（strategy=AUTO 时使用）
+        # 策略轮动器 — 始终初始化用于市场适配评估与日志推荐
+        # 自动切换仅在 strategy=AUTO 或 STRATEGY_AUTO_ROTATE=true 时生效
         self._rotator = None
-        if strategy == "AUTO":
-            try:
-                from components.strategy_rotator import StrategyRotator
-                self._rotator = StrategyRotator(symbol=symbol)
-                logger.info(f"[{agent_id}] 策略轮动器已启用")
-            except ImportError:
-                logger.warning(f"[{agent_id}] 策略轮动器不可用，回退到MACD")
+        self._auto_rotate_enabled = (strategy == "AUTO" or STRATEGY_AUTO_ROTATE)
+        try:
+            from components.strategy_rotator import StrategyRotator
+            self._rotator = StrategyRotator(symbol=symbol, stability=3)
+            mode = "自动轮动" if self._auto_rotate_enabled else "推荐模式(仅日志)"
+            logger.info(f"[{agent_id}] 策略轮动器已启用（{mode}）")
+        except ImportError:
+            logger.warning(f"[{agent_id}] 策略轮动器不可用")
+        self._hold_streak: int = 0  # 连续 HOLD 计数器（用于检测策略不适配）
 
         # 多周期信号确认器
         self._mtf_confirmer = None
@@ -890,11 +906,21 @@ class TradingAgent:
             self._feishu.send_position_alert(
                 symbol=self.symbol,
                 side=display_side_open,
-                price=exec_price,
+                price=safe_entry,
                 quantity=quantity,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                reason=f"AI验证:{ai_verdict}" if ai_verdict else "",
+                reason=f"策略: {self.strategy_name}"
+            )
+        if self._notify_mgr and self._feishu_enabled:
+            self._notify_mgr.position_alert(
+                symbol=self.symbol,
+                side=display_side_open,
+                price=safe_entry,
+                quantity=quantity,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                reason=f"策略: {self.strategy_name}"
             )
 
         logger.info(
@@ -1001,6 +1027,15 @@ class TradingAgent:
         display_close_side_c = "BUY" if pos_side_c == "short" else "SELL"
         if self._feishu and self._feishu_enabled:
             self._feishu.send_position_alert(
+                symbol=self.symbol,
+                side=display_close_side_c,
+                price=exec_price,
+                quantity=quantity,
+                pnl_pct=pnl_pct,
+                reason=reason,
+            )
+        if self._notify_mgr and self._feishu_enabled:
+            self._notify_mgr.position_alert(
                 symbol=self.symbol,
                 side=display_close_side_c,
                 price=exec_price,
@@ -1154,17 +1189,51 @@ class TradingAgent:
                 }
                 result["market_regime"] = regime_info
 
-                # ── 策略轮动：根据市场状态自动选择策略 ──
+                # ── 策略适配度评估 & 推荐 ──
                 if self._rotator and regime_state:
-                    pick = self._rotator.pick(regime_state)
-                    new_strategy = pick["strategy"]
-                    if new_strategy != self.strategy_name:
-                        logger.info(f"[{self.agent_id}] 策略轮动: {self.strategy_name} → {new_strategy} "
-                                    f"({pick['reason']})")
-                        self.strategy_name = new_strategy
-                        self.strategy_obj = self._build_strategy(new_strategy, pick.get("kwargs", {}))
-                        result["strategy"] = new_strategy
-                        result["rotation"] = pick
+                    current_fit = self._rotator.score_fit(
+                        self.strategy_name,
+                        regime_state.get("trend", "unknown"),
+                        regime_state.get("volatility", "unknown"),
+                    )
+                    regime_info["current_strategy_fit"] = current_fit
+
+                    # 获取更好的策略推荐
+                    better = self._rotator.get_better_strategies(
+                        self.strategy_name, regime_state, top_n=3
+                    )
+                    if better:
+                        regime_info["recommended_strategies"] = better
+
+                    # 仅 strategy=AUTO 时自动轮动；否则仅记录推荐
+                    if self.strategy_name == "AUTO":
+                        pick = self._rotator.pick(regime_state)
+                        new_strategy = pick["strategy"]
+                        if new_strategy != self.strategy_name:
+                            logger.info(f"[{self.agent_id}] 策略轮动: {self.strategy_name} → {new_strategy} "
+                                        f"({pick['reason']})")
+                            self.strategy_name = new_strategy
+                            self.strategy_obj = self._build_strategy(new_strategy, pick.get("kwargs", {}))
+                            result["strategy"] = new_strategy
+                            result["rotation"] = pick
+                    elif self._auto_rotate_enabled and better:
+                        # 当当前策略适配度 < 40 且连续 HOLD > 10 次时，自动切换到最佳推荐
+                        if current_fit < 40 and self._hold_streak > 10:
+                            best = better[0]
+                            logger.warning(
+                                f"[{self.agent_id}] ⚠️ 策略不适配: {self.strategy_name} 适配度={current_fit}, "
+                                f"连续HOLD={self._hold_streak}次 → 自动切换为 {best['strategy']} "
+                                f"(适配度={best['fit_score']}, {best['reason']})"
+                            )
+                            old_strategy = self.strategy_name
+                            self.strategy_name = best["strategy"]
+                            self.strategy_obj = self._build_strategy(best["strategy"])
+                            result["strategy"] = best["strategy"]
+                            result["rotation"] = {
+                                "from": old_strategy, "to": best["strategy"],
+                                "reason": best["reason"], "fit_score": best["fit_score"],
+                            }
+                            self._hold_streak = 0
             except Exception as e:
                 logger.warning(f"[{self.agent_id}] MarketRegime 获取失败: {e}")
 
@@ -1414,7 +1483,24 @@ class TradingAgent:
         self._log_equity(current_ts, current_price, equity, rsi)
         self._log_signal(signal_names.get(signal_val, "HOLD"), current_price, rsi, result["ai_verdict"])
 
+        # ── 连续 HOLD 计数（用于检测策略不适配）──
+        if signal_val == Signal.HOLD:
+            self._hold_streak += 1
+        else:
+            self._hold_streak = 0
+
         # ── 决策链结构化摘要日志 ──
+        regime_rec = ""
+        if self._rotator and regime_info:
+            current_fit = regime_info.get("current_strategy_fit", 0)
+            regime_rec = f" | 市场={regime_info.get('trend','?')}/{regime_info.get('volatility','?')} 策略适配={current_fit}"
+            # 连续 HOLD 较多时，追加策略推荐提示
+            if self._hold_streak >= 5 and current_fit < 50:
+                better_list = regime_info.get("recommended_strategies", [])
+                if better_list:
+                    top_rec = better_list[0]
+                    regime_rec += f" 💡推荐: {top_rec['strategy']}(适配{top_rec['fit_score']}){'(将自动切换)' if self._auto_rotate_enabled else ''}"
+
         decision_chain = {
             "raw": signal_names.get(signal_val, "HOLD"),
             "ai_filter": ai_verdict or "N/A",
@@ -1428,6 +1514,7 @@ class TradingAgent:
             f"技术={decision_chain['raw']} → AI={decision_chain['ai_filter']} → "
             f"门下={decision_chain['menxia']} → 路由={decision_chain['signal_router']} → "
             f"趋势={decision_chain['trend_filter']} → 最终={decision_chain['final']}"
+            f"{regime_rec}"
         )
 
         # 持仓状态
@@ -1541,6 +1628,21 @@ class TradingAgent:
                 self.capital -= cost  # 做多：支付买入成本
             logger.info("[%s] 恢复未平持仓: %s 价格 $%.2f  数量 %.6f",
                         self.agent_id, row[0], row[1], row[5])
+            # 注册恢复的持仓到门下省，确保风控超时检查生效（2026-05-31 修复）
+            if self.menxia:
+                try:
+                    self.menxia.record_open(
+                        self.symbol,
+                        self.position["entry_price"],
+                        self.position["quantity"],
+                        self.position["stop_loss"],
+                        self.position["take_profit"],
+                        side=self.position.get("side", "long"),
+                        entry_time=self.position.get("entry_time", 0),
+                    )
+                    logger.info("[%s] 已将恢复的持仓注册到门下省", self.agent_id)
+                except Exception as e:
+                    logger.warning("[%s] 注册恢复持仓到门下省失败: %s", self.agent_id, e)
 
     def _log_equity(self, timestamp: int, price: float, equity: float, rsi: float):
         conn = sqlite3.connect(DB_PATH)
@@ -1599,21 +1701,28 @@ class MultiAgentOrchestrator:
         # ── 门下省：风控审核服务（所有 Agent 共享）──
         self.menxia: Optional[MenxiaSheng] = None
         if _MENXIA_AVAILABLE:
-            # 飞书告警回调（风控等级变化时推送到群）
+            # 飞书告警回调（风控等级变化时推送到群 + 多通道通知）
             def _risk_alert(level: str, msg: str):
+                daily_loss = getattr(self.menxia, '_daily_loss', 0.0) * 100
+                total_exp = 0.0
+                try:
+                    status = self.menxia.get_status()
+                    total_exp = status.get('total_exposure_pct', 0.0)
+                except Exception:
+                    pass
                 if self._feishu:
-                    daily_loss = getattr(self.menxia, '_daily_loss', 0.0) * 100
-                    total_exp = 0.0
-                    try:
-                        status = self.menxia.get_status()
-                        total_exp = status.get('total_exposure_pct', 0.0)
-                    except Exception:
-                        pass
                     self._feishu.send_risk_alert(
                         level=level,
                         message=msg,
                         daily_loss_pct=daily_loss,
                         total_exposure_pct=total_exp,
+                    )
+                if _notify_mgr:
+                    _notify_mgr.risk_alert(
+                        level=level,
+                        message=msg,
+                        daily_loss_pct=daily_loss,
+                        exposure_pct=total_exp,
                     )
 
             self.menxia = MenxiaSheng(
@@ -1627,8 +1736,6 @@ class MultiAgentOrchestrator:
             self.menxia.MAX_POSITION_PER_SYMBOL = RISK_MAX_POSITION_PER_SYMBOL
             self.menxia.MAX_DAILY_TRADES = RISK_MAX_DAILY_TRADES
             self.menxia.MAX_HOLDING_HOURS = RISK_MAX_HOLDING_HOURS
-            logger.info(f"[门下省] 初始化: 单日亏损>{RISK_MAX_DAILY_LOSS_PCT*100:.0f}%禁止开仓, "
-                       f"总暴露>{RISK_MAX_TOTAL_EXPOSURE*100:.0f}%禁止开仓")
 
         # ── 尚书省：执行调度服务 ──
         self.shangshu: Optional[ShangshuSheng] = None
@@ -1654,6 +1761,15 @@ class MultiAgentOrchestrator:
                 self.shangshu = None
 
         self._parse_and_create_agents()
+
+        # ── 根据 Agent 数量自动均分总暴露度 ──
+        # 公式: 单标的 = 总暴露 / Agent 数量（均分）
+        if self.menxia and self.agents:
+            per_symbol = self.menxia.MAX_TOTAL_EXPOSURE / len(self.agents)
+            self.menxia.MAX_POSITION_PER_SYMBOL = per_symbol
+            LIVE_ORDER_CAPITAL_PCT = per_symbol
+            logger.info(f"[门下省] 动态均分: 总暴露={self.menxia.MAX_TOTAL_EXPOSURE*100:.0f}% "
+                       f"/ {len(self.agents)} 标的 = {per_symbol*100:.1f}%/标的")
         logger.info(f"多 Agent 编排器已初始化: {len(self.agents)} 个 Agent | "
                    f"实盘: {'是' if self.live_trading else '否（模拟）'}")
 

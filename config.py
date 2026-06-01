@@ -77,7 +77,8 @@ OPTIMAL_PARAMS = {
     "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
     "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.03, take_profit=0.05,
                       channel_period=30, trend_ema_period=10),  # Donchian 2h Grid Search 2026-05-22
-    "XAUT/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),  # Weex回测最优
+    "XAUT/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.030,
+                      channel_period=14, trend_ema_period=30),  # Donchian 2h窄参数 回测2026-05-30: +40.53% 夏普0.99
     # KYVE/USDT, PYTH/USDT: 无交易所历史数据（数据不足0条），暂沿用全局默认值 stop_loss=0.025 take_profit=0.050
 }
 
@@ -132,6 +133,8 @@ AGENT_SYMBOLS = os.getenv(
 # --- 尚书省：实盘执行配置 ---
 # 是否启用实盘交易（true=真实下单，false=模拟）
 LIVE_TRADING_ENABLED = os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true"
+# 是否启用市场感知策略自动轮动（当当前策略适配度<40且连续HOLD>10次时自动切换）
+STRATEGY_AUTO_ROTATE = os.getenv("STRATEGY_AUTO_ROTATE", "false").lower() == "true"
 # 实盘交易所：binance / gateio / bybit / bitget / hyperliquid / weex
 LIVE_EXCHANGE = os.getenv("LIVE_EXCHANGE", "binance")
 # 实盘 API Key（建议使用只读+交易权限的 Trade-only Key）
@@ -158,8 +161,8 @@ LIVE_INITIAL_CAPITAL = float(os.getenv("LIVE_INITIAL_CAPITAL", "10000.0"))
 RISK_MAX_DAILY_LOSS_PCT = float(os.getenv("RISK_MAX_DAILY_LOSS_PCT", "0.05"))
 # 单日亏损 > 10% → LOCK（全系统停止）
 RISK_MAX_DAILY_LOSS_LOCK = float(os.getenv("RISK_MAX_DAILY_LOSS_LOCK", "0.10"))
-# 总持仓暴露度上限（默认 30%）
-RISK_MAX_TOTAL_EXPOSURE = float(os.getenv("RISK_MAX_TOTAL_EXPOSURE", "0.30"))
+# 总持仓暴露度上限（默认 45%，自动均分到各标的）
+RISK_MAX_TOTAL_EXPOSURE = float(os.getenv("RISK_MAX_TOTAL_EXPOSURE", "0.45"))
 # 单标的持仓上限（默认 15%）
 RISK_MAX_POSITION_PER_SYMBOL = float(os.getenv("RISK_MAX_POSITION_PER_SYMBOL", "0.15"))
 # 单日最大开仓次数

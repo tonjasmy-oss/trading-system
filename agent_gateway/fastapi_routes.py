@@ -3,7 +3,8 @@ Agent Gateway FastAPI 路由
 将 QuantDinger 风格的 Agent API 集成到 FastAPI
 """
 
-from fastapi import APIRouter, Query, Path, Header, HTTPException
+from fastapi import APIRouter, Query, Path, Header, HTTPException, Depends
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 import time
@@ -62,7 +63,7 @@ def require_scope(agent: dict, required_scope: str):
 # ============================================================
 
 @agent_router.get("/whoami")
-async def whoami(agent: dict = verify_agent_token):
+async def whoami(agent: dict = Depends(verify_agent_token)):
     """返回Agent身份"""
     return {
         "data": {
@@ -75,7 +76,7 @@ async def whoami(agent: dict = verify_agent_token):
 
 
 @agent_router.get("/markets")
-async def list_markets(agent: dict = verify_agent_token):
+async def list_markets(agent: dict = Depends(verify_agent_token)):
     """列出允许的市场"""
     require_scope(agent, SCOPE_R)
     
@@ -94,7 +95,7 @@ async def market_symbols(
     market: str = Path(...),
     keyword: str = Query("", description="搜索关键字"),
     limit: int = Query(20, ge=1, le=100),
-    agent: dict = verify_agent_token
+    agent: dict = Depends(verify_agent_token)
 ):
     """搜索标的"""
     require_scope(agent, SCOPE_R)
@@ -130,7 +131,7 @@ async def klines(
     symbol: str = Query(..., description="标的代码"),
     timeframe: str = Query("1D", description="K线周期"),
     limit: int = Query(300, ge=1, le=2000),
-    agent: dict = verify_agent_token
+    agent: dict = Depends(verify_agent_token)
 ):
     """获取K线数据"""
     require_scope(agent, SCOPE_R)
@@ -174,7 +175,7 @@ async def klines(
 async def price(
     market: str = Query(..., description="市场代码"),
     symbol: str = Query(..., description="标的代码"),
-    agent: dict = verify_agent_token
+    agent: dict = Depends(verify_agent_token)
 ):
     """获取实时价格"""
     require_scope(agent, SCOPE_R)
@@ -204,3 +205,79 @@ async def price(
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Price fetch failed: {str(e)}")
+
+
+# ============================================================
+# Skill Router 集成
+# ============================================================
+
+import logging
+logger = logging.getLogger(__name__)
+
+def generate_session_id() -> str:
+    """生成会话ID"""
+    return hashlib.md5(f"{time.time()}".encode()).hexdigest()[:12]
+
+
+class ChatRequest(BaseModel):
+    """聊天请求"""
+    message: str
+    session_id: Optional[str] = None
+
+
+def _default_llm_client(message: str) -> str:
+    """默认 LLM 回调（待接入现有 langchain 系统）"""
+    return f"[LLM Fallback] 收到消息: {message}"
+
+
+# 延迟初始化 skill_router，避免循环导入
+_skill_router = None
+
+def get_skill_router():
+    """获取或创建 SkillRouter 实例"""
+    global _skill_router
+    if _skill_router is None:
+        try:
+            from agent.skill_router import SkillRouter
+            _skill_router = SkillRouter(llm_client=_default_llm_client)
+            logger.info("Skill Router initialized")
+        except Exception as e:
+            logger.warning(f"Skill Router init failed: {e}")
+            _skill_router = None
+    return _skill_router
+
+
+@agent_router.post("/agent/chat")
+async def agent_chat(request: ChatRequest):
+    """AI Agent 对话接口（Skill-First 架构）
+    
+    优先走 Skill 路由，高频任务走固定路径
+    无法匹配时降级到 LLM 动态规划
+    """
+    try:
+        skill_router = get_skill_router()
+        
+        if skill_router:
+            # 方案A: Skill 路由
+            skill_result = skill_router.route(request.message)
+            
+            if skill_result.get("skill_id") and skill_result.get("skill_id") != "llm_fallback":
+                return {
+                    "reply": skill_result["response"],
+                    "skill_id": skill_result["skill_id"],
+                    "needs_confirmation": skill_result.get("needs_confirmation", False),
+                    "session_id": request.session_id or generate_session_id()
+                }
+        
+        # 方案B: 降级到 LLM 动态规划（Skill 未匹配时）
+        # TODO: 对接现有 langchain 对话逻辑
+        return {
+            "reply": f"[LLM Fallback] 收到消息: {request.message}",
+            "skill_id": None,
+            "needs_confirmation": False,
+            "session_id": request.session_id or generate_session_id()
+        }
+        
+    except Exception as e:
+        logger.error(f"Agent chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

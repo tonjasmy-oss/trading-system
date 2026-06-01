@@ -1991,5 +1991,20 @@ STRATEGY_REGISTRY: Dict[str, type] = {
     "STAT_ARB":   StatisticalArbitrageStrategy,
     "COINGLASS":  CoinGlassSentimentStrategy,   # 情绪+清算集群策略（2026-05-18）
     "DONCHIAN":   DonchianChannelStrategy,      # 海龟通道突破策略（2026-05-22）
+    # 分层策略（P1-1）
+    "RSI_LAYERED":       None,  # 延迟导入: components.layered_strategy.RsiLayeredStrategy
+    "EMA_CROSS_LAYERED": None,  # 延迟导入: components.layered_strategy.EmaCrossLayeredStrategy
 }
+
+# 延迟导入分层策略
+def _lazy_import_layered():
+    try:
+        from components.layered_strategy import RsiLayeredStrategy, EmaCrossLayeredStrategy
+        STRATEGY_REGISTRY["RSI_LAYERED"] = RsiLayeredStrategy
+        STRATEGY_REGISTRY["EMA_CROSS_LAYERED"] = EmaCrossLayeredStrategy
+    except ImportError:
+        pass
+
+import atexit
+_lazy_import_layered()
 

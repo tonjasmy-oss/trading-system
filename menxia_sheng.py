@@ -402,12 +402,16 @@ class MenxiaSheng:
 
     def record_open(self, symbol: str, entry_price: float, quantity: float,
                     stop_loss: float, take_profit: float,
-                    side: str = "long"):
-        """记录开仓成功（尚书省执行完毕后回调）"""
+                    side: str = "long", entry_time: int = 0):
+        """记录开仓成功（尚书省执行完毕后回调）
+        
+        Args:
+            entry_time: 入场时间戳(毫秒)，0=使用当前时间（用于恢复持仓时保留原始时间）
+        """
         self._check_day_reset()
         self._positions[symbol] = {
             "entry_price": entry_price,
-            "entry_time": int(time.time() * 1000),
+            "entry_time": entry_time if entry_time else int(time.time() * 1000),
             "quantity": quantity,
             "stop_loss": stop_loss,
             "take_profit": take_profit,

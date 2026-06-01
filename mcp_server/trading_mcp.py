@@ -1,45 +1,99 @@
 """
-Trading System MCP Server - 交易系统MCP服务器
+Trading System MCP Server v2 — 增强版
+======================================
 
-参考 QuantDinger quantdinger-mcp 设计
-使用 FastMCP 框架
+参考 QuantDinger quantdinger-mcp 设计，提供完整的交易系统 MCP 工具集。
+
+新增 (v2):
+  - 实验管线工具 (regime detection + strategy experiment)
+  - 策略推荐工具 (市场状态 → 策略推荐)
+  - 审计日志 (tool call 记录)
+  - 流式返回支持 (SSE transport)
 
 安装运行：
-  pip3 install mcp
+  pip3 install mcp httpx
   python trading_mcp.py
 
 环境变量：
   TRADING_SYSTEM_URL - 交易系统地址（默认 http://localhost:8081）
-  MCP_TRANSPORT - 传输方式（stdio/http，默认stdio）
+  MCP_TRANSPORT - 传输方式（stdio/http/sse，默认stdio）
   MCP_HOST - HTTP绑定地址（默认127.0.0.1）
   MCP_PORT - HTTP端口（默认8000）
 """
 
 import os
 import sys
-from typing import Any
+import json
+import time
+import logging
+from typing import Any, Optional
+from datetime import datetime, timezone
 
 import httpx
 from mcp.server.fastmcp import FastMCP
-
 
 # ============================================================
 # 配置
 # ============================================================
 
 BASE_URL = os.getenv("TRADING_SYSTEM_URL", "http://localhost:8081")
-TIMEOUT_S = float(os.getenv("TRADING_SYSTEM_TIMEOUT_S", "60"))
+TIMEOUT_S = float(os.getenv("TRADING_SYSTEM_TIMEOUT_S", "120"))
+AUDIT_ENABLED = os.getenv("MCP_AUDIT_ENABLED", "true").lower() == "true"
 
 _client = httpx.Client(base_url=BASE_URL, timeout=TIMEOUT_S)
+logger = logging.getLogger("trading-mcp")
+
+# 审计日志
+_audit_log: list = []
+_audit_start_time = time.time()
+
+
+def _audit(tool_name: str, params: dict, result_type: str, duration_ms: float):
+    if not AUDIT_ENABLED:
+        return
+    entry = {
+        "tool": tool_name,
+        "params": {k: str(v)[:100] for k, v in (params or {}).items()},
+        "result_type": result_type,
+        "duration_ms": round(duration_ms, 1),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    _audit_log.append(entry)
+    if len(_audit_log) > 1000:
+        _audit_log.pop(0)
+
+
+def _timed(func):
+    """装饰器：自动计时 + 审计记录"""
+    def wrapper(*args, **kwargs):
+        t0 = time.time()
+        try:
+            result = func(*args, **kwargs)
+            _audit(func.__name__, kwargs, "ok", (time.time() - t0) * 1000)
+            return result
+        except Exception as e:
+            _audit(func.__name__, kwargs, f"error:{e}", (time.time() - t0) * 1000)
+            raise
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 
 def _get(path: str, params: dict = None) -> Any:
-    r = _client.get(path, params=params or {})
+    t0 = time.time()
+    try:
+        r = _client.get(path, params=params or {})
+    except httpx.TimeoutException:
+        return {"error": "timeout", "message": f"Request to {path} timed out after {TIMEOUT_S}s"}
     return _unwrap(r)
 
 
-def _post(path: str, json: dict = None) -> Any:
-    r = _client.post(path, json=json or {})
+def _post(path: str, json_data: dict = None) -> Any:
+    t0 = time.time()
+    try:
+        r = _client.post(path, json=json_data or {})
+    except httpx.TimeoutException:
+        return {"error": "timeout", "message": f"POST {path} timed out after {TIMEOUT_S}s"}
     return _unwrap(r)
 
 
@@ -62,24 +116,50 @@ def _unwrap(r: httpx.Response) -> Any:
 mcp = FastMCP(
     "trading-system",
     instructions=(
-        "Trading System MCP Server - 多市场量化交易系统。\n"
-        "支持 A股/港股/美股/加密货币 的行情、回测、交易功能。\n"
-        "所有工具都是只读或回测类，不暴露实盘交易。"
+        "Trading System MCP Server v2 — 多市场量化交易系统。\n"
+        "功能：市场行情 · 回测分析 · 策略实验 · 市场状态检测 · 策略推荐 · 持仓管理。\n"
+        "所有工具都是只读或回测类，不暴露实盘交易（实盘由 live_trading.py daemon 管理）。"
     ),
 )
 
 
-# ───────────────────────────── 市场数据工具 ─────────────────────────────
+# ============================================================
+# 系统工具
+# ============================================================
 
 @mcp.tool()
-def whoami() -> dict:
-    """返回当前Agent身份信息"""
-    return _get("/api/agent/v1/whoami")
+def system_status() -> dict:
+    """获取交易系统运行状态（三省六部架构、Agent 列表、监控状态）"""
+    return _get("/api/system/status")
 
+
+@mcp.tool()
+def sansheng_status() -> dict:
+    """获取三省六部架构详情（门下省风控、尚书省执行、Agent 策略）"""
+    return _get("/api/sansheng/status")
+
+
+@mcp.tool()
+def mcp_audit_log(limit: int = 20) -> dict:
+    """查看 MCP Server 审计日志（最近 N 条 tool call 记录）
+
+    Args:
+        limit: 返回条数（默认20）
+    """
+    return {
+        "total_calls": len(_audit_log),
+        "uptime_seconds": round(time.time() - _audit_start_time, 0),
+        "recent": _audit_log[-limit:],
+    }
+
+
+# ============================================================
+# 市场数据工具
+# ============================================================
 
 @mcp.tool()
 def list_markets() -> list:
-    """列出所有支持的市场"""
+    """列出所有支持的市场（CRYPTO/CN/HK/US）"""
     return _get("/api/agent/v1/markets")
 
 
@@ -123,6 +203,16 @@ def get_price(market: str, symbol: str) -> dict:
 
 
 @mcp.tool()
+def get_all_prices() -> list:
+    """获取所有市场的实时行情"""
+    return _get("/api/market/prices")
+
+
+# ============================================================
+# 持仓 & 交易工具
+# ============================================================
+
+@mcp.tool()
 def get_portfolio() -> list:
     """获取当前持仓"""
     return _get("/api/positions")
@@ -130,7 +220,7 @@ def get_portfolio() -> list:
 
 @mcp.tool()
 def get_portfolio_value() -> dict:
-    """获取账户市值统计"""
+    """获取账户市值统计（总成本/总市值/总PnL）"""
     return _get("/api/portfolio/value")
 
 
@@ -144,112 +234,151 @@ def get_trades(limit: int = 50) -> list:
     return _get("/api/trades", params={"limit": limit})
 
 
-# ───────────────────────────── 回测工具 ─────────────────────────────
+# ============================================================
+# 市场状态 & 策略推荐工具 (P0-1)
+# ============================================================
 
 @mcp.tool()
-def submit_backtest(
+def detect_regime(symbol: str, timeframe: str = "2h") -> dict:
+    """检测市场状态 + 获取策略推荐
+
+    Args:
+        symbol: 交易对 (e.g. SOL/USDT, ETH/USDT)
+        timeframe: K线周期 (默认2h)
+
+    Returns:
+        {regime: {trend, volatility, volume, confidence},
+         recommendations: [{strategy, fit_score, reason}]}
+    """
+    return _get("/api/experiment/pipeline/regime",
+                params={"symbol": symbol, "timeframe": timeframe})
+
+
+# ============================================================
+# 实验管线工具 (P0-2)
+# ============================================================
+
+@mcp.tool()
+def run_experiment(
     symbol: str,
-    market: str = "CRYPTO",
-    timeframe: str = "1H",
-    start_date: str = "2024-01-01",
-    end_date: str = "2024-12-31",
-    strategy: str = "RSIStrategy",
-    initial_capital: float = 10000,
-    commission: float = 0.001,
-    slippage: float = 0.0,
+    timeframe: str = "2h",
+    strategies: str = "DONCHIAN,BOLLINGER,RSI",
 ) -> dict:
-    """提交回测任务
+    """运行策略实验管线：Regime → Generate → Backtest → Score → Best
+
+    自动检测市场状态，生成候选参数组合，并行回测，多因子评分，输出最优策略。
 
     Args:
-        symbol: 标的代码
-        market: 市场代码
+        symbol: 交易对 (e.g. SOL/USDT)
         timeframe: K线周期
-        start_date/end_date: 回测时间范围
-        strategy: 策略名称
-        initial_capital: 初始资金
-        commission: 手续费率
-        slippage: 滑点
+        strategies: 逗号分隔的策略列表 (e.g. "DONCHIAN,BOLLINGER,RSI,ATRSTOP")
+
+    Returns:
+        {regime, best: {strategy, params, score, summary}, ranked: [...], duration_seconds}
     """
-    # 注意：完整实现需要调用实际的回测API
-    return {
-        "job_id": f"bt_{symbol}_{int(time.time())}",
-        "status": "submitted",
-        "message": "回测任务已提交（完整回测功能开发中）",
-        "params": {
-            "symbol": symbol, "market": market, "timeframe": timeframe,
-            "start_date": start_date, "end_date": end_date,
-            "strategy": strategy, "initial_capital": initial_capital
-        }
-    }
+    return _get("/api/experiment/pipeline/run", params={
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "strategies": strategies,
+        "max_workers": 4,
+    })
 
 
 @mcp.tool()
-def get_job(job_id: str) -> dict:
-    """查询任务状态
+def quick_experiment(symbol: str = "SOL/USDT", timeframe: str = "2h") -> dict:
+    """快速实验：对所有 Agent 标的运行实验管线
 
     Args:
-        job_id: 任务ID
+        symbol: 可选，指定单个标的（留空则对所有 Agent 标的运行）
+        timeframe: K线周期
     """
-    # 注意：完整实现需要实际的作业队列
-    return {
-        "job_id": job_id,
-        "status": "pending",
-        "message": "任务状态查询功能开发中"
-    }
+    if symbol:
+        return _get("/api/experiment/pipeline/run", params={
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategies": "DONCHIAN,BOLLINGER,RSI",
+            "max_workers": 2,
+        })
+    return _get("/api/experiment/pipeline/quick",
+                params={"symbol": symbol, "timeframe": timeframe})
+
+
+# ============================================================
+# 回测工具
+# ============================================================
+
+@mcp.tool()
+def list_backtest_strategies() -> dict:
+    """列出所有可回测的策略"""
+    return _get("/api/backtest/strategies")
 
 
 @mcp.tool()
-def list_jobs(kind: str = None, limit: int = 50) -> list:
-    """列出最近的任务
+def compare_strategies(
+    symbol: str = "ETH/USDT",
+    timeframe: str = "4h",
+    direction: str = "long",
+) -> dict:
+    """对比多个策略的回测表现
 
     Args:
-        kind: 任务类型过滤
+        symbol: 交易对
+        timeframe: K线周期
+        direction: 交易方向 (long/short/both)
+
+    Returns:
+        {rankings: [{strategy, return, sharpe, drawdown, win_rate, trades}]}
+    """
+    return _get("/api/backtest/compare", params={
+        "symbol": symbol, "timeframe": timeframe, "direction": direction
+    })
+
+
+# ============================================================
+# 复盘工具
+# ============================================================
+
+@mcp.tool()
+def get_replay_stats() -> dict:
+    """获取交易复盘统计数据（胜率/盈亏比/期望值/最大回撤）"""
+    return _get("/api/replay/stats")
+
+
+@mcp.tool()
+def get_replay_trades(limit: int = 50) -> list:
+    """获取带市场状态标注的交易历史
+
+    Args:
         limit: 返回数量
     """
-    return []
-
-
-# ───────────────────────────── 工具类 ─────────────────────────────
-
-@mcp.tool()
-def get_system_status() -> dict:
-    """获取交易系统状态"""
-    try:
-        return _get("/api/system/status")
-    except Exception as e:
-        return {"error": str(e), "status": "unavailable"}
-
-
-@mcp.tool()
-def get_sansheng_status() -> dict:
-    """获取三省六部架构状态"""
-    try:
-        return _get("/api/sansheng/status")
-    except Exception as e:
-        return {"error": str(e), "status": "unavailable"}
+    return _get("/api/replay/trades", params={"limit": limit})
 
 
 # ============================================================
-# 传输配置
+# 数据源状态
 # ============================================================
 
-def main():
-    """入口函数"""
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
-    host = os.getenv("MCP_HOST", "127.0.0.1")
-    port = int(os.getenv("MCP_PORT", "8000"))
-    
-    print(f"[trading-mcp] Starting MCP server...")
-    print(f"[trading-mcp] Trading System: {BASE_URL}")
-    print(f"[trading-mcp] Transport: {transport}")
-    
-    if transport == "http":
-        mcp.settings.host = host
-        mcp.settings.port = port
-        mcp.run(transport="streamable-http")
-    else:
-        mcp.run(transport="stdio")
+@mcp.tool()
+def data_providers_status() -> dict:
+    """获取所有数据源健康状态（限流/熔断统计）"""
+    return _get("/api/data/status")
 
+
+# ============================================================
+# Main
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    host = os.getenv("MCP_HOST", "127.0.0.1")
+    port = int(os.getenv("MCP_PORT", "8000"))
+
+    print(f"Trading System MCP Server v2")
+    print(f"  Backend: {BASE_URL}")
+    print(f"  Transport: {transport}")
+    if transport in ("http", "sse"):
+        print(f"  Listening: http://{host}:{port}")
+        mcp.run(transport="sse" if transport == "sse" else "streamable-http",
+                host=host, port=port)
+    else:
+        mcp.run(transport="stdio")
