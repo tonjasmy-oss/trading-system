@@ -44,6 +44,6 @@ while [ $restart_count -lt $max_restarts ]; do
     restart_count=$((restart_count + 1))
     echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') exited (restart #${restart_count}), waiting 5s..."
     echo "[watchdog] $(date) restart #${restart_count}" >> "$CRASH_LOG"
-    sleep 5
+    sleep 15
 done
 echo "[watchdog] $(date '+%Y-%m-%d %H:%M:%S') max restarts (${max_restarts}) reached, stopping" | tee -a "$LOG_FILE"

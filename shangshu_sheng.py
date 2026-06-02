@@ -697,6 +697,11 @@ class WeexAdapter(ExchangeAdapter):
     async def place_order(self, symbol: str, side: str, order_type: str,
                          quantity: float, price: Optional[float] = None,
                          params: Optional[Dict] = None) -> ExecutionResult:
+        # ── 精度修正：Weex 要求 quantity 匹配 stepSize ──
+        step = 0.01 if "XAUT" in symbol else 0.001
+        quantity = round(quantity / step) * step
+        if quantity <= 0:
+            return ExecutionResult(False, "", symbol, side, quantity, 0, order_type, 0, "quantity<=0 after rounding")
         from weex import create_order as weex_create_order
 
         def _do():
