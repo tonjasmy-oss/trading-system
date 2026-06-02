@@ -59,3 +59,9 @@ xaut_*.json
 # Session logs
 SESSION_LOG*.md
 /reports/
+# Frontend
+frontend/node_modules/
+frontend/package-lock.json
+
+# Personal docs
+操作手册*
