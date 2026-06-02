@@ -100,17 +100,16 @@ echo "  模式: $([[ "$LIVE_TRADING_ENABLED" == "true" ]] && echo "实盘" || ec
 echo "  交易所: $CRYPTO_EXCHANGE"
 echo "  监听: $HOST:$PORT"
 
-# 启动（nohup 方式，由启动它的 shell 管理生命周期）
+# 使用 setsid 彻底脱离会话，避免父 shell 退出时连带杀死子进程
+# Dashboard 初始化需要 8~12 秒（因子库加载等），等待时间相应延长
 LOG_FILE="nohup_$(date +%Y%m%d).out"
-python3 -m uvicorn dashboard:app \
-    --host "$HOST" \
-    --port "$PORT" \
-    > "$LOG_FILE" 2>&1 &
-
-# 清理 7 天前的旧日志
-find "$SCRIPT_DIR" -name "nohup_*.out" -mtime +7 -delete 2>/dev/null || true
-
+setsid python3 -c "
+import uvicorn
+uvicorn.run('dashboard:app', host='$HOST', port=$PORT)
+" > "$LOG_FILE" 2>&1 &
 NEW_PID=$!
+
+# 写入 PID 文件（注：uvicorn 可能 fork worker，此处记录的是主进程 PID）
 echo "$NEW_PID" > "$PID_FILE"
 echo "$AGENT_TOKEN" > "$SCRIPT_DIR/.agent_token"
 chmod 600 "$SCRIPT_DIR/.agent_token"
@@ -118,10 +117,15 @@ chmod 600 "$SCRIPT_DIR/.agent_token"
 echo "[交易系统] Dashboard 已启动 PID=$NEW_PID"
 echo "[交易系统] PID 已保存到 $PID_FILE"
 
-# 等待就绪
-sleep 3
-if curl -sf "http://localhost:$PORT/api/system/status" > /dev/null 2>&1; then
-    echo "✅ Dashboard 就绪: http://localhost:$PORT"
-else
-    echo "⚠️  Dashboard 可能仍在启动，查看日志: tail -f $LOG_FILE"
-fi
+# 清理 7 天前的旧日志
+find "$SCRIPT_DIR" -name "nohup_*.out" -mtime +7 -delete 2>/dev/null || true
+
+# 等待就绪（Dashboard 初始化因子注册表需要更多时间）
+for i in $(seq 1 6); do
+    sleep 2
+    if curl -sf "http://localhost:$PORT/api/system/status" > /dev/null 2>&1; then
+        echo "✅ Dashboard 就绪: http://localhost:$PORT (耗时 ${i}0s)"
+        exit 0
+    fi
+done
+echo "⚠️  Dashboard 启动超时 (12s)，查看日志: tail -f $LOG_FILE"

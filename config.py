@@ -117,12 +117,15 @@ MULTI_AGENT_ENABLED = os.getenv("MULTI_AGENT_ENABLED", "false").lower() == "true
 AGENT_CHECK_INTERVAL = int(os.getenv("AGENT_CHECK_INTERVAL", "60"))
 
 # --- 多 Agent 标的配置（格式：SYMBOL:STRATEGY:EXCHANGE）---
-# 策略可选: RSI, SMA, BOLLINGER, MACD, GRID, VOLUME
+# 策略可选: RSI, SMA, BOLLINGER, MACD, GRID, VOLUME, VOTE, AUTO, DONCHIAN,
+#           ATRSTOP, MULTIFACTOR, FUNDING_ARB, STAT_ARB, COINGLASS,
+#           FACTOR (Vibe-Trading 因子), SWARM (默认预设),
+#           SWARM:preset_name (指定预设，如 SWARM:crypto_trading_desk)
 # 交易所可选: binance, gateio, bitget, hyperliquid, weex
-# 示例: ETH/USDT:RSI:binance,SOL/USDT:RSI:hyperliquid,SUI/USDT:SMA:binance
+# 示例: BTC/USDT:SWARM:crypto_trading_desk:binance,ETH/USDT:FACTOR:binance
 AGENT_SYMBOLS = os.getenv(
     "AGENT_SYMBOLS",
-    "BTC/USDT:VOTE:binance,ETH/USDT:AUTO:binance,SOL/USDT:VOTE:binance,SUI/USDT:AUTO:binance,ARB/USDT:VOTE:binance,AVAX/USDT:VOTE:binance,OP/USDT:VOTE:binance,LINK/USDT:VOTE:binance,XAUT/USDT:DONCHIAN:gateio"
+    "BTC/USDT:VOTE:binance,ETH/USDT:SWARM:derivatives_strategy_desk:binance,SOL/USDT:SWARM:commodity_research_team:binance:2h,SUI/USDT:SWARM:sector_rotation_team:binance:2h,XAUT/USDT:SWARM:portfolio_review_board:gateio:4h"
 )
 
 # ============================================================
@@ -226,4 +229,36 @@ STAT_ARB_PAIRS = {
 # 全局风控补充（黑天鹅保护）
 # ============================================================
 BLACK_SWAN_DROP_PCT   = float(os.getenv("BLACK_SWAN_DROP_PCT", "0.08"))   # BTC单日跌>8%强平所有杠杆仓
-MAX_DRAWDOWN_LOCK_PCT = float(os.getenv("MAX_DRAWDOWN_LOCK_PCT", "0.15"))  # 总资金回撤>15%暂停所有新仓)
+MAX_DRAWDOWN_LOCK_PCT = float(os.getenv("MAX_DRAWDOWN_LOCK_PCT", "0.15"))  # 总资金回撤>15%暂停所有新仓
+
+# ============================================================
+# Vibe-Trading 集成配置（v0.1.9 桥接 — 2026-06-02）
+# ============================================================
+
+# ── 因子库集成 ──────────────────────────────────────────────
+# 是否启用因子策略（从 Vibe-Trading Alpha Zoo 加载 456 个因子）
+FACTOR_ENABLED = os.getenv("FACTOR_ENABLED", "true").lower() == "true"
+# 默认因子列表（用于 FACTOR 策略类型）
+# 格式: zoo.alpha_id，多个用逗号分隔
+FACTOR_DEFAULT_ALPHAS = os.getenv(
+    "FACTOR_DEFAULT_ALPHAS",
+    "alpha101_042,gtja191_006,qlib158_beta10"
+).split(",")
+# 因子信号 z-score 阈值
+FACTOR_THRESHOLD = float(os.getenv("FACTOR_THRESHOLD", "0.5"))
+# 因子信号连续确认 K线数
+FACTOR_LOOKBACK = int(os.getenv("FACTOR_LOOKBACK", "3"))
+
+# ── Swarm 集成 ──────────────────────────────────────────────
+# 是否启用 Swarm 策略（从 Vibe-Trading 29 种预设加载）
+SWARM_ENABLED = os.getenv("SWARM_ENABLED", "true").lower() == "true"
+# 默认 Swarm 预设（用于 SWARM 策略类型）
+SWARM_DEFAULT_PRESET = os.getenv("SWARM_DEFAULT_PRESET", "crypto_trading_desk")
+# Swarm 投票阈值
+SWARM_THRESHOLD = float(os.getenv("SWARM_THRESHOLD", "0.25"))
+
+# ── Research Goal 集成 ──────────────────────────────────────
+# 是否启用研究目标运行时（回测优化审计追踪）
+GOAL_ENABLED = os.getenv("GOAL_ENABLED", "true").lower() == "true"
+# Goal 数据库路径
+GOAL_DB_PATH = os.getenv("GOAL_DB_PATH", "")   # 空=使用默认路径

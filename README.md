@@ -2,28 +2,31 @@
 
 **三省六部制**量化交易系统，支持加密货币与股票的双市场回测 / 模拟 / 实盘交易。核心理念：信号生成（**中书省**）、风控审核（**门下省**）、执行调度（**尚书省**）三层分离，规则硬编码、逻辑可审计。
 
-> **v3 更新（2026-06-01）**：借鉴 QuantDinger 进行了 7 项增强 —— 市场状态感知策略推荐、实验管线、分层策略架构、StrategySpec JSON 编译器、多通道通知、MCP Server v2。
+> **v3.1 更新（2026-06-02）**：集成 Vibe-Trading —— 452 因子库桥接、29 种 Swarm 预设（差异化权重）、Research Goal 运行时。
 
 ---
 
 ## 系统架构
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                    中书省 · 信号生成层                         │
-│   RSI / MACD / Bollinger / DONCHIAN / VOTE / ATRSTOP / KDJ   │
-│   分层策略 (LayeredStrategy)  ·  StrategySpec JSON 编译器      │
-├──────────────────────────────────────────────────────────────┤
-│                    门下省 · 风控审核层                         │
-│   11条风控规则 · 四级递进 (NORMAL→CAUTION→WARNING→LOCKED)      │
-│   市场状态感知 · 策略适配度评分 · 💡 自动推荐                   │
-├──────────────────────────────────────────────────────────────┤
-│                    尚书省 · 执行调度层                         │
-│   Binance / Gate.io / Weex / OKX / Bybit / Hyperliquid        │
-├──────────────────────────────────────────────────────────────┤
-│  刑部 · 违规记录   户部 · 权益曲线   仓部 · 持仓管理             │
-│  实验管线 · 策略寻优   MCP Server v2 · 多通道通知               │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                    中书省 · 信号生成层                             │
+│   RSI / MACD / Bollinger / DONCHIAN / VOTE / ATRSTOP / KDJ       │
+│   COINGLASS / MULTIFACTOR / FUNDING_ARB / STAT_ARB               │
+│   分层策略 (LayeredStrategy)  ·  StrategySpec JSON 编译器          │
+│   ✦ Swarm 多 Agent 投票 (29 预设)  ·  ✦ 452 因子库桥接             │
+├──────────────────────────────────────────────────────────────────┤
+│                    门下省 · 风控审核层                             │
+│   11条风控规则 · 四级递进 (NORMAL→CAUTION→WARNING→LOCKED)          │
+│   市场状态感知 · 策略适配度评分 · 💡 自动推荐                       │
+├──────────────────────────────────────────────────────────────────┤
+│                    尚书省 · 执行调度层                             │
+│   Binance / Gate.io / Weex / OKX / Bybit / Hyperliquid            │
+├──────────────────────────────────────────────────────────────────┤
+│  刑部 · 违规记录   户部 · 权益曲线   仓部 · 持仓管理                 │
+│  实验管线 · 策略寻优   MCP Server v2 · 多通道通知                   │
+│  ✦ Goal 运行时 · 回测审计追踪                                       │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -33,7 +36,9 @@
 | 功能 | 说明 |
 |------|------|
 | **多交易所** | Binance / Gate.io / Weex / OKX / Bybit / Hyperliquid |
-| **11种策略** | RSI / MACD / Bollinger / DONCHIAN / SMA / KDJ / ATRSTOP / MULTIFACTOR / VOTE / FUNDING_ARB / STAT_ARB |
+| **15+ 策略** | RSI / MACD / Bollinger / DONCHIAN / SMA / KDJ / ATRSTOP / MULTIFACTOR / VOTE / FUNDING_ARB / STAT_ARB / COINGLASS / RSI_LAYERED / EMA_CROSS_LAYERED |
+| **Swarm 投票** | 29 种预设（投资委员会/风险委员会/量化台/宏观论坛等），多 Agent 角色加权投票 |
+| **因子库** | 452 因子桥接 (alpha101 / gtja191 / qlib158)，统一 Registry API |
 | **分层策略架构** | 指标层 → 信号层 → 风险层 三层分离，AI 可生成 |
 | **策略实验管线** | Regime → Generate → Backtest → Score(6因子) → Best 闭环 |
 | **StrategySpec** | JSON 策略规格 → Python 类自动编译 |
@@ -48,6 +53,7 @@
 | **DataProvider** | 统一数据抽象层（限流+熔断） |
 | **在线参数优化** | 每笔平仓后自动微调参数（24h冷却） |
 | **多周期确认** | 1h/4h/1d 信号一致性验证 |
+| **安全重启** | `restart.sh` 优雅停止 + 端口清理 + 验证 |
 
 ---
 
@@ -61,10 +67,14 @@ trading-system/
 ├── shangshu_sheng.py             # 尚书省 · 执行调度层
 ├── menxia_sheng.py               # 门下省 · 风控审核层（11条规则，四级递进）
 │
+├── swarm_bridge.py               # ✦ Swarm 预设桥接（29预设，差异化权重）
+├── factor_bridge.py              # ✦ 因子库桥接（452因子，Registry API）
+├── goal_bridge.py                # ✦ Research Goal 运行时（回测审计追踪）
+│
 ├── components/                    # 模块化组件
-│   ├── experiment_pipeline.py    # [v3] 策略实验管线（530行）
-│   ├── layered_strategy.py       # [v3] 分层策略架构（451行）
-│   ├── strategy_spec.py          # [v3] StrategySpec JSON 编译器（405行）
+│   ├── experiment_pipeline.py    # 策略实验管线
+│   ├── layered_strategy.py       # 分层策略架构
+│   ├── strategy_spec.py          # StrategySpec JSON 编译器
 │   ├── signal_engine.py          # 信号引擎
 │   ├── market_regime.py          # 市场状态识别 + 策略推荐引擎
 │   ├── strategy_rotator.py       # 市场感知策略轮动
@@ -82,20 +92,30 @@ trading-system/
 │   ├── factory.py                # DataProviderFactory
 │   └── compat.py                 # 向后兼容适配
 │
+├── exchanges/                     # 交易所适配器
+│   ├── base.py                   # BaseExchangeAdapter
+│   ├── binance.py                # Binance 适配器
+│   ├── okx.py                    # OKX 适配器
+│   └── factory.py                # ExchangeFactory
+│
 ├── agent_gateway/                 # Agent Gateway（Token 鉴权）
 ├── mcp_server/                    # MCP Server v2（17 tools）
-│   └── trading_mcp.py            # 审计日志 + SSE/HTTP/stdio
+├── agent/                         # Agent Skills
+├── frontend/                      # Web 前端
 │
-├── notify.py                      # 多通道通知（飞书/Telegram/Discord/Email/Webhook）
-├── strategies.py                  # 11种策略实现 + STRATEGY_REGISTRY
+├── swarm_backtest.py              # ✦ Swarm 批量回测（29预设 × N标的）
+├── strategies.py                  # 15+ 策略实现 + STRATEGY_REGISTRY
 ├── backtest.py                    # 单标的回测引擎
 ├── batch_backtest.py              # 批量回测 + Grid Search
 ├── crypto_api.py                  # CCXT/Gate.io 封装
 ├── trade_history.py               # 交易历史记录
 ├── tdx_compiler.py                # 通达信公式编译器
 │
-├── .gitignore                     # Git 忽略规则（*.db/.env 等）
+├── restart.sh                     # 安全重启脚本
+├── run_dashboard.sh               # Dashboard 启动（setsid）
+├── run_live_daemon.sh             # Live Daemon 启动
 ├── requirements.txt               # Python 依赖
+├── .gitignore                     # Git 忽略规则（*.db/.env 等）
 └── README.md
 ```
 
@@ -105,7 +125,7 @@ trading-system/
 
 ### 环境要求
 - Python >= 3.10
-- SQLite（内置）
+- SQLite（内置）或 PostgreSQL（可选）
 - 交易所 API Key（实盘必需）
 
 ### 快速启动
@@ -114,15 +134,14 @@ trading-system/
 git clone https://github.com/tonjasmy-oss/trading-system.git
 cd trading-system
 
-pip install ccxt pandas numpy fastapi uvicorn akshare aiohttp python-dotenv
+pip install ccxt pandas numpy fastapi uvicorn akshare aiohttp python-dotenv pyyaml
 
 # 复制并编辑环境变量
 cp .env.example .env
 vim .env
 
 # 启动
-python3 -u live_trading.py --daemon &
-python3 -m uvicorn dashboard:app --host 0.0.0.0 --port 8081 &
+bash restart.sh
 # 访问 http://localhost:8081
 ```
 
@@ -147,113 +166,46 @@ LIVE_EXCHANGE=weex
 LIVE_API_KEY=***
 LIVE_API_SECRET=***
 
-# 多 Agent
+# 多 Agent（支持 SWARM:preset_name）
 MULTI_AGENT_ENABLED=true
-AGENT_SYMBOLS=SUI/USDT:DONCHIAN:weex:2h,SOL/USDT:DONCHIAN:weex:2h,XAUT/USDT:DONCHIAN:weex:2h
+AGENT_SYMBOLS=BTC/USDT:VOTE:binance,ETH/USDT:SWARM:derivatives_strategy_desk:binance,SOL/USDT:SWARM:commodity_research_team:binance:2h,SUI/USDT:SWARM:sector_rotation_team:binance:2h,XAUT/USDT:SWARM:portfolio_review_board:gateio:4h
 AGENT_CHECK_INTERVAL=60
 
-# 市场感知策略自动轮动（默认 false，仅日志推荐）
-STRATEGY_AUTO_ROTATE=false
+# Vibe-Trading 集成
+FACTOR_ENABLED=true
+SWARM_ENABLED=true
+SWARM_DEFAULT_PRESET=crypto_trading_desk
+SWARM_THRESHOLD=0.25
+GOAL_ENABLED=true
 
 # 飞书告警
 FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
 
-# Telegram（可选）
-# TELEGRAM_BOT_TOKEN=***
-# TELEGRAM_CHAT_ID=***
-
-# Discord（可选）
-# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/xxx
-
 # 风控
 RISK_MAX_DAILY_LOSS_PCT=0.05
 RISK_MAX_TOTAL_EXPOSURE=0.45
+STRATEGY_AUTO_ROTATE=false
 ```
 
 ---
 
-## v3 新增功能
+## Swarm 预设（v3.1 新增）
 
-### 市场状态感知策略推荐 (P0-1)
+29 种 Vibe-Trading Swarm 预设，每种预设包含 3~8 个 Agent 角色，通过加权投票聚合信号。回测基于 XAUT/USDT 4h（2024-05 ~ 2026-05）数据。
 
-决策链日志实时显示市场状态和当前策略适配度：
+| 排名 | 预设 | 类型 | 夏普 | 收益 | 回撤 |
+|------|------|------|------|------|------|
+| 1 | **portfolio_review_board** | 组合评审 | 1.92 | +128% | -7.4% |
+| 2 | **credit_research_team** | 信用研究 | 1.61 | +107% | -13.2% |
+| 3 | **investment_committee** | 投委会 | 1.59 | +107% | -16.2% |
+| 4 | **derivatives_strategy_desk** | 衍生品策略 | 1.53 | +93% | -13.2% |
+| 5 | **risk_committee** | 风险委员会 | 1.53 | +93% | -13.2% |
+| 6 | crypto_trading_desk | 加密货币交易 | 1.51 | +57% | -3.8% |
+| 7 | sentiment_intelligence_team | 情绪情报 | 1.44 | +88% | -11.3% |
+| 8 | technical_analysis_panel | 技术分析 | 1.43 | +66% | -7.5% |
+| 9 | macro_strategy_forum | 宏观论坛 | 1.42 | +92% | -16.1% |
 
-```
-[agent_1] 📊 决策链: ... | 市场=ranging/high 策略适配=40
-[agent_2] 📊 决策链: ... | 市场=ranging/medium 策略适配=30 💡推荐: BOLLINGER(适配90)
-```
-
-9种市场状态 × 策略适配度映射表，DONCHIAN 在上行趋势适配 95，震荡市仅 25-40。
-
-### 策略实验管线 (P0-2)
-
-```bash
-# API 调用
-curl 'http://localhost:8081/api/experiment/pipeline/run?symbol=SOL/USDT&timeframe=2h&strategies=DONCHIAN,BOLLINGER,RSI'
-
-# CLI
-python3 -c "from components.experiment_pipeline import quick_experiment; print(quick_experiment('SOL/USDT','2h'))"
-```
-
-输出：市场状态 → 51个候选策略 → 批量回测(14秒) → 6因子评分 → 最优策略排行。
-
-### 分层策略架构 (P1-1)
-
-```python
-from components.layered_strategy import LayeredStrategy, StrategyRisk, RsiLayeredStrategy
-
-# 指标层 / 信号层 / 风险层 三层分离
-s = RsiLayeredStrategy(rsi_period=14, oversold=28, overbought=65)
-print(s.risk_config)  # StrategyRisk(stop_loss=0.02, take_profit=0.04, ...)
-```
-
-### StrategySpec JSON 编译器 (P1-3)
-
-AI 用 JSON 描述策略，系统自动编译为可执行 Python 类：
-
-```json
-{
-  "name": "rsi_oversold_bounce",
-  "indicators": [{"name":"rsi","type":"RSI","params":{"period":14}}],
-  "entry_conditions": [{"indicator":"rsi","operator":"cross_above","value":28}],
-  "risk": {"stop_loss":0.02, "take_profit":0.04}
-}
-```
-
-### MCP Server v2 (P2-2)
-
-17 个 MCP 工具，支持 SSE / HTTP / stdio 三传输：
-
-```bash
-python3 mcp_server/trading_mcp.py
-# stdio → 直接用于 Claude Code / Cursor
-# MCP_TRANSPORT=sse MCP_PORT=8000 → HTTP 服务
-```
-
-工具：`system_status` / `detect_regime` / `run_experiment` / `compare_strategies` / `get_replay_stats` 等。
-
----
-
-## Dashboard API
-
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/` | GET | Dashboard 首页 |
-| `/api/system/status` | GET | 系统运行状态 |
-| `/api/sansheng/status` | GET | 三省六部架构详情（Agent策略/风控/模块） |
-| `/api/positions` | GET | 当前持仓 |
-| `/api/portfolio/value` | GET | 账户市值统计 |
-| `/api/market/prices` | GET | 全市场实时行情 |
-| `/api/experiment/pipeline/regime` | GET | [v3] 市场状态 + 策略推荐 |
-| `/api/experiment/pipeline/run` | GET | [v3] 策略实验管线 |
-| `/api/experiment/pipeline/quick` | GET | [v3] 对所有Agent标的快速实验 |
-| `/api/backtest/compare` | GET | 多策略对比回测排行 |
-| `/api/backtest/strategies` | GET | 可回测策略列表 |
-| `/api/replay/stats` | GET | 交易复盘KPI |
-| `/api/replay/trades` | GET | 交易历史（含市场状态标注） |
-| `/api/replay/heatmap` | GET | 策略×市场热力图 |
-| `/api/data/status` | GET | 数据源健康状态 |
-| `/api/agent/v1/*` | ANY | Agent Gateway（需AGENT_TOKEN） |
+完整 29 种预设列表见 `swarm_bridge.py` 中的 `_PRESET_ROLE_OVERRIDES`。
 
 ---
 
@@ -272,20 +224,28 @@ python3 mcp_server/trading_mcp.py
 | **MULTIFACTOR** | 趋势 | 上升 | 多因子综合评分 |
 | **FUNDING_ARB** | 套利 | 震荡 | 资金费率套利 |
 | **STAT_ARB** | 套利 | 震荡 | 统计套利 |
-| **RSI_LAYERED** | 摆动 | 下跌/震荡 | [v3] 分层实现示例 |
-| **EMA_CROSS_LAYERED** | 趋势 | 上升/下跌 | [v3] 分层实现示例 |
+| **COINGLASS** | 情绪 | 通用 | 市场情绪指标 |
+| **SWARM** | 多Agent | 通用 | 29种预设加权投票 |
 
 ---
 
-## 已优化标的参数
+## Dashboard API
 
-| 标的 | 策略 | 参数 | 回测结果 |
-|------|------|------|----------|
-| BTC/USDT | VOTE | RSI_P=10 OS=28 OB=65 SL=4% TP=8% | Score=17.89, +20.11% |
-| ETH/USDT | VOTE | RSI_P=14 OS=30 OB=65 SL=2% TP=4% | Score=15.55, +24.93% |
-| SOL/USDT | VOTE | RSI_P=10 OS=28 OB=65 SL=1.5% TP=4% | Score=11.51, +15.53% |
-| SUI/USDT | DONCHIAN | ch=30 ema=10 SL=3% TP=5% | Grid Search 2026-05-22 |
-| XAUT/USDT | DONCHIAN | ch=14 ema=30 SL=1.5% TP=3% | +40.53%, Sharpe=0.99 |
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/` | GET | Dashboard 首页 |
+| `/api/system/status` | GET | 系统运行状态 |
+| `/api/sansheng/status` | GET | 三省六部架构详情 |
+| `/api/positions` | GET | 当前持仓 |
+| `/api/portfolio/value` | GET | 账户市值统计 |
+| `/api/market/prices` | GET | 全市场实时行情 |
+| `/api/experiment/pipeline/regime` | GET | 市场状态 + 策略推荐 |
+| `/api/experiment/pipeline/run` | GET | 策略实验管线 |
+| `/api/backtest/compare` | GET | 多策略对比回测排行 |
+| `/api/replay/stats` | GET | 交易复盘KPI |
+| `/api/replay/trades` | GET | 交易历史 |
+| `/api/replay/heatmap` | GET | 策略×市场热力图 |
+| `/api/agent/v1/*` | ANY | Agent Gateway (需AGENT_TOKEN) |
 
 ---
 
@@ -294,7 +254,8 @@ python3 mcp_server/trading_mcp.py
 - **无硬编码密钥**：所有 API Key / Secret / Token 均通过环境变量注入
 - **AGENT_TOKEN**：敏感操作强制验证，保存于 `.agent_token`（权限 600），不进入 Git
 - **数据库隔离**：所有 `.db` / `.log` / `nohup_*.out` / `.pid` 文件通过 `.gitignore` 排除
-- **实盘保护**：门下省 11 条风控规则，四级递进 (NORMAL→CAUTION→WARNING→LOCKED)，一票否决制
+- **实盘保护**：门下省 11 条风控规则，四级递进，一票否决制
+- **.env 过滤**：`.gitignore` 排除所有 `.env*` 文件，示例配置在 `.env.example`
 
 ---
 
@@ -312,15 +273,13 @@ chmod 666 trading_system.db live_trading.db
 
 **Dashboard 端口被占用？**
 ```bash
-fuser -k 8081/tcp; python3 -m uvicorn dashboard:app --host 0.0.0.0 --port 8081
+fuser -k 8081/tcp; bash restart.sh
 ```
 
-**MCP Server 连接问题？**
+**回测数据不足？**
 ```bash
-# 检查 Dashboard 是否运行
-curl http://localhost:8081/api/system/status
-# 直接 stdio 模式启动
-python3 mcp_server/trading_mcp.py
+# 数据自动从 CCXT 在线拉取，首次运行需等待
+python3 -c "from history_cache import init_cache_db; init_cache_db()"
 ```
 
 ---

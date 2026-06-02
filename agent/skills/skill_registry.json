@@ -1,0 +1,136 @@
+{
+  "skills": [
+    {
+      "id": "trader_management",
+      "name": "交易员管理",
+      "name_en": "Trader Management",
+      "description": "创建、启动、停止、编辑、删除交易员",
+      "examples": [
+        "创建一个 BTC 交易员",
+        "启动我的 SUI 交易员",
+        "停止交易员",
+        "查看所有交易员",
+        "删除交易员"
+      ],
+      "intents": ["create", "start", "stop", "edit", "delete", "list", "status"],
+      "action_fields": ["trader_id", "trader_name", "exchange", "strategy", "symbol", "auto_start"],
+      "high_risk_actions": ["delete", "start", "stop"],
+      "requires_confirmation": ["delete", "start_live"]
+    },
+    {
+      "id": "exchange_management",
+      "name": "交易所配置管理",
+      "name_en": "Exchange Management",
+      "description": "添加、修改、删除交易所 API 配置",
+      "examples": [
+        "添加币安 API",
+        "配置 OKX 交易所",
+        "删除交易所配置",
+        "查看交易所状态",
+        "测试交易所连接"
+      ],
+      "intents": ["add", "configure", "delete", "test", "status", "list"],
+      "action_fields": ["exchange_id", "api_key", "api_secret", "passphrase", "testnet"],
+      "high_risk_actions": ["delete", "test_connection"],
+      "requires_confirmation": ["delete"]
+    },
+    {
+      "id": "model_management",
+      "name": "AI模型配置管理",
+      "name_en": "Model Management",
+      "description": "配置、测试、切换 AI 模型",
+      "examples": [
+        "配置 DeepSeek 模型",
+        "切换到 Qwen 模型",
+        "测试模型连接",
+        "查看可用模型"
+      ],
+      "intents": ["add", "configure", "switch", "test", "list"],
+      "action_fields": ["model_provider", "model_name", "api_key", "base_url"],
+      "high_risk_actions": ["test_connection"],
+      "requires_confirmation": []
+    },
+    {
+      "id": "strategy_management",
+      "name": "策略管理",
+      "name_en": "Strategy Management",
+      "description": "创建、编辑、激活、删除交易策略",
+      "examples": [
+        "创建一个 RSI 策略",
+        "编辑策略参数",
+        "激活策略",
+        "查看策略表现"
+      ],
+      "intents": ["create", "edit", "activate", "deactivate", "delete", "list", "performance"],
+      "action_fields": ["strategy_id", "strategy_type", "params", "is_active"],
+      "high_risk_actions": ["activate", "deactivate", "delete"],
+      "requires_confirmation": ["activate", "delete"]
+    },
+    {
+      "id": "trader_diagnosis",
+      "name": "交易员诊断",
+      "name_en": "Trader Diagnosis",
+      "description": "诊断交易员启动失败、运行异常、策略未执行等问题",
+      "examples": [
+        "为什么交易员启动失败",
+        "交易员没有下单怎么办",
+        "策略没有执行",
+        "交易员报错 invalid signature"
+      ],
+      "intents": ["diagnose", "troubleshoot", "why_failed", "error", "not_working"],
+      "action_fields": ["trader_id", "error_message", "symptom"],
+      "high_risk_actions": [],
+      "requires_confirmation": []
+    },
+    {
+      "id": "exchange_diagnosis",
+      "name": "交易所连接诊断",
+      "name_en": "Exchange Diagnosis",
+      "description": "诊断交易所 API 连接失败、余额查询异常、下单失败等问题",
+      "examples": [
+        "为什么币安 API 连不上",
+        "余额查询失败",
+        "invalid signature 怎么办",
+        "交易所连接测试失败"
+      ],
+      "intents": ["diagnose", "troubleshoot", "connection_failed", "invalid_signature", "auth_failed"],
+      "action_fields": ["exchange_id", "error_code", "error_message", "endpoint"],
+      "high_risk_actions": [],
+      "requires_confirmation": []
+    },
+    {
+      "id": "balance_and_position",
+      "name": "余额与持仓查询",
+      "name_en": "Balance & Position Query",
+      "description": "查询各交易所账户余额和当前持仓",
+      "examples": [
+        "查看余额",
+        "查看持仓",
+        "我的仓位是多少",
+        "各交易所余额"
+      ],
+      "intents": ["query", "list", "show", "get", "view"],
+      "action_fields": ["exchange_id", "symbol"],
+      "high_risk_actions": [],
+      "requires_confirmation": []
+    },
+    {
+      "id": "backtest_management",
+      "name": "回测管理",
+      "name_en": "Backtest Management",
+      "description": "运行策略回测、查看回测结果",
+      "examples": [
+        "回测 RSI 策略",
+        "运行回测",
+        "查看回测结果",
+        "对比策略表现"
+      ],
+      "intents": ["run", "execute", "compare", "result", "performance"],
+      "action_fields": ["symbol", "timeframe", "strategy_type", "params", "start_date", "end_date"],
+      "high_risk_actions": [],
+      "requires_confirmation": []
+    }
+  ],
+  "version": "1.0.0",
+  "updated_at": "2026-05-30"
+}

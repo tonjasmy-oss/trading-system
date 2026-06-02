@@ -57,6 +57,10 @@ from config import (
     BLACK_SWAN_DROP_PCT, MAX_DRAWDOWN_LOCK_PCT,
     ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER,
     STRATEGY_AUTO_ROTATE,
+    # Vibe-Trading 集成（v0.1.9 桥接 — 2026-06-02）
+    FACTOR_ENABLED, FACTOR_DEFAULT_ALPHAS, FACTOR_THRESHOLD, FACTOR_LOOKBACK,
+    SWARM_ENABLED, SWARM_DEFAULT_PRESET, SWARM_THRESHOLD,
+    GOAL_ENABLED, GOAL_DB_PATH,
 )
 from crypto_api import (
     get_crypto_price, get_ohlcv,
@@ -543,6 +547,40 @@ class TradingAgent:
                 z_exit_loss=STAT_ARB_Z_LOSS,
             )
 
+        # ── Vibe-Trading 因子策略（FACTOR）───────────────────────────
+        elif strategy_type == "FACTOR" and FACTOR_ENABLED:
+            logger.info(f"[{self.agent_id}] 初始化因子策略 (Vibe-Trading Alpha Zoo)")
+            try:
+                from factor_bridge import FactorSignalStrategy
+                return FactorSignalStrategy(
+                    config=StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+                    factor_ids=list(FACTOR_DEFAULT_ALPHAS),
+                    threshold=FACTOR_THRESHOLD,
+                    lookback=FACTOR_LOOKBACK,
+                )
+            except ImportError as e:
+                logger.warning(f"因子策略不可用: {e}，回退到 VOTE")
+                return self._build_strategy("VOTE")
+
+        # ── Vibe-Trading Swarm 策略（SWARM / SWARM:preset_name）────
+        elif (strategy_type == "SWARM" or strategy_type.startswith("SWARM:")) and SWARM_ENABLED:
+            # 解析预设名: SWARM → 默认, SWARM:crypto_trading_desk → 指定
+            if ":" in strategy_type:
+                preset = strategy_type.split(":", 1)[1]
+            else:
+                preset = SWARM_DEFAULT_PRESET
+            logger.info(f"[{self.agent_id}] 初始化 Swarm 策略 (预设: {preset})")
+            try:
+                from swarm_bridge import create_swarm_strategy
+                return create_swarm_strategy(
+                    preset_name=preset,
+                    config=StrategyConfig(symbol=self.symbol, timeframe=self.timeframe),
+                    threshold=SWARM_THRESHOLD,
+                )
+            except ImportError as e:
+                logger.warning(f"Swarm 策略不可用: {e}，回退到 VOTE")
+                return self._build_strategy("VOTE")
+
         # 合并轮动器传入的参数
         if rotator_kwargs:
             strategy_kwargs.update(rotator_kwargs)
@@ -689,8 +727,9 @@ class TradingAgent:
                 return Signal.SELL, rsi_ref[-1], rsi_ref[-2]
             return Signal.HOLD, 50.0, 50.0
 
-        # ── 多策略投票 ──
-        if isinstance(self.strategy_obj, MultiStrategyVote):
+        # ── 多策略投票 / Swarm 投票 ──
+        if isinstance(self.strategy_obj, MultiStrategyVote) or \
+           hasattr(self.strategy_obj, 'populate_signals_with_confidence'):
             # 获取信号和置信度
             entry_signals, confidences = self.strategy_obj.populate_signals_with_confidence(candles)
             last_entry = entry_signals[-1] if entry_signals else 0

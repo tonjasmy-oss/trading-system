@@ -1,0 +1,71 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-[#1E2329];
+  }
+  body {
+    @apply bg-nofx-bg text-nofx-text antialiased;
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  }
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0B0E11;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #1E2329;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #2E3340;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-nofx-bg/80 backdrop-blur-xl border-b border-[#1E2329];
+  }
+  .binance-card {
+    @apply rounded-xl border border-[#1E2329];
+    background: linear-gradient(135deg, rgba(30,35,41,0.5) 0%, rgba(14,18,23,0.8) 100%);
+  }
+  .btn-primary {
+    @apply px-4 py-2 rounded-lg font-semibold text-black transition-all;
+    background: linear-gradient(135deg, #F0B90B 0%, #FFD700 100%);
+    box-shadow: 0 0 10px rgba(240, 185, 11, 0.3);
+  }
+  .btn-primary:hover {
+    box-shadow: 0 0 20px rgba(240, 185, 11, 0.5);
+    transform: translateY(-1px);
+  }
+  .btn-secondary {
+    @apply px-4 py-2 rounded-lg font-semibold border border-[#1E2329] transition-all;
+    background: rgba(30,35,41,0.8);
+    color: #EAECEF;
+  }
+  .btn-secondary:hover {
+    border-color: #F0B90B;
+    color: #F0B90B;
+  }
+  .input-dark {
+    @apply w-full px-3 py-2 rounded-lg border border-[#1E2329] bg-[#0E1217] text-[#EAECEF] outline-none transition-all;
+  }
+  .input-dark:focus {
+    @apply border-[#F0B90B];
+    box-shadow: 0 0 0 2px rgba(240, 185, 11, 0.1);
+  }
+  .badge-gold {
+    @apply px-2 py-0.5 rounded text-xs font-bold bg-[#F0B90B]/10 text-[#F0B90B] border border-[#F0B90B]/20;
+  }
+  .badge-success {
+    @apply px-2 py-0.5 rounded text-xs font-bold bg-[#0ECB81]/10 text-[#0ECB81] border border-[#0ECB81]/20;
+  }
+  .badge-danger {
+    @apply px-2 py-0.5 rounded text-xs font-bold bg-[#F6465D]/10 text-[#F6465D] border border-[#F6465D]/20;
+  }
+}
