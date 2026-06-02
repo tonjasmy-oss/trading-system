@@ -805,7 +805,7 @@ def create_order(
             "symbol": symbol,
             "side": side.lower(),
             "type": order_type.lower(),
-            "price": float(price or 0),
+            "price": float(order_data.get("avgPrice") or order_data.get("price") or price or 0),
             "amount": float(rounded_qty),
             "filled": 0.0,
             "status": "open",

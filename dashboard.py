@@ -850,8 +850,8 @@ def get_portfolio_value():
                 "symbol": sym, "quantity": qty, "entry_price": entry,
                 "current_price": cp, "cost": cost, "value": value_now, "pnl": pnl,
             })
-        total_pnl = total_value - total_cost
-        total_pnl_pct = (total_value - total_cost) / total_cost * 100 if total_cost > 0 else 0.0
+        total_pnl = sum(p["pnl"] for p in positions_list)
+        total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
         return {
             "total_cost": round(total_cost, 2),
             "total_value": round(total_value, 2),
