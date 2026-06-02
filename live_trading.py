@@ -1825,6 +1825,13 @@ class MultiAgentOrchestrator:
 
             # 解析策略类型，支持 FORMULA:名称 语法
             raw_strategy = parts[1].strip().upper() if len(parts) > 1 else "RSI"
+            # ── SWARM 特殊处理：SYMBOL:SWARM:preset_name:exchange:timeframe ──
+            swarm_preset = None
+            if raw_strategy == "SWARM" and len(parts) > 2:
+                known_exchanges = {"binance", "gateio", "weex", "okx", "bybit", "bitget", "hyperliquid"}
+                if not parts[2].strip().lower() in known_exchanges:
+                    swarm_preset = parts[2].strip()
+                    raw_strategy = f"SWARM:{swarm_preset}"
             formula_name = None
             if raw_strategy.startswith("FORMULA:"):
                 formula_name = raw_strategy.split(":", 1)[1].strip().lower()
@@ -1832,9 +1839,12 @@ class MultiAgentOrchestrator:
             else:
                 strategy = raw_strategy
 
-            exchange = parts[2].strip().lower() if len(parts) > 2 else "binance"
+            # SWARM 模式下字段偏移: parts[2]=preset, parts[3]=exchange, parts[4]=timeframe
+            ex_idx = 3 if swarm_preset else 2
+            tf_idx = 4 if swarm_preset else 3
+            exchange = parts[ex_idx].strip().lower() if len(parts) > ex_idx else "binance"
             # 第4字段：timeframe（如 2h/4h/1h），默认 4h
-            timeframe = parts[3].strip() if len(parts) > 3 else "4h"
+            timeframe = parts[tf_idx].strip() if len(parts) > tf_idx else "4h"
             # 自定义公式（FORMULA:名称 语法，第5字段指定公式名）
             custom_formula_str = None
             if len(parts) > 4:
