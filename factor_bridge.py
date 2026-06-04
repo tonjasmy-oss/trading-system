@@ -198,6 +198,25 @@ def _get_registry() -> "Registry":
     return _registry_singleton
 
 
+# ══════════════════════════════════════════════════════════════
+# 模块初始化日志（启动时强制输出，确保桥接状态可追踪）
+# ══════════════════════════════════════════════════════════════
+
+def _bootstrap_log():
+    """启动时打印因子桥接状态"""
+    if _FACTOR_AVAILABLE:
+        try:
+            reg = _get_registry()
+            count = len(reg.list()) if reg else 0
+            logger.info(f"[factor_bridge] 因子桥接已激活: {count} 个因子可用 (Vibe-Trading Alpha Zoo)")
+        except Exception as e:
+            logger.warning(f"[factor_bridge] 因子加载成功但注册表查询失败: {e}")
+    else:
+        logger.warning("[factor_bridge] 因子桥接未激活: Vibe-Trading 依赖缺失")
+
+_bootstrap_log()
+
+
 def _load_factor(factor_id: str) -> AlphaCompute:
     """加载单个因子计算模块（带缓存）"""
     if factor_id in _factor_cache:

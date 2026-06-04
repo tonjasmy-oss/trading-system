@@ -1,24 +1,30 @@
 """
-strategy_rotator.py — 市场状态感知策略轮动
-============================================
+strategy_rotator.py — 市场状态感知策略轮动 (v2: 业绩感知)
+========================================================
 
-根据 MarketRegime 检测的市场状态，自动选择最优策略：
+根据 MarketRegime 检测的市场状态 + 实盘表现，自动选择最优策略：
 
   状态                 → 推荐策略
   ──────────────────────────────────────────
   uptrend + high_vol   → DONCHIAN (通道突破最强)
-  uptrend + high_vol   → ATRSTOP  (趋势跟随+动态止损)
+  uptrend + medium_vol → DONCHIAN
   uptrend + low_vol    → SMA      (简单均线趋势)
   downtrend + high_vol → DONCHIAN (通道向下突破做空)
-  downtrend + high_vol → RSI      (超卖反弹)
+  downtrend + medium_vol→ RSI      (超卖做多)
   downtrend + low_vol  → RSI      (超卖做多)
   ranging  + high_vol  → ATRSTOP  (震荡+高波动，动态止损防假突破)
   ranging  + medium_vol → BOLLINGER(布林带均值回归)
   ranging  + low_vol   → KDJ      (摆动交易)
   unknown              → MACD     (默认稳健)
+
+v2 新增:
+  - strategy_performance 表追踪每策略每市场状态的实盘表现
+  - 轮动时融合 regime fit_score + actual performance → 综合决策
+  - record_outcome() 在每次平仓后更新业绩数据
 """
 
 import os
+import sqlite3
 import logging
 logger = logging.getLogger(__name__)
 
@@ -66,15 +72,193 @@ _STRATEGY_FIT_SCORE = {
 
 
 class StrategyRotator:
-    """市场状态感知策略轮动器"""
+    """市场状态感知策略轮动器（v2: 业绩感知）"""
 
-    def __init__(self, symbol: str = "", config_map: dict = None, stability: int = 2):
+    def __init__(self, symbol: str = "", timeframe: str = "",
+                 config_map: dict = None, stability: int = 2,
+                 db_path: str = "live_trading.db"):
         self.symbol = symbol
+        self.timeframe = timeframe
+        self.db_path = db_path
         self.config_map = config_map or {}
         self._last_strategy: str = ""
         self._last_regime_key: tuple = ("", "")
         self._stability_counter: int = 0
         self._min_stability: int = stability
+        self._init_db()
+
+    # ---------- 数据库 ----------
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS strategy_performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                regime_trend TEXT NOT NULL,
+                regime_volatility TEXT NOT NULL,
+                total_trades INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                total_pnl_pct REAL DEFAULT 0,
+                profit_factor REAL DEFAULT 0,
+                avg_pnl_pct REAL DEFAULT 0,
+                last_trade_at TEXT,
+                updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(symbol, timeframe, strategy, regime_trend, regime_volatility)
+            );
+            CREATE INDEX IF NOT EXISTS idx_strategy_perf_symbol
+                ON strategy_performance(symbol, timeframe);
+        """)
+        conn.commit()
+        conn.close()
+
+    # ---------- 业绩记录 ----------
+
+    def record_outcome(self, strategy: str, regime_trend: str,
+                       regime_volatility: str, pnl_pct: float):
+        """
+        每次平仓后调用，更新该策略在当前市场状态下的表现。
+        """
+        if not self.symbol or not self.timeframe:
+            return
+        try:
+            conn = sqlite3.connect(self.db_path)
+            existing = conn.execute(
+                "SELECT total_trades, wins, total_pnl_pct FROM strategy_performance "
+                "WHERE symbol=? AND timeframe=? AND strategy=? AND regime_trend=? AND regime_volatility=?",
+                (self.symbol, self.timeframe, strategy, regime_trend, regime_volatility)
+            ).fetchone()
+
+            if existing:
+                total, wins, total_pnl = existing
+                total += 1
+                if pnl_pct > 0:
+                    wins += 1
+                total_pnl += pnl_pct
+            else:
+                total = 1
+                wins = 1 if pnl_pct > 0 else 0
+                total_pnl = pnl_pct
+
+            profit_factor = 1.0
+            # 从 trades 表计算更准确的盈亏比
+            loss_sum = conn.execute(
+                "SELECT COALESCE(SUM(ABS(pnl_pct)), 0) FROM trades WHERE symbol=? AND pnl_pct<0 AND exit_reason IS NOT NULL",
+                (self.symbol,)
+            ).fetchone()[0]
+            win_sum = conn.execute(
+                "SELECT COALESCE(SUM(pnl_pct), 0) FROM trades WHERE symbol=? AND pnl_pct>0",
+                (self.symbol,)
+            ).fetchone()[0]
+            if loss_sum > 0:
+                profit_factor = round(win_sum / loss_sum, 2)
+
+            avg_pnl = round(total_pnl / total, 2)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO strategy_performance "
+                "(symbol, timeframe, strategy, regime_trend, regime_volatility, "
+                " total_trades, wins, total_pnl_pct, profit_factor, avg_pnl_pct, last_trade_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))",
+                (self.symbol, self.timeframe, strategy, regime_trend, regime_volatility,
+                 total, wins, round(total_pnl, 2), profit_factor, avg_pnl)
+            )
+            conn.commit()
+            conn.close()
+            logger.debug(f"[策略轮动] {self.symbol} {strategy} @ {regime_trend}/{regime_volatility}: "
+                        f"{total}笔 胜率={wins/total:.0%} PF={profit_factor}")
+        except Exception as e:
+            logger.debug(f"[策略轮动] record_outcome 异常: {e}")
+
+    # ---------- 业绩查询 ----------
+
+    def _get_performance(self, strategy: str, trend: str, volatility: str) -> dict:
+        """查询某策略在某市场状态下的实盘表现"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            # 优先精确匹配
+            row = conn.execute(
+                "SELECT total_trades, wins, total_pnl_pct, profit_factor, avg_pnl_pct "
+                "FROM strategy_performance "
+                "WHERE symbol=? AND timeframe=? AND strategy=? AND regime_trend=? AND regime_volatility=?",
+                (self.symbol, self.timeframe, strategy, trend, volatility)
+            ).fetchone()
+            # 回退：跨 regime 查找（回测数据可能存储在不同 regime 下）
+            if not row:
+                row = conn.execute(
+                    "SELECT total_trades, wins, total_pnl_pct, profit_factor, avg_pnl_pct "
+                    "FROM strategy_performance "
+                    "WHERE symbol=? AND timeframe=? AND strategy=? "
+                    "ORDER BY total_trades DESC LIMIT 1",
+                    (self.symbol, self.timeframe, strategy)
+                ).fetchone()
+            conn.close()
+            if row and row[0] > 0:
+                return {
+                    "total_trades": row[0], "wins": row[1],
+                    "total_pnl_pct": row[2], "profit_factor": row[3],
+                    "avg_pnl_pct": row[4],
+                    "win_rate": row[1] / row[0],
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _apply_performance_penalty(self, strategy: str, fit_score: int,
+                                    trend: str, volatility: str) -> int:
+        """
+        根据实盘表现在 fit_score 上加调整分。
+        表现差 → 降权；表现好 → 加权重。
+        """
+        perf = self._get_performance(strategy, trend, volatility)
+        if not perf:
+            return fit_score  # 无实盘数据，保持原分
+
+        trades = perf["total_trades"]
+        if trades < 3:
+            return fit_score  # 样本太小，不调整
+
+        pf = perf["profit_factor"]
+        wr = perf["win_rate"]
+        avg_pnl = perf["avg_pnl_pct"]
+
+        adjustment = 0
+
+        # 总收益极端负值 → 重度惩罚（覆盖单个 per-trade 平均值不足的问题）
+        total_pnl = perf["total_pnl_pct"]
+        if total_pnl < -50.0 and trades >= 10:
+            adjustment -= 60
+        elif total_pnl < -20.0 and trades >= 10:
+            adjustment -= 40
+        elif total_pnl < -5.0 and trades >= 10:
+            adjustment -= 20
+
+        # 强负面信号：盈亏比极差或大幅亏损
+        if pf < 0.3 or avg_pnl < -3.0:
+            adjustment -= 40
+        elif pf < 0.5 or wr < 0.25:
+            adjustment -= 25
+        elif pf < 0.8 or wr < 0.35:
+            adjustment -= 10
+
+        # 正面信号：表现优秀
+        if pf > 2.0 or wr > 0.6:
+            adjustment += 15
+        elif pf > 1.2 and wr > 0.45:
+            adjustment += 5
+
+        new_score = max(0, min(100, fit_score + adjustment))
+        if adjustment != 0:
+            logger.info(
+                f"[策略轮动] {self.symbol} {strategy} @ {trend}/{volatility}: "
+                f"fit={fit_score} + perf_adj={adjustment:+d} = {new_score} "
+                f"(trades={trades} wr={wr:.0%} pf={pf} avgPnl={avg_pnl}%)"
+            )
+        return new_score
+
+    # ---------- 轮动核心 ----------
 
     def pick(self, regime: dict) -> dict:
         trend = (regime.get("trend") or "unknown").lower()
@@ -83,6 +267,30 @@ class StrategyRotator:
         key = (trend, vol)
         strategy_name, reason, kwargs = REGIME_STRATEGY_MAP.get(key, FALLBACK_STRATEGY)
 
+        # ── 业绩感知：检查推荐策略的实盘表现 ──
+        perf_adjusted_score = self._apply_performance_penalty(
+            strategy_name, 100, trend, vol)  # 基分 100 作为参考
+
+        # 如果推荐策略被大幅降权(<30)，尝试找替代
+        if perf_adjusted_score < 30:
+            alternatives = self._find_better_alternative(strategy_name, trend, vol)
+            if alternatives:
+                alt_strategy, alt_score, alt_reason = alternatives
+                logger.warning(
+                    f"[策略轮动] {self.symbol} {trend}+{vol}: "
+                    f"推荐{strategy_name}(业绩差，得分{perf_adjusted_score}) "
+                    f"→ 替代{alternatives[0]}(得分{alt_score})"
+                )
+                strategy_name = alt_strategy
+                reason = f"{reason} (业绩替代: {alt_reason})"
+                kwargs = REGIME_STRATEGY_MAP.get(
+                    next((k for k in REGIME_STRATEGY_MAP
+                          if REGIME_STRATEGY_MAP[k][0] == alt_strategy),
+                         ("", "", {})),
+                    ({},)
+                )[2] if alt_strategy in dict(REGIME_STRATEGY_MAP.values()) else {}
+
+        # 稳定期检查
         if key == self._last_regime_key:
             self._stability_counter += 1
         else:
@@ -112,24 +320,60 @@ class StrategyRotator:
             "regime_volatility": vol,
         }
 
+    def _find_better_alternative(self, excluded: str, trend: str, volatility: str):
+        """在当前市场状态下，找除 excluded 外表现最好的策略"""
+        candidates = []
+        for st in ["DONCHIAN", "ATRSTOP", "BOLLINGER", "RSI", "SMA", "KDJ", "MACD"]:
+            if st == excluded:
+                continue
+            fit = self.score_fit(st, trend, volatility)
+            adj_fit = self._apply_performance_penalty(st, fit, trend, volatility)
+            if adj_fit >= 25:
+                candidates.append((st, adj_fit))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            best = candidates[0]
+            return (best[0], best[1], f"regime_fit={self.score_fit(best[0], trend, volatility)}")
+        return None
+
+    def get_better_strategies(self, current_strategy: str, regime: dict, top_n: int = 3) -> list:
+        """
+        获取比当前策略更适合的策略推荐列表。
+        原方法，保持兼容；新增业绩调整。
+        """
+        trend = (regime.get("trend") or "unknown").lower()
+        vol = (regime.get("volatility") or "unknown").lower()
+        current_fit = self.score_fit(current_strategy, trend, vol)
+
+        candidates = []
+        for st in ["DONCHIAN", "ATRSTOP", "BOLLINGER", "RSI", "SMA", "KDJ", "MACD"]:
+            if st == current_strategy:
+                continue
+            fit = self.score_fit(st, trend, volatility=vol)
+            adj_fit = self._apply_performance_penalty(st, fit, trend, vol)
+            if adj_fit > current_fit:
+                candidates.append({
+                    "strategy": st,
+                    "fit_score": adj_fit,
+                    "reason": f"市场适配度={fit}" + (f" 实盘调整后={adj_fit}" if adj_fit != fit else ""),
+                })
+
+        candidates.sort(key=lambda x: x["fit_score"], reverse=True)
+        return candidates[:top_n]
+
     def get_current_strategy(self) -> str:
         return self._last_strategy or "MACD"
 
     def reset(self):
-        """重置轮动状态（切换模式时调用）"""
         self._last_strategy = ""
         self._last_regime_key = ("", "")
         self._stability_counter = 0
 
     def score_fit(self, strategy_name: str, trend: str, volatility: str) -> int:
-        """
-        评估指定策略对当前市场的适配度（0-100）。
-        优先查本地评分表，然后回退到 market_regime.recommend_strategies。
-        """
         key = (strategy_name.upper(), trend.lower(), volatility.lower())
         if key in _STRATEGY_FIT_SCORE:
             return _STRATEGY_FIT_SCORE[key]
-        # 回退到 market_regime 的推荐引擎
         try:
             from components.market_regime import recommend_strategies
             recs = recommend_strategies(trend, volatility, top_n=10)
@@ -138,33 +382,11 @@ class StrategyRotator:
                     return rec["fit_score"]
         except ImportError:
             pass
-        return 30  # 默认低适配度
+        return 30
 
     def is_current_strategy_appropriate(self, regime: dict, threshold: int = 50) -> bool:
-        """当前策略是否适配当前市场（fit_score >= threshold）"""
         if not self._last_strategy:
             return True
         trend = (regime.get("trend") or "unknown").lower()
         vol = (regime.get("volatility") or "unknown").lower()
         return self.score_fit(self._last_strategy, trend, vol) >= threshold
-
-    def get_better_strategies(self, current_strategy: str, regime: dict, top_n: int = 3) -> list:
-        """
-        获取比当前策略更适配市场的推荐策略。
-        返回适配度超过当前策略的推荐列表。
-        """
-        trend = (regime.get("trend") or "unknown").lower()
-        vol = (regime.get("volatility") or "unknown").lower()
-        current_score = self.score_fit(current_strategy, trend, vol)
-
-        try:
-            from components.market_regime import recommend_strategies
-            recs = recommend_strategies(trend, vol, top_n=10)
-        except ImportError:
-            return []
-
-        better = []
-        for rec in recs:
-            if rec["fit_score"] > current_score and rec["strategy"].upper() != current_strategy.upper():
-                better.append(rec)
-        return better[:top_n]

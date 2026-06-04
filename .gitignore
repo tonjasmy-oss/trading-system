@@ -65,3 +65,6 @@ frontend/package-lock.json
 
 # Personal docs
 操作手册*
+agent_state.json
+check_pos.py
+SYSTEM_AUDIT*.md

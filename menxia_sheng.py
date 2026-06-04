@@ -331,7 +331,7 @@ class MenxiaSheng:
             rules_triggered.append(f"R7_风险等级:{self._risk_level.value}")
             return self._reject(symbol, quantity, agent_id, order_id,
                                f"风险等级{self._risk_level.value}，禁止开仓",
-                               self._risk_level, rules_triggered, entry_price)
+                               self._risk_level, rules_triggered, entry_price, total_exp)
 
         # R8: 信号质量/置信度拦截（来自历史复盘的错误模式）
         try:
@@ -409,9 +409,15 @@ class MenxiaSheng:
             entry_time: 入场时间戳(毫秒)，0=使用当前时间（用于恢复持仓时保留原始时间）
         """
         self._check_day_reset()
+        # 保障 entry_time 有效性：0 或异常小值时回退到当前时间
+        effective_entry_time = entry_time if entry_time and entry_time > 1000000000000 else int(time.time() * 1000)
+        if entry_time == 0:
+            logger.debug(f"[门下省] {symbol} entry_time 未传入，使用当前时间 {effective_entry_time}")
+        elif entry_time != effective_entry_time:
+            logger.warning(f"[门下省] {symbol} entry_time 异常({entry_time})，已修正为 {effective_entry_time}")
         self._positions[symbol] = {
             "entry_price": entry_price,
-            "entry_time": entry_time if entry_time else int(time.time() * 1000),
+            "entry_time": effective_entry_time,
             "quantity": quantity,
             "stop_loss": stop_loss,
             "take_profit": take_profit,

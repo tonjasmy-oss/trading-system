@@ -359,12 +359,13 @@ class TradingAgent:
         self._auto_rotate_enabled = (strategy == "AUTO" or STRATEGY_AUTO_ROTATE)
         try:
             from components.strategy_rotator import StrategyRotator
-            self._rotator = StrategyRotator(symbol=symbol, stability=3)
+            self._rotator = StrategyRotator(symbol=symbol, timeframe=timeframe, stability=3, db_path=DB_PATH)
             mode = "自动轮动" if self._auto_rotate_enabled else "推荐模式(仅日志)"
             logger.info(f"[{agent_id}] 策略轮动器已启用（{mode}）")
         except ImportError:
             logger.warning(f"[{agent_id}] 策略轮动器不可用")
         self._hold_streak: int = 0  # 连续 HOLD 计数器（用于检测策略不适配）
+        self._ai_periodic_counter: int = 0  # AI 周期性调用计数器（每 N 轮即使 HOLD 也调用）
 
         # 多周期信号确认器
         self._mtf_confirmer = None
@@ -379,14 +380,20 @@ class TradingAgent:
                 symbol=symbol,
                 db_path=DB_PATH,
                 anchor_params=anchor,
+                strategy=strategy,
             )
-            self._optimizer.set_current_params({
-                "rsi_period": rsi_period,
-                "oversold": oversold,
-                "overbought": overbought,
-                "stop_loss": stop_loss_pct,
-                "take_profit": take_profit_pct,
-            })
+            init_params = {"stop_loss": stop_loss_pct, "take_profit": take_profit_pct}
+            if strategy == "RSI":
+                init_params.update({"rsi_period": rsi_period, "oversold": oversold, "overbought": overbought})
+            elif strategy == "ATRSTOP":
+                init_params.update({"ema_period": ATRSTOP_EMA_PERIOD, "atr_period": ATRSTOP_ATR_PERIOD, "atr_multiplier": ATRSTOP_ATR_MULTIPLIER})
+            elif strategy == "DONCHIAN":
+                init_params.update({"channel_period": self.channel_period, "trend_ema_period": self.trend_ema_period})
+            elif strategy == "BOLLINGER":
+                init_params.update({"period": 20, "std_dev": 2.0})
+            elif strategy == "SMA":
+                init_params.update({"fast_period": 10, "slow_period": 30})
+            self._optimizer.set_current_params(init_params)
             logger.info(f"[{agent_id}] 在线参数优化器已启用")
 
         # 策略实例（支持通达信公式）
@@ -914,6 +921,7 @@ class TradingAgent:
             self.menxia.record_open(
                 self.symbol, exec_price, quantity, stop_loss, take_profit,
                 side="short" if is_short else "long",
+                entry_time=timestamp,
             )
 
         # ── TradeHistory 记录开仓 ──
@@ -1117,8 +1125,36 @@ class TradingAgent:
                         f"OS={self.oversold} OB={self.overbought} "
                         f"SL={self.stop_loss_pct:.3f} TP={self.take_profit_pct:.3f}"
                     )
+                    # 同步策略专属参数
+                    for change in opt_result["changes"]:
+                        pname = change["param"]
+                        pnew = change["new"]
+                        if pname == "ema_period":
+                            ATRSTOP_EMA_PERIOD_OVERRIDE = int(pnew)
+                        elif pname == "atr_period":
+                            ATRSTOP_ATR_PERIOD_OVERRIDE = int(pnew)
+                        elif pname == "atr_multiplier":
+                            ATRSTOP_ATR_MULTIPLIER_OVERRIDE = pnew
+                        elif pname == "channel_period":
+                            self.channel_period = int(pnew)
+                        elif pname == "trend_ema_period":
+                            self.trend_ema_period = int(pnew)
             except Exception as e:
                 logger.warning(f"[{self.agent_id}] 在线优化异常: {e}")
+
+        # ── 业绩感知：平仓后记录策略在当前市场状态下的表现 ──
+        if self._rotator and self._current_regime:
+            try:
+                regime_trend = self._current_regime.get("trend", "unknown")
+                regime_volatility = self._current_regime.get("volatility", "unknown")
+                self._rotator.record_outcome(
+                    strategy=self.strategy_name,
+                    regime_trend=regime_trend,
+                    regime_volatility=regime_volatility,
+                    pnl_pct=pnl_pct,
+                )
+            except Exception:
+                pass
 
         # ── 交易后反思复盘（AI 分析入场/出场逻辑）──
         if _REFLECTION_AVAILABLE and _reflection_trade_id is not None:
@@ -1136,8 +1172,8 @@ class TradingAgent:
                     "pnl_pct": pnl_pct,
                     "exit_reason": reason,
                 })
-            except Exception:
-                pass  # 反思失败不影响主流程
+            except Exception as e:
+                logger.warning(f"[{self.agent_id}] 反思复盘失败: {e}")
 
         return True
 
@@ -1251,6 +1287,8 @@ class TradingAgent:
                         if new_strategy != self.strategy_name:
                             logger.info(f"[{self.agent_id}] 策略轮动: {self.strategy_name} → {new_strategy} "
                                         f"({pick['reason']})")
+                            if self._optimizer:
+                                self._optimizer.switch_strategy(new_strategy, pick.get("kwargs"))
                             self.strategy_name = new_strategy
                             self.strategy_obj = self._build_strategy(new_strategy, pick.get("kwargs", {}))
                             result["strategy"] = new_strategy
@@ -1265,6 +1303,8 @@ class TradingAgent:
                                 f"(适配度={best['fit_score']}, {best['reason']})"
                             )
                             old_strategy = self.strategy_name
+                            if self._optimizer:
+                                self._optimizer.switch_strategy(best["strategy"])
                             self.strategy_name = best["strategy"]
                             self.strategy_obj = self._build_strategy(best["strategy"])
                             result["strategy"] = best["strategy"]
@@ -1377,13 +1417,26 @@ class TradingAgent:
             else:
                 result["mtf"] = mtf_result
 
-        # AI 过滤（仅对 BUY/SELL 有效）
+        # AI 过滤（仅对 BUY/SELL 有效，HOLD 时每10轮周期性调用一次市场评估）
         ai_verdict = ""
+        filtered_sig = signal_val  # 默认不修改信号
+        self._ai_periodic_counter += 1
         if signal_val != Signal.HOLD:
             filtered_sig, ai_verdict = self._apply_ai_filter(
                 signal_val, current_price, rsi, price_change_24h_pct, volume_24h
             )
             result["ai_verdict"] = ai_verdict
+            self._ai_periodic_counter = 0  # 有信号时重置计数器
+        elif self._ai_periodic_counter >= 10 and self.ai_filter:
+            # 每10轮即使HOLD也调用AI做周期性市场研判
+            self._ai_periodic_counter = 0
+            try:
+                _, ai_verdict = self._apply_ai_filter(
+                    Signal.HOLD, current_price, rsi, price_change_24h_pct, volume_24h
+                )
+                logger.info(f"[{self.agent_id}] 🤖 周期AI研判: {ai_verdict}")
+            except Exception as e:
+                logger.debug(f"[{self.agent_id}] 周期AI调用失败: {e}")
 
             # ── 多空信号处理 ──
             # BUY + 持空 → 平空; BUY + 空仓 → 开多
@@ -1540,11 +1593,13 @@ class TradingAgent:
                     top_rec = better_list[0]
                     regime_rec += f" 💡推荐: {top_rec['strategy']}(适配{top_rec['fit_score']}){'(将自动切换)' if self._auto_rotate_enabled else ''}"
 
+        # AI 过滤器状态显示：已初始化但跳过 → "就绪"，未初始化 → "未启用"，有结果 → verdict
+        ai_display = ai_verdict or ("就绪" if self.ai_filter else "未启用")
         decision_chain = {
             "raw": signal_names.get(signal_val, "HOLD"),
-            "ai_filter": ai_verdict or "N/A",
-            "menxia": "通过" if can_open else ("N/A" if not reason else f"否决({reason})"),
-            "signal_router": routing_info.get("chosen_strategy", "N/A") if routing_info else "N/A",
+            "ai_filter": ai_display,
+            "menxia": "通过" if can_open else ("跳过(HOLD)" if not reason else f"否决({reason})"),
+            "signal_router": routing_info.get("chosen_strategy") if routing_info and routing_info.get("chosen_strategy") else self.strategy_name,
             "trend_filter": "放行" if not trend else (f"禁多" if trend == "downtrend" else f"禁空" if trend == "uptrend" else trend),
             "final": result.get("signal", "?"),
         }
@@ -1893,6 +1948,24 @@ class MultiAgentOrchestrator:
             )
             self.agents.append(agent)
 
+    def _sync_agent_state(self):
+        """将当前 Agent 运行时策略写入共享状态文件（供 Dashboard 跨进程读取）"""
+        import json
+        state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_state.json")
+        state = [
+            {
+                "agent": a.agent_id,
+                "symbol": a.symbol,
+                "strategy": a.strategy_name,
+                "exchange": a.exchange,
+                "timeframe": a.timeframe,
+            }
+            for a in self.agents
+        ]
+        with open(state_file, "w") as f:
+            json.dump(state, f, indent=2)
+            f.write("\n")
+
     async def check_all_once(self) -> List[Dict]:
         """对所有 Agent 执行一次检查（异步）"""
         import asyncio
@@ -1975,6 +2048,7 @@ class MultiAgentOrchestrator:
         while self._running:
             try:
                 loop.run_until_complete(self.check_all_once())
+                self._sync_agent_state()
             except Exception as e:
                 logger.error(f"后台轮询异常: {e}")
             time.sleep(AGENT_CHECK_INTERVAL)

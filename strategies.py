@@ -485,9 +485,9 @@ RSI(8)：{ctx.rsi:.2f}
                 logger.info(f"AI_FILTER: 批准信号 {sig_name}，confidence={confidence:.2f}，reason={reason}")
                 return technical_signal, f"AI批准({reason})"
 
-        # confidence <= 0.65 或 HOLD → 透传但标记风险
-        risk_tag = f"⚠️{risk}" if risk == "HIGH" else ""
-        return technical_signal, f"AI模糊(HOLD)→{sig_name} {risk_tag} {reason}"
+        # 严格模式：AI模糊/HOLD/低置信度 → 否决信号，不贸然入场
+        logger.info(f"AI_FILTER: 信号模糊否决 {sig_name}，verdict={v} confidence={confidence:.2f} reason={reason}")
+        return Signal.HOLD, f"AI否决(信号模糊: {reason})"
 
 
 # ============================================================

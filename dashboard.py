@@ -359,24 +359,106 @@ def _get_module_status() -> dict:
         modules["feishu"] = True
     except Exception:
         modules["feishu"] = False
+    # Vibe-Trading 因子桥接
+    try:
+        from factor_bridge import _FACTOR_AVAILABLE as _fa, _get_registry
+        if _fa:
+            reg = _get_registry()
+            modules["factor"] = {"available": True, "count": len(reg.list()) if reg else 0}
+        else:
+            modules["factor"] = {"available": False, "count": 0}
+    except Exception:
+        modules["factor"] = {"available": False, "count": 0}
+    # Vibe-Trading Swarm 桥接
+    try:
+        from swarm_bridge import list_swarm_presets
+        presets = list_swarm_presets()
+        modules["swarm"] = {"available": True, "count": len(presets)}
+    except Exception:
+        modules["swarm"] = {"available": False, "count": 0}
     return modules
 
 
 def _get_agent_list() -> list:
     """获取 Agent 标的列表及其策略、行情"""
-    from config import AGENT_SYMBOLS
     import sqlite3
     agents = []
     db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_trading.db")
+
+    # 优先从运行中的 orchestrator 获取实际策略（处理自动轮动后的策略变更）
+    try:
+        from live_trading import orchestrator as _orch
+        if _orch and hasattr(_orch, 'agents') and _orch.agents:
+            for agent in _orch.agents:
+                price = None
+                try:
+                    conn = sqlite3.connect(db_path)
+                    row = conn.execute(
+                        "SELECT price FROM equity_log WHERE agent_id=? AND price>0 ORDER BY id DESC LIMIT 1",
+                        (agent.agent_id,)
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        price = round(row[0], 4)
+                except Exception:
+                    pass
+                agents.append({
+                    "agent": agent.agent_id,
+                    "symbol": agent.symbol,
+                    "strategy": agent.strategy_name,
+                    "exchange": agent.exchange,
+                    "timeframe": agent.timeframe,
+                    "price": price,
+                })
+            return agents
+    except Exception:
+        pass
+
+    # 次选：从跨进程状态文件读取（live_trading daemon 写入）
+    import json
+    state_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent_state.json")
+    try:
+        if os.path.exists(state_file):
+            with open(state_file, "r") as f:
+                state_agents = json.load(f)
+            for sa in state_agents:
+                price = None
+                try:
+                    conn = sqlite3.connect(db_path)
+                    row = conn.execute(
+                        "SELECT price FROM equity_log WHERE agent_id=? AND price>0 ORDER BY id DESC LIMIT 1",
+                        (sa.get("agent", ""),)
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        price = round(row[0], 4)
+                except Exception:
+                    pass
+                agents.append({**sa, "price": price})
+            if agents:
+                return agents
+    except Exception:
+        pass
+
+    # 回退：从配置文件解析
+    from config import AGENT_SYMBOLS
     for i, item in enumerate(AGENT_SYMBOLS.split(",")):
         item = item.strip()
         if not item:
             continue
         parts = item.split(":")
         sym = parts[0].strip() if len(parts) > 0 else "?"
-        strat = parts[1].strip() if len(parts) > 1 else "?"
-        exch = parts[2].strip() if len(parts) > 2 else "?"
-        tf = parts[3].strip() if len(parts) > 3 else "?"
+        raw_strat = parts[1].strip() if len(parts) > 1 else "?"
+        swarm_preset = None
+        if raw_strat.upper() == "SWARM" and len(parts) > 2:
+            known_exchanges = {"binance", "gateio", "weex", "okx", "bybit", "bitget", "hyperliquid"}
+            if parts[2].strip().lower() not in known_exchanges:
+                swarm_preset = parts[2].strip()
+        strat = f"SWARM:{swarm_preset}" if swarm_preset else raw_strat
+        ex_idx = 3 if swarm_preset else 2
+        tf_idx = 4 if swarm_preset else 3
+        exch = parts[ex_idx].strip() if len(parts) > ex_idx else "?"
+        tf = parts[tf_idx].strip() if len(parts) > tf_idx else "?"
         agent_id = f"agent_{i+1}"
         price = None
         try:
