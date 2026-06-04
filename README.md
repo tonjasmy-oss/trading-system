@@ -2,7 +2,7 @@
 
 **三省六部制**量化交易系统，支持加密货币与股票的双市场回测 / 模拟 / 实盘交易。核心理念：信号生成（**中书省**）、风控审核（**门下省**）、执行调度（**尚书省**）三层分离，规则硬编码、逻辑可审计。
 
-> **v3.2 更新（2026-06-04）**：策略轮动 + 参数优化闭环 —— 业绩感知轮动（回测数据融合）、策略感知参数域、投票制止损冲突修复、参数持久化（重启不丢）。
+> **v3.3 更新（2026-06-04）**: 借鉴 Vibe-Trading — Shadow Account / 回测验证增强 / 策略多格式导出。
 
 ---
 
@@ -55,6 +55,9 @@
 | **策略感知优化** ✦ | 8种策略独立参数域，轮动时自动切换，DB持久化重启不丢 |
 | **投票制调参** | 多规则投票取净方向，消除止损同时被调高调低冲突 |
 | **多周期确认** | 1h/4h/1d 信号一致性验证 |
+| **Shadow Account** ✦ | 历史交易聚类分析→提取盈利规则→影子回测对比实际表现 |
+| **回测验证增强** ✦ | 蒙特卡洛模拟 + Bootstrap CI + Walk-Forward + 基准对比 |
+| **策略导出** ✦ | Pine Script v6 (7种) + MQL5 (4种)，一键复制到 TradingView/MT5 |
 | **安全重启** | `restart.sh` 优雅停止 + 端口清理 + 验证 |
 
 ---
@@ -113,6 +116,9 @@ trading-system/
 ├── trade_history.py               # 交易历史记录
 ├── tdx_compiler.py                # 通达信公式编译器
 │
+├── shadow_account.py              # ✦ 交易影子账户（规则提取+回测对比）
+├── backtest_validation.py         # ✦ 回测验证增强（蒙特卡洛/Walk-Forward）
+├── strategy_exporter.py           # ✦ 策略导出（Pine Script/MQL5）
 ├── restart.sh                     # 安全重启脚本
 ├── run_dashboard.sh               # Dashboard 启动（setsid）
 ├── run_live_daemon.sh             # Live Daemon 启动
@@ -263,6 +269,7 @@ STRATEGY_AUTO_ROTATE=false
 | `/api/experiment/pipeline/regime` | GET | 市场状态 + 策略推荐 |
 | `/api/experiment/pipeline/run` | GET | 策略实验管线 |
 | `/api/backtest/compare` | GET | 多策略对比回测排行 |
+| `/api/strategy/export` | GET | 策略多格式导出（Pine/MQL5） |
 | `/api/replay/stats` | GET | 交易复盘KPI |
 | `/api/replay/trades` | GET | 交易历史 |
 | `/api/replay/heatmap` | GET | 策略×市场热力图 |
