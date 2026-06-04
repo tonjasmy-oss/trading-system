@@ -68,3 +68,5 @@ frontend/package-lock.json
 agent_state.json
 check_pos.py
 SYSTEM_AUDIT*.md
+*.db-shm
+*.db-wal

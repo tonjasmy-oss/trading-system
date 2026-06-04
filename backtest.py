@@ -35,6 +35,7 @@ from tdx_compiler import FormulaStrategy, BUILTIN_FORMULAS
 from history_cache import get_ohlcv as cache_get_ohlcv, get_latest_timestamp, save_ohlcv, init_cache_db
 
 MAX_CACHE_LIMIT = 15000
+from backtest_validation import BacktestValidator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -719,6 +720,16 @@ def main():
     print_summary(result)
     report_path = generate_report(result, output_dir=args.output_dir)
     print(f"\n📄 完整报告: {report_path}")
+    # ── 回测验证增强 ──
+    try:
+        pnls = [t.pnl_pct for t in result.trades]
+        if len(pnls) >= 10:
+            bv = BacktestValidator(returns=pnls)
+            vr = bv.run_all()
+            print()
+            print(bv.format_report(vr))
+    except Exception:
+        pass
 
     return result
 

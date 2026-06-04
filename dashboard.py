@@ -378,6 +378,21 @@ def _get_module_status() -> dict:
         modules["swarm"] = {"available": False, "count": 0}
     return modules
 
+@app.get("/api/strategy/export")
+async def strategy_export(strategy: str = "RSI", format: str = "pine"):
+    """导出策略为 Pine Script 或 MQL5"""
+    from strategy_exporter import export_pine, export_mql5
+    sl = float(os.getenv("STRATEGY_STOP_LOSS", "0.03"))
+    tp = float(os.getenv("STRATEGY_TAKE_PROFIT", "0.05"))
+    try:
+        if format == "mql5":
+            code = export_mql5(strategy.upper(), sl=sl, tp=tp)
+        else:
+            code = export_pine(strategy.upper(), sl=sl, tp=tp)
+        return {"strategy": strategy.upper(), "format": format, "code": code}
+    except Exception as e:
+        return {"error": str(e)}
+
 
 def _get_agent_list() -> list:
     """获取 Agent 标的列表及其策略、行情"""

@@ -1156,6 +1156,18 @@ class TradingAgent:
             except Exception:
                 pass
 
+        # ── 交易影子账户：每5笔交易自动分析一次 ──
+        try:
+            _shadow_trade_count = getattr(self, '_shadow_trade_count', 0) + 1
+            setattr(self, '_shadow_trade_count', _shadow_trade_count)
+            if _shadow_trade_count >= 5 and _shadow_trade_count % 5 == 0:
+                from shadow_account import ShadowAccount
+                sa = ShadowAccount(db_path=DB_PATH, min_trades=3)
+                sa.analyze()
+                logger.info(f"[{self.agent_id}] 🧠 影子账户已更新 (累积{_shadow_trade_count}笔)")
+        except Exception:
+            pass
+
         # ── 交易后反思复盘（AI 分析入场/出场逻辑）──
         if _REFLECTION_AVAILABLE and _reflection_trade_id is not None:
             try:
