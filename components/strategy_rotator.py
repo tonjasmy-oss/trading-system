@@ -283,12 +283,14 @@ class StrategyRotator:
                 )
                 strategy_name = alt_strategy
                 reason = f"{reason} (业绩替代: {alt_reason})"
+                # 用集合安全检查（dict(REGIME_STRATEGY_MAP.values()) 对 3 元组会报错）
+                _strategy_names = {v[0] for v in REGIME_STRATEGY_MAP.values()}
                 kwargs = REGIME_STRATEGY_MAP.get(
                     next((k for k in REGIME_STRATEGY_MAP
                           if REGIME_STRATEGY_MAP[k][0] == alt_strategy),
                          ("", "", {})),
                     ({},)
-                )[2] if alt_strategy in dict(REGIME_STRATEGY_MAP.values()) else {}
+                )[2] if alt_strategy in _strategy_names else {}
 
         # 稳定期检查
         if key == self._last_regime_key:

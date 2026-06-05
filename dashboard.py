@@ -57,10 +57,23 @@ async def _on_startup():
         try:
             init_db()
             mon = PriceMonitor(check_interval=30)
+            # 从 AGENT_SYMBOLS 解析实际交易标的
             symbols = [
                 {"symbol": "BTC", "market": "CRYPTO"},
                 {"symbol": "ETH", "market": "CRYPTO"},
             ]
+            import os as _os
+            agent_cfg = _os.getenv("AGENT_SYMBOLS", "")
+            if agent_cfg:
+                seen = {"BTC", "ETH"}
+                for part in agent_cfg.split(","):
+                    part = part.strip()
+                    if not part: continue
+                    sym = part.split(":")[0].strip()
+                    coin = sym.split("/")[0] if "/" in sym else sym
+                    if coin and coin not in seen:
+                        symbols.append({"symbol": coin, "market": "CRYPTO"})
+                        seen.add(coin)
             update_monitor_status("running", f"监控 {len(symbols)} 个品种")
 
             def _on_alert(data):

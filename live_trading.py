@@ -1043,14 +1043,15 @@ class TradingAgent:
         c.execute("UPDATE positions SET status = ? WHERE status = 'open' AND symbol = ?",
                   (reason, self.symbol))
         conn.commit()
+        trade_rowid = c.lastrowid
         conn.close()
 
         # 通知门下省更新每日亏损
         if self.menxia:
             self.menxia.record_close(self.symbol, pnl_pct)
 
-        # 保存 trade_id 供后续反思复盘使用（TradeHistory 块内会置 None）
-        _reflection_trade_id = self._current_trade_id
+        # 保存 trade_id 供后续反思复盘使用（不依赖 TradeHistory）
+        _reflection_trade_id = self._current_trade_id or trade_rowid
 
         # ── TradeHistory 记录平仓 ──
         if self._trade_history and self._current_trade_id is not None:
@@ -1167,6 +1168,28 @@ class TradingAgent:
                 logger.info(f"[{self.agent_id}] 🧠 影子账户已更新 (累积{_shadow_trade_count}笔)")
         except Exception:
             pass
+
+        # ── Goal 运行时：交易结果作为证据记录 ──
+        if GOAL_ENABLED:
+            try:
+                from goal_bridge import GoalRuntime
+                _goal = GoalRuntime(db_path=GOAL_DB_PATH or "")
+                goals = _goal.list_active_goals()
+                if not goals:
+                    _goal.create_backtest_goal(
+                        symbol=self.symbol,
+                        strategy=self.strategy_name,
+                        target_metric="profit_factor",
+                        target_value=1.2,
+                    )
+                else:
+                    _goal.add_backtest_evidence(
+                        goal_id=goals[0].goal_id,
+                        params={"strategy": self.strategy_name, "symbol": self.symbol},
+                        metrics={"pnl_pct": pnl_pct, "exit_reason": reason},
+                    )
+            except Exception:
+                pass
 
         # ── 交易后反思复盘（AI 分析入场/出场逻辑）──
         if _REFLECTION_AVAILABLE and _reflection_trade_id is not None:
@@ -1868,14 +1891,14 @@ class MultiAgentOrchestrator:
 
         self._parse_and_create_agents()
 
-        # ── 根据 Agent 数量自动均分总暴露度 ──
-        # 公式: 单标的 = 总暴露 / Agent 数量（均分）
+        # ── 根据 Agent 数量自动均分总暴露度（显式配置优先）──
+        # 均分作为最低保障，若显式配置更高则以显式配置为准
         if self.menxia and self.agents:
-            per_symbol = self.menxia.MAX_TOTAL_EXPOSURE / len(self.agents)
+            fair_share = self.menxia.MAX_TOTAL_EXPOSURE / len(self.agents)
+            per_symbol = max(self.menxia.MAX_POSITION_PER_SYMBOL, fair_share)
             self.menxia.MAX_POSITION_PER_SYMBOL = per_symbol
-            LIVE_ORDER_CAPITAL_PCT = per_symbol
-            logger.info(f"[门下省] 动态均分: 总暴露={self.menxia.MAX_TOTAL_EXPOSURE*100:.0f}% "
-                       f"/ {len(self.agents)} 标的 = {per_symbol*100:.1f}%/标的")
+            logger.info(f"[门下省] 单标的上限: {per_symbol*100:.1f}% "
+                       f"(均分底线={fair_share*100:.1f}%, 总暴露={self.menxia.MAX_TOTAL_EXPOSURE*100:.0f}%)")
         logger.info(f"多 Agent 编排器已初始化: {len(self.agents)} 个 Agent | "
                    f"实盘: {'是' if self.live_trading else '否（模拟）'}")
 

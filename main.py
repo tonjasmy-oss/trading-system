@@ -14,6 +14,10 @@ from pathlib import Path
 # 添加当前目录到路径
 sys.path.insert(0, str(Path(__file__).parent))
 
+from dotenv import load_dotenv
+_ENV_PATH = Path(__file__).parent / ".env"
+load_dotenv(_ENV_PATH)
+
 from database import init_db
 from portfolio import Portfolio
 from monitor import PriceMonitor, quick_price_check
@@ -33,16 +37,27 @@ _monitor_thread = None
 _monitor_running = False
 
 def get_monitor_symbols():
-    """获取监控品种列表"""
-    return [
+    """获取监控品种列表（从 AGENT_SYMBOLS 动态扩展）"""
+    import os
+    base = [
         {"symbol": "BTC", "market": "CRYPTO"},
         {"symbol": "ETH", "market": "CRYPTO"},
-        {"symbol": "AAPL", "market": "US"},
-        {"symbol": "TSLA", "market": "US"},
-        {"symbol": "00700", "market": "HK"},
-        {"symbol": "600000", "market": "CN"},
-        {"symbol": "000001", "market": "CN"},
     ]
+    # 从 .env 的 AGENT_SYMBOLS 解析实际交易标的
+    agent_cfg = os.getenv("AGENT_SYMBOLS", "")
+    seen = {"BTC", "ETH"}
+    if agent_cfg:
+        for part in agent_cfg.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            sym = part.split(":")[0].strip()
+            # 提取纯币种名（如 SUI/USDT → SUI）
+            coin = sym.split("/")[0] if "/" in sym else sym
+            if coin and coin not in seen:
+                base.append({"symbol": coin, "market": "CRYPTO"})
+                seen.add(coin)
+    return base
 
 def monitor_loop_bg():
     """后台监控循环"""
