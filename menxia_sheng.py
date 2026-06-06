@@ -207,6 +207,7 @@ class MenxiaSheng:
                  risk_alert_callback = None):
         self.initial_capital = initial_capital
         self.current_capital = initial_capital
+        self.db_path = db_path
 
         # 每日重置状态
         self._day_key: str = ""
@@ -231,7 +232,10 @@ class MenxiaSheng:
         self._consecutive_losses: int = 0
 
         self._check_day_reset()
-        logger.info(f"[门下省] 初始化完成，初始资金 ${initial_capital:.2f}")
+        self._init_menxia_table()
+        self._load_positions_from_db()
+        logger.info(f"[门下省] 初始化完成，初始资金 ${initial_capital:.2f}"
+                    f" 恢复持仓 {len(self._positions)} 笔")
 
     # ======================== 公开审核 API ========================
 
@@ -423,6 +427,18 @@ class MenxiaSheng:
             "take_profit": take_profit,
             "side": side,
         }
+        # 持久化到 SQLite，确保重启后 R6 72h 超时检查可用
+        try:
+            conn = self._get_menxia_conn()
+            conn.execute("""
+                INSERT OR REPLACE INTO menxia_positions
+                (symbol, entry_price, entry_time, quantity, stop_loss, take_profit, side)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (symbol, entry_price, effective_entry_time, quantity, stop_loss, take_profit, side))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"[门下省] 持仓持久化失败: {symbol} - {e}")
         self._daily_trades += 1
         logger.info(f"[门下省] 开仓记录: {symbol} ${entry_price:.4f} x {quantity} ({side})")
 
@@ -437,6 +453,14 @@ class MenxiaSheng:
         self._check_day_reset()
         if symbol in self._positions:
             del self._positions[symbol]
+        # 从 SQLite 删除持仓记录
+        try:
+            conn = self._get_menxia_conn()
+            conn.execute("DELETE FROM menxia_positions WHERE symbol = ?", (symbol,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.error(f"[门下省] 持仓删除持久化失败: {symbol} - {e}")
         if pnl_pct < 0:
             self._daily_loss += abs(pnl_pct) / 100.0 * capital_fraction
             self._consecutive_losses += 1
@@ -540,6 +564,53 @@ class MenxiaSheng:
             rules_triggered=rules_triggered,
             exposure_pct=total_exposure * 100,
         )
+
+    # ======================== DB 持久化 ========================
+
+    def _get_menxia_conn(self) -> sqlite3.Connection:
+        """获取门下省专用数据库连接"""
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_menxia_table(self):
+        """创建门下省持仓持久化表"""
+        conn = self._get_menxia_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS menxia_positions (
+                symbol TEXT PRIMARY KEY,
+                entry_price REAL NOT NULL,
+                entry_time INTEGER NOT NULL,
+                quantity REAL NOT NULL,
+                stop_loss REAL,
+                take_profit REAL,
+                side TEXT DEFAULT 'long'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+    def _load_positions_from_db(self):
+        """从 SQLite 恢复持仓记录（进程重启后恢复 entry_time，确保 R6 72h 超时可用）"""
+        conn = self._get_menxia_conn()
+        rows = conn.execute(
+            "SELECT symbol, entry_price, entry_time, quantity, stop_loss, take_profit, side "
+            "FROM menxia_positions"
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            symbol, entry_price, entry_time, quantity, stop_loss, take_profit, side = row
+            self._positions[symbol] = {
+                "entry_price": entry_price,
+                "entry_time": entry_time,
+                "quantity": quantity,
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "side": side or "long",
+            }
+        if rows:
+            logger.info(f"[门下省] 从 DB 恢复 {len(rows)} 笔持仓记录")
 
     def _check_day_reset(self):
         """UTC 每天重置每日统计"""
