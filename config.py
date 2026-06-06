@@ -262,3 +262,44 @@ SWARM_THRESHOLD = float(os.getenv("SWARM_THRESHOLD", "0.25"))
 GOAL_ENABLED = os.getenv("GOAL_ENABLED", "true").lower() == "true"
 # Goal 数据库路径
 GOAL_DB_PATH = os.getenv("GOAL_DB_PATH", "")   # 空=使用默认路径
+
+# ============================================================
+# AGENT_SYMBOLS 统一解析（Dashboard 和 live_trading 共用，避免字段串位）
+# ============================================================
+
+_KNOWN_EXCHANGES = {"binance", "gateio", "weex", "okx", "bybit", "bitget", "hyperliquid"}
+
+def parse_agent_config_list(agent_symbols_str: str = None):
+    """解析 AGENT_SYMBOLS 返回 Agent 配置列表。
+    支持: SYMBOL:STRATEGY:EXCHANGE:TIMEFRAME 或 SYMBOL:SWARM:preset:EXCHANGE:TIMEFRAME
+    """
+    if agent_symbols_str is None:
+        agent_symbols_str = AGENT_SYMBOLS
+    results = []
+    for i, item in enumerate(agent_symbols_str.split(",")):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        sym = parts[0].strip()
+        raw_strategy = parts[1].strip().upper() if len(parts) > 1 else "RSI"
+
+        swarm_preset = None
+        if raw_strategy == "SWARM" and len(parts) > 2:
+            if parts[2].strip().lower() not in _KNOWN_EXCHANGES:
+                swarm_preset = parts[2].strip()
+
+        strat = f"SWARM:{swarm_preset}" if swarm_preset else raw_strategy
+        ex_idx = 3 if swarm_preset else 2
+        tf_idx = 4 if swarm_preset else 3
+        exch = parts[ex_idx].strip().lower() if len(parts) > ex_idx else "binance"
+        tf = parts[tf_idx].strip() if len(parts) > tf_idx else "4h"
+
+        results.append({
+            "agent": f"agent_{i+1}",
+            "symbol": sym,
+            "strategy": strat,
+            "exchange": exch,
+            "timeframe": tf,
+        })
+    return results

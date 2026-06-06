@@ -459,9 +459,23 @@ class TradingAgent:
                                    oversold=self.oversold, overbought=self.overbought)
             macd_s = build_strategy("MACD", config)
             boll_s = build_strategy("BOLLINGER", config, period=20, std_dev=2.0)
+            strategies = [(rsi_s, 0.35), (macd_s, 0.25), (boll_s, 0.25)]
+            vote_name = "RSI+MACD+BOLL"
+            if FACTOR_ENABLED:
+                try:
+                    from factor_bridge import FactorSignalStrategy
+                    factor_s = FactorSignalStrategy(
+                        config=config,
+                        factor_ids=list(FACTOR_DEFAULT_ALPHAS),
+                        threshold=FACTOR_THRESHOLD,
+                        lookback=FACTOR_LOOKBACK,
+                    )
+                    strategies.append((factor_s, 0.15))
+                    vote_name = "RSI+MACD+BOLL+FACTOR"
+                except Exception as e:
+                    logger.warning(f"[{self.agent_id}] 因子策略不可用，AUTO回退至RSI+MACD+BOLL: {e}")
             return MultiStrategyVote(
-                strategies=[(rsi_s, 0.4), (macd_s, 0.3), (boll_s, 0.3)],
-                threshold=0.3, name="RSI+MACD+BOLL",
+                strategies=strategies, threshold=0.3, name=vote_name,
             )
 
         # 多策略投票
@@ -1452,7 +1466,7 @@ class TradingAgent:
             else:
                 result["mtf"] = mtf_result
 
-        # AI 过滤（仅对 BUY/SELL 有效，HOLD 时每10轮周期性调用一次市场评估）
+        # AI 过滤（BUY/SELL 实时过滤，HOLD 时每5轮周期性调用一次市场评估）
         ai_verdict = ""
         filtered_sig = signal_val  # 默认不修改信号
         self._ai_periodic_counter += 1
@@ -1462,8 +1476,8 @@ class TradingAgent:
             )
             result["ai_verdict"] = ai_verdict
             self._ai_periodic_counter = 0  # 有信号时重置计数器
-        elif self._ai_periodic_counter >= 10 and self.ai_filter:
-            # 每10轮即使HOLD也调用AI做周期性市场研判
+        elif self._ai_periodic_counter >= 5 and self.ai_filter:
+            # 每5轮即使HOLD也调用AI做周期性市场研判
             self._ai_periodic_counter = 0
             try:
                 _, ai_verdict = self._apply_ai_filter(
@@ -1472,134 +1486,134 @@ class TradingAgent:
                 logger.info(f"[{self.agent_id}] 🤖 周期AI研判: {ai_verdict}")
             except Exception as e:
                 logger.debug(f"[{self.agent_id}] 周期AI调用失败: {e}")
-
-            # ── 多空信号处理 ──
-            # BUY + 持空 → 平空; BUY + 空仓 → 开多
-            # SELL + 持多 → 平多; SELL + 空仓 → 开空
-            if filtered_sig == Signal.BUY and self.position is not None and self.position.get("side") == "short":
-                # 持有空仓，BUY信号→平空
-                await self._close_position(current_price, current_ts, "signal_cover", rsi)
-                result["signal"] = "COVER（平空）"
-                # position already cleared, continue to equity calc below
-            elif filtered_sig == Signal.BUY and self.position is None:
-                # === 门下省风控审核（第一优先）===
-                can_open, reason = (True, "")
-                if self.menxia:
-                    review = self.menxia.review_open(
-                        symbol=self.symbol,
-                        entry_price=current_price,
-                        quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
-                        agent_id=self.agent_id,
-                        signal_confidence=last_conf if 'last_conf' in dir() else 0.5,
-                        indicators={'rsi': current_rsi} if 'current_rsi' in dir() else {},
-                    )
-                    can_open = review.approved
-                    reason = review.reason
-
-                # ── SignalRouter 多候选评分（Agent-S Best-of-N）──
-                routing_info: Dict = {}
-                if self._signal_router and can_open:
-                    try:
-                        quantity = (self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price
-                        # 当前策略候选
-                        primary = CandidateSignal(
-                            symbol=self.symbol,
-                            strategy=self.strategy_name,
-                            confidence=last_conf if 'last_conf' in dir() else 0.5,
-                            side="BUY",
-                            price=current_price,
-                            quantity=quantity,
-                            timeframe=self.timeframe,
-                            agent_id=self.agent_id,
-                            indicators={"rsi": current_rsi} if 'current_rsi' in dir() else {},
-                        )
-                        # 从配置扩展多策略候选（如果有额外策略可用）
-                        candidates = self._build_multi_strategy_candidates(
-                            candles, current_price, quantity
-                        )
-                        if primary not in candidates:
-                            candidates.insert(0, primary)
-
-                        mx_status = self.menxia.get_status()
-                        exposure = mx_status.get("total_exposure_pct", 0) / 100.0
-                        route_result = self._signal_router.route(
-                            candidates=candidates,
-                            exposure_pct=exposure,
-                            market_trend="unknown",     # P2: market_regime
-                            market_volatility="unknown",
-                        )
-                        routing_info = {
-                            "routing_reason": route_result.routing_reason,
-                            "chosen_strategy": route_result.chosen.strategy if route_result.chosen else None,
-                            "chosen_score": route_result.chosen.score if route_result.chosen else None,
-                            "alternatives": [
-                                {"strategy": c.strategy, "score": c.score,
-                                 "breakdown": c.score_breakdown}
-                                for c in route_result.alternatives
-                            ],
-                        }
-                        if route_result.chosen:
-                            can_open = True
-                            logger.info(
-                                f"[{self.agent_id}] SignalRouter 选中 "
-                                f"{route_result.chosen.strategy}（评分 {route_result.chosen.score:.1f}）"
-                            )
-                        else:
-                            can_open = False
-                            reason = f"全部 {len(route_result.rejected)} 个候选被否决"
-                    except Exception as e:
-                        logger.warning(f"[{self.agent_id}] SignalRouter 异常: {e}")
-
-                if not can_open:
-                    logger.warning(f"[{self.agent_id}] 门校省否决开仓: {reason}")
-                    result["signal"] = f"门校省否决({reason})"
-                    if routing_info:
-                        result["routing"] = routing_info
-                else:
-                    # 趋势过滤：熊市禁止做多
-                    trend = (self._current_regime or {}).get("trend", "")
-                    if trend == "downtrend":
-                        logger.warning(f"[{self.agent_id}] 趋势过滤：熊市禁止做多({self.symbol})")
-                        result["signal"] = "HOLD（趋势过滤:熊市禁多）"
-                    else:
-                        await self._open_position(current_price, current_ts, rsi, ai_verdict, side="buy")
-                        result["signal"] = "BUY"
-                    if routing_info:
-                        result["routing"] = routing_info
-            elif filtered_sig == Signal.SELL and self.position is not None and self.position.get("side") == "long":
-                # 持有多仓，SELL信号→平多
-                await self._close_position(current_price, current_ts, "signal_exit", rsi)
-                result["signal"] = "EXIT（平多）"
-            elif filtered_sig == Signal.SELL and self.position is None:
-                # 空仓，SELL信号→开空（门下省审核）
-                can_open_short, reason_short = (True, "")
-                if self.menxia:
-                    review = self.menxia.review_open(
-                        symbol=self.symbol,
-                        entry_price=current_price,
-                        quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
-                        agent_id=self.agent_id,
-                        signal_confidence=0.5,
-                        indicators={"rsi": rsi},
-                    )
-                    can_open_short = review.approved
-                    reason_short = review.reason
-                if not can_open_short:
-                    logger.warning(f"[{self.agent_id}] 门校省否决开空: {reason_short}")
-                    result["signal"] = f"门校省否决({reason_short})"
-                else:
-                    # 趋势过滤：牛市禁止做空
-                    trend = (self._current_regime or {}).get("trend", "")
-                    if trend == "uptrend":
-                        logger.warning(f"[{self.agent_id}] 趋势过滤：牛市禁止做空({self.symbol})")
-                        result["signal"] = "HOLD（趋势过滤:牛市禁空）"
-                    else:
-                        await self._open_position(current_price, current_ts, rsi, ai_verdict, side="sell")
-                        result["signal"] = "SHORT"
-            elif filtered_sig == Signal.HOLD and signal_val == Signal.BUY:
-                result["signal"] = "HOLD（AI否决）"
         else:
             result["ai_verdict"] = "技术信号HOLD"
+
+        # ── 多空信号处理 ──
+        # BUY + 持空 → 平空; BUY + 空仓 → 开多
+        # SELL + 持多 → 平多; SELL + 空仓 → 开空
+        if filtered_sig == Signal.BUY and self.position is not None and self.position.get("side") == "short":
+            # 持有空仓，BUY信号→平空
+            await self._close_position(current_price, current_ts, "signal_cover", rsi)
+            result["signal"] = "COVER（平空）"
+            # position already cleared, continue to equity calc below
+        elif filtered_sig == Signal.BUY and self.position is None:
+            # === 门下省风控审核（第一优先）===
+            can_open, reason = (True, "")
+            if self.menxia:
+                review = self.menxia.review_open(
+                    symbol=self.symbol,
+                    entry_price=current_price,
+                    quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
+                    agent_id=self.agent_id,
+                    signal_confidence=last_conf if 'last_conf' in dir() else 0.5,
+                    indicators={'rsi': current_rsi} if 'current_rsi' in dir() else {},
+                )
+                can_open = review.approved
+                reason = review.reason
+
+            # ── SignalRouter 多候选评分（Agent-S Best-of-N）──
+            routing_info: Dict = {}
+            if self._signal_router and can_open:
+                try:
+                    quantity = (self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price
+                    # 当前策略候选
+                    primary = CandidateSignal(
+                        symbol=self.symbol,
+                        strategy=self.strategy_name,
+                        confidence=last_conf if 'last_conf' in dir() else 0.5,
+                        side="BUY",
+                        price=current_price,
+                        quantity=quantity,
+                        timeframe=self.timeframe,
+                        agent_id=self.agent_id,
+                        indicators={"rsi": current_rsi} if 'current_rsi' in dir() else {},
+                    )
+                    # 从配置扩展多策略候选（如果有额外策略可用）
+                    candidates = self._build_multi_strategy_candidates(
+                        candles, current_price, quantity
+                    )
+                    if primary not in candidates:
+                        candidates.insert(0, primary)
+
+                    mx_status = self.menxia.get_status()
+                    exposure = mx_status.get("total_exposure_pct", 0) / 100.0
+                    route_result = self._signal_router.route(
+                        candidates=candidates,
+                        exposure_pct=exposure,
+                        market_trend="unknown",     # P2: market_regime
+                        market_volatility="unknown",
+                    )
+                    routing_info = {
+                        "routing_reason": route_result.routing_reason,
+                        "chosen_strategy": route_result.chosen.strategy if route_result.chosen else None,
+                        "chosen_score": route_result.chosen.score if route_result.chosen else None,
+                        "alternatives": [
+                            {"strategy": c.strategy, "score": c.score,
+                             "breakdown": c.score_breakdown}
+                            for c in route_result.alternatives
+                        ],
+                    }
+                    if route_result.chosen:
+                        can_open = True
+                        logger.info(
+                            f"[{self.agent_id}] SignalRouter 选中 "
+                            f"{route_result.chosen.strategy}（评分 {route_result.chosen.score:.1f}）"
+                        )
+                    else:
+                        can_open = False
+                        reason = f"全部 {len(route_result.rejected)} 个候选被否决"
+                except Exception as e:
+                    logger.warning(f"[{self.agent_id}] SignalRouter 异常: {e}")
+
+            if not can_open:
+                logger.warning(f"[{self.agent_id}] 门校省否决开仓: {reason}")
+                result["signal"] = f"门校省否决({reason})"
+                if routing_info:
+                    result["routing"] = routing_info
+            else:
+                # 趋势过滤：熊市禁止做多
+                trend = (self._current_regime or {}).get("trend", "")
+                if trend == "downtrend":
+                    logger.warning(f"[{self.agent_id}] 趋势过滤：熊市禁止做多({self.symbol})")
+                    result["signal"] = "HOLD（趋势过滤:熊市禁多）"
+                else:
+                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="buy")
+                    result["signal"] = "BUY"
+                if routing_info:
+                    result["routing"] = routing_info
+        elif filtered_sig == Signal.SELL and self.position is not None and self.position.get("side") == "long":
+            # 持有多仓，SELL信号→平多
+            await self._close_position(current_price, current_ts, "signal_exit", rsi)
+            result["signal"] = "EXIT（平多）"
+        elif filtered_sig == Signal.SELL and self.position is None:
+            # 空仓，SELL信号→开空（门下省审核）
+            can_open_short, reason_short = (True, "")
+            if self.menxia:
+                review = self.menxia.review_open(
+                    symbol=self.symbol,
+                    entry_price=current_price,
+                    quantity=(self.capital * LIVE_ORDER_CAPITAL_PCT) / current_price,
+                    agent_id=self.agent_id,
+                    signal_confidence=0.5,
+                    indicators={"rsi": rsi},
+                )
+                can_open_short = review.approved
+                reason_short = review.reason
+            if not can_open_short:
+                logger.warning(f"[{self.agent_id}] 门校省否决开空: {reason_short}")
+                result["signal"] = f"门校省否决({reason_short})"
+            else:
+                # 趋势过滤：牛市禁止做空
+                trend = (self._current_regime or {}).get("trend", "")
+                if trend == "uptrend":
+                    logger.warning(f"[{self.agent_id}] 趋势过滤：牛市禁止做空({self.symbol})")
+                    result["signal"] = "HOLD（趋势过滤:牛市禁空）"
+                else:
+                    await self._open_position(current_price, current_ts, rsi, ai_verdict, side="sell")
+                    result["signal"] = "SHORT"
+        elif filtered_sig == Signal.HOLD and signal_val == Signal.BUY:
+            result["signal"] = "HOLD（AI否决）"
 
         # 权益
         equity = self._get_equity(current_price)

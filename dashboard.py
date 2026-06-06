@@ -470,24 +470,10 @@ def _get_agent_list() -> list:
 
     # 回退：从配置文件解析
     from config import AGENT_SYMBOLS
-    for i, item in enumerate(AGENT_SYMBOLS.split(",")):
-        item = item.strip()
-        if not item:
-            continue
-        parts = item.split(":")
-        sym = parts[0].strip() if len(parts) > 0 else "?"
-        raw_strat = parts[1].strip() if len(parts) > 1 else "?"
-        swarm_preset = None
-        if raw_strat.upper() == "SWARM" and len(parts) > 2:
-            known_exchanges = {"binance", "gateio", "weex", "okx", "bybit", "bitget", "hyperliquid"}
-            if parts[2].strip().lower() not in known_exchanges:
-                swarm_preset = parts[2].strip()
-        strat = f"SWARM:{swarm_preset}" if swarm_preset else raw_strat
-        ex_idx = 3 if swarm_preset else 2
-        tf_idx = 4 if swarm_preset else 3
-        exch = parts[ex_idx].strip() if len(parts) > ex_idx else "?"
-        tf = parts[tf_idx].strip() if len(parts) > tf_idx else "?"
-        agent_id = f"agent_{i+1}"
+    from config import parse_agent_config_list
+    parsed = parse_agent_config_list(AGENT_SYMBOLS)
+    for cfg in parsed:
+        agent_id = cfg["agent"]
         price = None
         try:
             conn = sqlite3.connect(db_path)
@@ -500,7 +486,7 @@ def _get_agent_list() -> list:
                 price = round(row[0], 4)
         except Exception:
             pass
-        agents.append({"agent": agent_id, "symbol": sym, "strategy": strat, "exchange": exch, "timeframe": tf, "price": price})
+        agents.append({**cfg, "price": price})
     return agents
 
 
