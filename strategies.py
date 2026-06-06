@@ -296,10 +296,12 @@ class AISignalFilter:
         model: AIModel = AIModel.DEEPSEEK,
         api_key: Optional[str] = None,
         cache_ttl_seconds: int = 300,  # 5分钟内相同信号不重复请求
+        confidence_threshold: float = 0.50,  # AI置信度阈值，>=此值才放行
     ):
         self.model = model
         self.api_key = api_key or os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("MINIMAX_API_KEY")
         self.cache_ttl = cache_ttl_seconds
+        self.confidence_threshold = confidence_threshold
         self._cache: Dict[str, tuple[float, str]] = {}  # key -> (timestamp, result)
 
     # -------------------- Prompt 构建 --------------------
@@ -476,8 +478,8 @@ RSI(8)：{ctx.rsi:.2f}
         reason = verdict.get("reason", "")
         risk = verdict.get("risk_level", "MEDIUM")
 
-        # 逻辑：confidence > 0.5 时才执行 VERDICT
-        if confidence > 0.5:
+        # 逻辑：confidence >= threshold 时才执行 VERDICT
+        if confidence >= self.confidence_threshold:
             if v == "REJECT":
                 logger.info(f"AI_FILTER: 否决信号 {sig_name}，confidence={confidence:.2f}，reason={reason}")
                 return Signal.HOLD, f"AI否决({reason})"

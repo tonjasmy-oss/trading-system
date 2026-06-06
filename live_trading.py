@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     AI_MODEL, AI_SIGNAL_FILTER_ENABLED,
+    AI_CONFIDENCE_THRESHOLD_SUI, AI_CONFIDENCE_THRESHOLD_SOL, AI_CONFIDENCE_THRESHOLD_XAUT,
     MULTI_AGENT_ENABLED, AGENT_CHECK_INTERVAL, AGENT_SYMBOLS,
     VALIDATE_TRADE_ONLY, USE_HYPERLIQUID,
     HYPERLIQUID_WALLET_ADDRESS,
@@ -348,8 +349,18 @@ class TradingAgent:
             try:
                 model_map = {"deepseek": AIModel.DEEPSEEK, "openai": AIModel.OPENAI, "minimax": AIModel.MINIMAX}
                 model = model_map.get(AI_MODEL.lower(), AIModel.DEEPSEEK)
-                self.ai_filter = AISignalFilter(model=model)
-                logger.info(f"[{agent_id}] AI 过滤器已启用: {AI_MODEL}")
+                # 按品种选择 AI 置信度阈值（基于2年回测）
+                symbol_upper = self.symbol.upper()
+                if "SUI" in symbol_upper:
+                    ai_th = AI_CONFIDENCE_THRESHOLD_SUI
+                elif "SOL" in symbol_upper:
+                    ai_th = AI_CONFIDENCE_THRESHOLD_SOL
+                elif "XAUT" in symbol_upper:
+                    ai_th = AI_CONFIDENCE_THRESHOLD_XAUT
+                else:
+                    ai_th = 0.50
+                self.ai_filter = AISignalFilter(model=model, confidence_threshold=ai_th)
+                logger.info(f"[{agent_id}] AI 过滤器已启用: {AI_MODEL} (阈值={ai_th})")
             except Exception as e:
                 logger.warning(f"[{agent_id}] AI 过滤器初始化失败: {e}")
 

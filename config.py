@@ -99,6 +99,9 @@ CUSTOM_FORMULAS = {
 # 可选: "deepseek", "openai", "minimax", ""（空=禁用）
 AI_MODEL = os.getenv("AI_MODEL", "")
 AI_SIGNAL_FILTER_ENABLED = os.getenv("AI_SIGNAL_FILTER_ENABLED", "false").lower() == "true"
+AI_CONFIDENCE_THRESHOLD_SUI = float(os.getenv("AI_CONFIDENCE_THRESHOLD_SUI", "0.50"))
+AI_CONFIDENCE_THRESHOLD_SOL = float(os.getenv("AI_CONFIDENCE_THRESHOLD_SOL", "0.50"))
+AI_CONFIDENCE_THRESHOLD_XAUT = float(os.getenv("AI_CONFIDENCE_THRESHOLD_XAUT", "0.50"))
 
 # --- Hyperliquid 支持（VergeX AI 链上DEX）---
 # Hyperliquid 钱包地址（用于签名认证）
