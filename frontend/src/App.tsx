@@ -1,20 +1,48 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Container } from '@/components/common/Container'
 import { TraderDashboardPage } from '@/pages/TraderDashboardPage'
 import { StrategyStudioPage } from '@/pages/StrategyStudioPage'
+import { CompetitionPage } from '@/pages/CompetitionPage'
 import { AgentChatPage } from '@/pages/AgentChatPage'
 import { SettingsPage } from '@/pages/SettingsPage'
-import { BarChart3, BookOpen, Bot, Settings } from 'lucide-react'
+import { BarChart3, BookOpen, Bot, Settings, Zap, Trophy } from 'lucide-react'
 
 const tabs = [
-  { id: 'dashboard', label: 'Dashboard', icon: BarChart3 },
-  { id: 'strategy', label: 'Strategy Studio', icon: BookOpen },
-  { id: 'agent', label: 'AI Agent', icon: Bot },
-  { id: 'settings', label: 'Settings', icon: Settings },
+  { id: 'dashboard', label: 'Dashboard', icon: BarChart3, path: '/dashboard' },
+  { id: 'strategy', label: 'Strategy Studio', icon: BookOpen, path: '/strategy' },
+  { id: 'competition', label: 'Competition', icon: Trophy, path: '/competition' },
+  { id: 'agent', label: 'AI Agent', icon: Bot, path: '/agent' },
+  { id: 'light', label: 'Light', icon: Zap, path: '/light', external: true },
+  { id: 'settings', label: 'Settings', icon: Settings, path: '/settings' },
 ]
 
+/** 从当前 URL pathname 解析 active tab */
+function getTabFromPath(): string {
+  const path = window.location.pathname.replace(/\/$/, '') || '/'
+  const tab = tabs.find(t => !t.external && (path === t.path || path === '/'))
+  return tab ? tab.id : 'dashboard'
+}
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState('dashboard')
+  const [activeTab, setActiveTab] = useState(getTabFromPath)
+
+  // 同步 URL ↔ Tab（浏览器前进/后退）
+  useEffect(() => {
+    const onPopState = () => setActiveTab(getTabFromPath())
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [])
+
+  const switchTab = (id: string) => {
+    const tab = tabs.find(t => t.id === id)
+    if (!tab) return
+    if (tab.external) {
+      window.location.href = tab.path
+      return
+    }
+    window.history.pushState(null, '', tab.path)
+    setActiveTab(id)
+  }
 
   return (
     <div className="min-h-screen bg-nofx-bg">
@@ -34,10 +62,10 @@ export default function App() {
 
             {/* Tab Switcher */}
             <nav className="flex items-center gap-1">
-              {tabs.map(({ id, label, icon: Icon }) => (
+              {tabs.map(({ id, label, icon: Icon, external }) => (
                 <button
                   key={id}
-                  onClick={() => setActiveTab(id)}
+                  onClick={() => switchTab(id)}
                   className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
                     activeTab === id
                       ? 'bg-[#F0B90B]/10 text-[#F0B90B] border border-[#F0B90B]/20'
@@ -46,6 +74,9 @@ export default function App() {
                 >
                   <Icon className="w-4 h-4" />
                   <span className="hidden sm:inline">{label}</span>
+                  {external && (
+                    <span className="text-[10px] text-[#F0B90B]/50 ml-0.5">↗</span>
+                  )}
                 </button>
               ))}
             </nav>
@@ -63,6 +94,7 @@ export default function App() {
       <main>
         {activeTab === 'dashboard' && <TraderDashboardPage />}
         {activeTab === 'strategy' && <StrategyStudioPage />}
+        {activeTab === 'competition' && <CompetitionPage />}
         {activeTab === 'agent' && <AgentChatPage />}
         {activeTab === 'settings' && <SettingsPage />}
       </main>

@@ -602,15 +602,70 @@ h3{font-size:12px;color:#8b949e;margin:10px 0 4px;font-weight:400;text-transform
 <div class="modal-overlay" id="addModal">
   <div class="modal">
     <h3>➕ 添加监控标的</h3>
-    <label>标的代码</label>
-    <input id="addSymbol" placeholder="如 AAPL / 000001 / BTC" autocomplete="off">
-    <label>市场</label>
-    <select id="addMarket">
-      <option value="CN">A股</option>
-      <option value="HK">港股</option>
-      <option value="US">美股</option>
-      <option value="CRYPTO">加密货币</option>
-    </select>
+
+    <div style="display:flex;gap:8px;margin-bottom:12px">
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#c9d1d9;cursor:pointer">
+        <input type="radio" name="addMode" value="price" checked onchange="onAddModeChange()">
+        <span>📈 行情监控</span>
+      </label>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#c9d1d9;cursor:pointer">
+        <input type="radio" name="addMode" value="agent" onchange="onAddModeChange()">
+        <span>🤖 交易监控</span>
+      </label>
+    </div>
+
+    <div id="addPriceFields">
+      <label>标的代码</label>
+      <input id="addSymbol" placeholder="如 AAPL / 000001 / BTC" autocomplete="off">
+      <label>市场</label>
+      <select id="addMarket">
+        <option value="CN">A股</option>
+        <option value="HK">港股</option>
+        <option value="US">美股</option>
+        <option value="CRYPTO">加密货币</option>
+      </select>
+    </div>
+
+    <div id="addAgentFields" style="display:none">
+      <label>交易对</label>
+      <input id="addAgentSymbol" placeholder="如 BTC/USDT" autocomplete="off">
+      <label>策略</label>
+      <select id="addAgentStrategy">
+        <option value="EVR">EVR — EMA-Vol-RSI 复合趋势</option>
+        <option value="RSI">RSI — 超买超卖</option>
+        <option value="SMA">SMA — 双均线交叉</option>
+        <option value="MACD">MACD — 金叉死叉</option>
+        <option value="BOLLINGER">BOLLINGER — 布林带突破</option>
+        <option value="KDJ">KDJ — 随机指标</option>
+        <option value="ATRSTOP">ATRSTOP — ATR动态止损</option>
+        <option value="DONCHIAN">DONCHIAN — 海龟通道突破</option>
+        <option value="MULTIFACTOR">MULTIFACTOR — 多因子趋势</option>
+        <option value="AUTO">AUTO — 自动选择</option>
+        <option value="BNB_TRENDMR">BNB_TRENDMR — 趋势+均值回归(4h)</option>
+        <option value="BNB_VOLBREAK">BNB_VOLBREAK — 波动突破(2h)</option>
+      </select>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <div>
+          <label>数据源</label>
+          <select id="addAgentExchange">
+            <option value="binance">binance</option>
+            <option value="gateio">gateio</option>
+            <option value="weex">weex</option>
+            <option value="okx">okx</option>
+          </select>
+        </div>
+        <div>
+          <label>K线周期</label>
+          <select id="addAgentTimeframe">
+            <option value="1h">1h</option>
+            <option value="2h">2h</option>
+            <option value="4h" selected>4h</option>
+            <option value="1d">1d</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
     <div class="btn-row">
       <button class="btn-cancel" onclick="hideAddModal()">取消</button>
       <button class="btn-ok" onclick="doAddSymbol()">确认添加</button>
@@ -618,7 +673,7 @@ h3{font-size:12px;color:#8b949e;margin:10px 0 4px;font-weight:400;text-transform
   </div>
 </div>
 
-<div class="footer"><span>⏱ <span id="uptime">--</span> · 自动刷新 30s</span><a class="btn-dashboard" href="/dashboard">📊 完整版</a></div>
+<div class="footer"><span>⏱ <span id="uptime">--</span> · 自动刷新 30s</span><a class="btn-dashboard" href="/dashboard">📊 完整版</a><a class="btn-dashboard" href="/settings" style="background:#1f6feb">⚙ 设置</a></div>
 
 <script>
 const $=id=>document.getElementById(id);
@@ -772,19 +827,56 @@ function renderUptime(s){
   $('uptime').textContent=`运行 ${h}h ${m}m ${sec}s`;
 }
 
-function showAddModal(){$('addModal').classList.add('show');$('addSymbol').value='';$('addSymbol').focus()}
+function onAddModeChange(){
+  var isAgent=document.querySelector('input[name="addMode"]:checked').value==='agent';
+  $('addPriceFields').style.display=isAgent?'none':'block';
+  $('addAgentFields').style.display=isAgent?'block':'none';
+}
+function showAddModal(){
+  $('addModal').classList.add('show');
+  $('addSymbol').value='';
+  $('addAgentSymbol').value='';
+  // 默认为行情监控模式
+  document.querySelector('input[name="addMode"][value="price"]').checked=true;
+  onAddModeChange();
+  $('addSymbol').focus();
+}
 function hideAddModal(){$('addModal').classList.remove('show')}
 $('addModal').addEventListener('click',function(e){if(e.target===this)hideAddModal()});
 
 async function doAddSymbol(){
-  var sym=$('addSymbol').value.trim();
-  var mkt=$('addMarket').value;
-  if(!sym){alert('请输入标的代码');return}
-  try{
-    var r=await fetch('/api/symbols',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,market:mkt})});
-    var d=await r.json();
-    if(d.success){hideAddModal();load()}else{alert(d.detail||'添加失败')}
-  }catch(e){alert('请求失败: '+e.message)}
+  var isAgent=document.querySelector('input[name="addMode"]:checked').value==='agent';
+  if(isAgent){
+    var sym=$('addAgentSymbol').value.trim();
+    var strat=$('addAgentStrategy').value;
+    var exch=$('addAgentExchange').value;
+    var tf=$('addAgentTimeframe').value;
+    if(!sym){alert('请输入交易对');return}
+    // 先获取当前配置，追加后保存
+    try{
+      var cur=await fetch('/api/agents/symbols').then(r=>r.json());
+      var agents=cur.agents||[];
+      agents.push({symbol:sym,strategy:strat,exchange:exch,timeframe:tf});
+      var r=await fetch('/api/agents/symbols',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({agents:agents})});
+      var d=await r.json();
+      if(d.success){
+        alert('✅ 已添加 '+sym+' ('+strat+' @ '+exch+' '+tf+')。\\n需在 Settings 页面点击「重启生效」。');
+        hideAddModal();
+        load();
+      }else{
+        alert(d.detail||'添加失败');
+      }
+    }catch(e){alert('请求失败: '+e.message)}
+  }else{
+    var sym=$('addSymbol').value.trim();
+    var mkt=$('addMarket').value;
+    if(!sym){alert('请输入标的代码');return}
+    try{
+      var r=await fetch('/api/symbols',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym,market:mkt})});
+      var d=await r.json();
+      if(d.success){hideAddModal();load()}else{alert(d.detail||'添加失败')}
+    }catch(e){alert('请求失败: '+e.message)}
+  }
 }
 
 async function doRemoveSymbol(sym,mkt){
@@ -1295,6 +1387,357 @@ async def test_alert(req: AlertRequest):
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+
+# ================================================================
+# 回测结果聚合 API（为 Settings 页面提供策略绩效数据）
+# ================================================================
+
+_BACKTEST_CACHE = None
+_BACKTEST_CACHE_TIME = 0
+
+
+def _aggregate_backtest_results() -> dict:
+    """扫描 backtest_results/ 目录，聚合各标的×策略的回测指标"""
+    global _BACKTEST_CACHE, _BACKTEST_CACHE_TIME
+    now = time.time()
+    if _BACKTEST_CACHE and (now - _BACKTEST_CACHE_TIME) < 600:  # 10 分钟缓存
+        return _BACKTEST_CACHE
+
+    import json as _json
+    import re as _re
+    result_dir = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "backtest_results")
+    summary = {}
+
+    if not _os.path.isdir(result_dir):
+        _BACKTEST_CACHE = summary
+        _BACKTEST_CACHE_TIME = now
+        return summary
+
+    # 策略名 → 短标识 映射
+    _strategy_alias = {
+        "RSIStrategy": "RSI", "SMAcrossStrategy": "SMA", "MACDStrategy": "MACD",
+        "BollingerBandsStrategy": "BOLLINGER", "KDJStrategy": "KDJ",
+        "ATRStopStrategy": "ATRSTOP", "DonchianChannelStrategy": "DONCHIAN",
+        "MultiFactorTrendStrategy": "MULTIFACTOR",
+    }
+
+    # 遍历所有 JSON 文件
+    for fname in sorted(_os.listdir(result_dir)):
+        if not fname.endswith(".json"):
+            continue
+        fpath = _os.path.join(result_dir, fname)
+        try:
+            with open(fpath) as f:
+                data = _json.load(f)
+        except Exception:
+            continue
+
+        results = data if isinstance(data, list) else [data]
+
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            sym = item.get("symbol", "")
+            strat = item.get("strategy", "")
+            tf = item.get("timeframe", "")
+            if not sym or not strat or not tf:
+                continue
+
+            # 标准化策略名
+            alias = _strategy_alias.get(strat, strat)
+            key = f"{alias}:{tf}"
+
+            # 只保留最新（按文件时间排序，后面覆盖前面）
+            metrics = {
+                "total_return_pct": round(item.get("total_return_pct", 0), 2),
+                "win_rate_pct": round(item.get("win_rate_pct", item.get("win_rate", 0) * 100 if isinstance(item.get("win_rate"), float) else 0), 1),
+                "profit_factor": round(item.get("profit_factor", 0), 2),
+                "sharpe_ratio": round(item.get("sharpe_ratio", 0), 2),
+                "max_drawdown_pct": round(item.get("max_drawdown_pct", 0), 2),
+                "total_trades": item.get("total_trades", 0),
+            }
+
+            if sym not in summary:
+                summary[sym] = {}
+            summary[sym][key] = metrics
+
+    _BACKTEST_CACHE = summary
+    _BACKTEST_CACHE_TIME = now
+    return summary
+
+
+@app.get("/api/backtest/summary")
+async def get_backtest_summary(symbols: str = ""):
+    """获取各标的各策略的回测指标聚合"""
+    summary = _aggregate_backtest_results()
+
+    # 如果指定了标的列表，只返回这些
+    if symbols:
+        wanted = set(s.strip() for s in symbols.split(","))
+        summary = {s: v for s, v in summary.items() if s in wanted}
+
+    return {"summary": summary}
+
+
+# ================================================================
+# 策略竞赛 API（多策略同台竞技 + 排行榜）
+# ================================================================
+
+class CompetitionRequest(BaseModel):
+    symbol: str = "BTC/USDT"
+    timeframe: str = "4h"
+    direction: str = "both"
+
+
+@app.get("/api/competition")
+async def get_competition(
+    symbol: str = "BTC/USDT",
+    timeframe: str = "4h",
+    direction: str = "both",
+):
+    """运行策略竞赛并返回排行榜"""
+    try:
+        from backtest import BacktestEngine
+        from strategies import (
+            SMAcrossStrategy, RSIStrategy, MACDStrategy,
+            BollingerBandsStrategy, DonchianChannelStrategy,
+            ATRStopStrategy, KDJStrategy, StrategyConfig,
+        )
+        from history_cache import get_ohlcv, init_cache_db
+        from config import ATRSTOP_EMA_PERIOD, ATRSTOP_ATR_PERIOD, ATRSTOP_ATR_MULTIPLIER
+        from datetime import datetime, timezone
+        init_cache_db()
+
+        candles = get_ohlcv(symbol, timeframe, limit=20000)
+        if not candles or len(candles) < 100:
+            return {"error": f"data insufficient ({len(candles) if candles else 0} bars)"}
+
+        first = datetime.fromtimestamp(candles[0]['timestamp']/1000, tz=timezone.utc)
+        last = datetime.fromtimestamp(candles[-1]['timestamp']/1000, tz=timezone.utc)
+
+        cfg = StrategyConfig(symbol=symbol, timeframe=timeframe,
+                            stop_loss=0.05, take_profit=0.10,
+                            trade_direction=direction)
+
+        contestants = {
+            "RSI":       RSIStrategy(cfg, rsi_period=14, oversold=30, overbought=70),
+            "SMA":       SMAcrossStrategy(cfg, fast_period=10, slow_period=30),
+            "MACD":      MACDStrategy(cfg, fast_period=12, slow_period=26, signal_period=9),
+            "BOLLINGER": BollingerBandsStrategy(cfg, period=20, std_dev=2.0),
+            "KDJ":       KDJStrategy(cfg, k_period=9, d_period=3, j_period=3),
+            "ATRSTOP":   ATRStopStrategy(cfg, ema_period=ATRSTOP_EMA_PERIOD, atr_period=ATRSTOP_ATR_PERIOD, atr_multiplier=ATRSTOP_ATR_MULTIPLIER),
+            "DONCHIAN":  DonchianChannelStrategy(cfg, channel_period=20, trend_ema_period=50),
+        }
+
+        try:
+            from strategies_bnb import BNB4HTrendMR, BNB2HVolBreak
+            contestants["BNB_TRENDMR"] = BNB4HTrendMR(cfg)
+            contestants["BNB_VOLBREAK"] = BNB2HVolBreak(cfg)
+        except ImportError:
+            pass
+
+        rankings = []
+        for name, strat in contestants.items():
+            try:
+                engine = BacktestEngine(strat, initial_capital=10000, trade_direction=direction)
+                engine.candles = candles
+                engine.compute_signals()
+                r = engine.run()
+                pf = round(r.winning_trades / max(r.losing_trades, 1), 2)
+                rankings.append({
+                    "strategy": name, "rank": 0,
+                    "return_pct": round(r.total_return_pct, 2),
+                    "sharpe": round(r.sharpe_ratio, 2),
+                    "max_dd": round(r.max_drawdown_pct, 2),
+                    "win_rate": round(r.win_rate_pct, 1),
+                    "trades": r.total_trades,
+                    "profit_factor": pf,
+                })
+            except Exception as e:
+                rankings.append({"strategy": name, "error": str(e)})
+
+        rankings.sort(key=lambda x: x.get("return_pct", -9999), reverse=True)
+        for i, r in enumerate(rankings):
+            r["rank"] = i + 1
+
+        return {
+            "symbol": symbol, "timeframe": timeframe, "direction": direction,
+            "period": f"{first.strftime('%Y-%m-%d')} ~ {last.strftime('%Y-%m-%d')}",
+            "bars": len(candles),
+            "rankings": rankings,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ================================================================
+# 监控标的管理 API（管理 AGENT_SYMBOLS 配置）
+# ================================================================
+
+class AgentSymbolConfig(BaseModel):
+    """单个 Agent 配置"""
+    symbol: str           # e.g. "BTC/USDT"
+    strategy: str         # e.g. "EVR"
+    exchange: str         # e.g. "binance"
+    timeframe: str = "4h" # e.g. "4h"
+
+
+class AgentSymbolsUpdate(BaseModel):
+    """批量更新 Agent 配置"""
+    agents: List[AgentSymbolConfig]
+
+
+def _read_agent_symbols_from_env() -> List[AgentSymbolConfig]:
+    """从 .env 文件读取 AGENT_SYMBOLS 并解析"""
+    env_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".env")
+    agents = []
+    if _os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("AGENT_SYMBOLS="):
+                    raw = line.split("=", 1)[1].strip()
+                    if raw:
+                        for part in raw.split(","):
+                            part = part.strip()
+                            if not part:
+                                continue
+                            fields = part.split(":")
+                            agents.append(AgentSymbolConfig(
+                                symbol=fields[0].strip() if len(fields) > 0 else "",
+                                strategy=fields[1].strip() if len(fields) > 1 else "EVR",
+                                exchange=fields[2].strip() if len(fields) > 2 else "binance",
+                                timeframe=fields[3].strip() if len(fields) > 3 else "4h",
+                            ))
+                    break
+    return agents
+
+
+def _write_agent_symbols_to_env(agents: List[AgentSymbolConfig]) -> bool:
+    """将 AGENT_SYMBOLS 写回 .env 文件"""
+    env_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".env")
+    if not _os.path.exists(env_path):
+        return False
+    raw = ",".join(
+        f"{a.symbol}:{a.strategy}:{a.exchange}:{a.timeframe}"
+        for a in agents
+    )
+    new_line = f"AGENT_SYMBOLS={raw}"
+    # 替换或追加
+    with open(env_path) as f:
+        lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.strip().startswith("AGENT_SYMBOLS="):
+            lines[i] = new_line + "\n"
+            found = True
+            break
+    if not found:
+        lines.append(new_line + "\n")
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+    # 同时更新环境变量，使 Dashboard 立即可见
+    _os.environ["AGENT_SYMBOLS"] = raw
+    return True
+
+
+# 可用策略列表
+AVAILABLE_STRATEGIES = [
+    "EVR", "RSI", "SMA", "MACD", "BOLLINGER", "KDJ", "ATRSTOP",
+    "MULTIFACTOR", "DONCHIAN", "COINGLASS", "FUNDING_ARB", "STAT_ARB",
+    "SUI_SUPERTREND", "BTC_SUPERTREND", "BTC_TRENDFLOW", "BTC_TRENDFLOW_2H",
+    "RSI_LAYERED", "EMA_CROSS_LAYERED", "VOTE", "AUTO",
+    "BNB_TRENDMR", "BNB_VOLBREAK",
+]
+
+AVAILABLE_EXCHANGES = [
+    "binance", "gateio", "weex", "okx", "bybit", "hyperliquid",
+]
+
+AVAILABLE_TIMEFRAMES = ["1h", "2h", "4h", "1d"]
+
+
+@app.get("/api/agents/symbols")
+async def get_agent_symbols():
+    """获取当前监控标的配置"""
+    agents = _read_agent_symbols_from_env()
+    return {
+        "agents": [a.model_dump() for a in agents],
+        "available_strategies": AVAILABLE_STRATEGIES,
+        "available_exchanges": AVAILABLE_EXCHANGES,
+        "available_timeframes": AVAILABLE_TIMEFRAMES,
+    }
+
+
+@app.put("/api/agents/symbols")
+async def update_agent_symbols(req: AgentSymbolsUpdate):
+    """批量更新监控标的配置，持久化到 .env"""
+    if not req.agents:
+        raise HTTPException(status_code=400, detail="配置不能为空")
+    for a in req.agents:
+        if not a.symbol or not a.strategy or not a.exchange:
+            raise HTTPException(status_code=400, detail=f"配置不完整: {a}")
+    ok = _write_agent_symbols_to_env(list(req.agents))
+    if not ok:
+        raise HTTPException(status_code=500, detail="写入 .env 失败")
+    return {"success": True, "count": len(req.agents), "message": "配置已保存。需重启 Live Daemon 使新配置生效。"}
+
+
+@app.post("/api/agents/restart")
+async def restart_agents():
+    """重启 Live Daemon 使配置生效"""
+    import subprocess, shlex
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+
+    # 1. 读取当前 PID
+    pid_file = _os.path.join(script_dir, ".live_daemon.pid")
+    if _os.path.exists(pid_file):
+        try:
+            with open(pid_file) as f:
+                old_pid = int(f.read().strip())
+            _os.kill(old_pid, 9)
+        except:
+            pass
+        _os.remove(pid_file)
+
+    # 2. 终止旧的 watchdog 进程
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "run_live_daemon.sh"],
+            capture_output=True, text=True, timeout=5
+        )
+        for wd_pid in result.stdout.strip().split("\n"):
+            wd_pid = wd_pid.strip()
+            if wd_pid and wd_pid != str(os.getpid()):
+                try:
+                    os.kill(int(wd_pid), 9)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3. 启动新的 watchdog
+    import time as _time
+    _time.sleep(1)
+    restart_script = _os.path.join(script_dir, "run_live_daemon.sh")
+    subprocess.Popen(
+        ["setsid", "bash", restart_script],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=script_dir,
+    )
+    _time.sleep(4)
+
+    # 4. 验证
+    if _os.path.exists(pid_file):
+        try:
+            with open(pid_file) as f:
+                new_pid = int(f.read().strip())
+            _os.kill(new_pid, 0)
+            return {"success": True, "pid": new_pid, "message": "Live Daemon 已重启"}
+        except:
+            pass
+    return {"success": True, "message": "Live Daemon 已触发启动（等待初始化）"}
 
 
 # ================================================================
@@ -3552,6 +3995,7 @@ if _os.path.isdir(_NEW_FRONTEND_DIR):
     # 新前端 SPA 回退（/dashboard 等路径返回 index.html）
     @app.get("/dashboard")
     @app.get("/strategy")
+    @app.get("/competition")
     @app.get("/agent")
     @app.get("/settings")
     async def new_frontend_index(request: Request):
@@ -3584,7 +4028,7 @@ if _os.path.isdir(_STATIC_DIR):
         if full_path.startswith("api/") or full_path.startswith("js/") or full_path.startswith("css/"):
             raise HTTPException(status_code=404)
         # 新前端挂载路径 -> 返回新前端 index.html（StaticFiles mount 被 catch-all 拦截，需单独处理）
-        _new_frontend_paths = ("dashboard", "strategy", "agent", "settings")
+        _new_frontend_paths = ("dashboard", "strategy", "competition", "agent", "settings")
         if any(full_path.startswith(p) for p in _new_frontend_paths) and _os.path.isdir(_NEW_FRONTEND_DIR):
             index_path = _os.path.join(_NEW_FRONTEND_DIR, "index.html")
             if _os.path.isfile(index_path):

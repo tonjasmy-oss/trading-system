@@ -1993,6 +1993,10 @@ STRATEGY_REGISTRY: Dict[str, type] = {
     "STAT_ARB":   StatisticalArbitrageStrategy,
     "COINGLASS":  CoinGlassSentimentStrategy,   # 情绪+清算集群策略（2026-05-18）
     "DONCHIAN":   DonchianChannelStrategy,      # 海龟通道突破策略（2026-05-22）
+    "SUI_SUPERTREND": None,                     # 延迟导入: eth_supertrend_strategy.SUISupertrendStrategy
+    "BTC_SUPERTREND": None,                     # 延迟导入: btc_supertrend_strategy.BTCSupertrendStrategy
+    "BTC_TRENDFLOW": None,                      # 延迟导入: btc_trendflow_strategy.BTCTrendFlowStrategy
+    "BTC_TRENDFLOW_2H": None,                  # 延迟导入: btc_trendflow_strategy.BTCTrendFlow2HStrategy
     # 分层策略（P1-1）
     "RSI_LAYERED":       None,  # 延迟导入: components.layered_strategy.RsiLayeredStrategy
     "EMA_CROSS_LAYERED": None,  # 延迟导入: components.layered_strategy.EmaCrossLayeredStrategy
@@ -2007,6 +2011,60 @@ def _lazy_import_layered():
     except ImportError:
         pass
 
+# 延迟导入 SUI Supertrend 策略
+def _lazy_import_sui_supertrend():
+    try:
+        from eth_supertrend_strategy import SUISupertrendStrategy
+        STRATEGY_REGISTRY["SUI_SUPERTREND"] = SUISupertrendStrategy
+    except ImportError:
+        pass
+
+# 延迟导入 BTC Supertrend 策略
+def _lazy_import_btc_supertrend():
+    try:
+        from btc_supertrend_strategy import BTCSupertrendStrategy
+        STRATEGY_REGISTRY["BTC_SUPERTREND"] = BTCSupertrendStrategy
+    except ImportError:
+        pass
+
+# 延迟导入 BTC TrendFlow 策略
+def _lazy_import_btc_trendflow():
+    try:
+        from btc_trendflow_strategy import BTCTrendFlowStrategy, BTCTrendFlow2HStrategy
+        STRATEGY_REGISTRY["BTC_TRENDFLOW"] = BTCTrendFlowStrategy
+        STRATEGY_REGISTRY["BTC_TRENDFLOW_2H"] = BTCTrendFlow2HStrategy
+    except ImportError:
+        pass
+
 import atexit
 _lazy_import_layered()
+_lazy_import_sui_supertrend()
+_lazy_import_btc_supertrend()
+_lazy_import_btc_trendflow()
 
+
+# ============================================================
+# 延迟导入 EVR 策略 (EMA-Volume-RSI 复合趋势策略)
+# ============================================================
+def _lazy_import_evr():
+    try:
+        from strategies_evr_v2 import EVRStrategyV2
+        STRATEGY_REGISTRY["EVR"] = EVRStrategyV2
+        STRATEGY_REGISTRY["EVR_V2"] = EVRStrategyV2
+    except ImportError:
+        pass
+
+_lazy_import_evr()
+
+# ============================================================
+# 延迟导入 BNB 专用策略
+# ============================================================
+def _lazy_import_bnb():
+    try:
+        from strategies_bnb import BNB4HTrendMR, BNB2HVolBreak
+        STRATEGY_REGISTRY["BNB_TRENDMR"] = BNB4HTrendMR
+        STRATEGY_REGISTRY["BNB_VOLBREAK"] = BNB2HVolBreak
+    except ImportError:
+        pass
+
+_lazy_import_bnb()

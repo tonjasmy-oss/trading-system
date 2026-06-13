@@ -1,8 +1,8 @@
 """
-strategy_rotator.py — 市场状态感知策略轮动 (v2: 业绩感知)
+strategy_rotator.py — 市场状态感知策略轮动 (v3: 回测+业绩融合)
 ========================================================
 
-根据 MarketRegime 检测的市场状态 + 实盘表现，自动选择最优策略：
+根据 MarketRegime 检测的市场状态 + 回测数据 + 实盘表现，自动选择最优策略。
 
   状态                 → 推荐策略
   ──────────────────────────────────────────
@@ -17,13 +17,14 @@ strategy_rotator.py — 市场状态感知策略轮动 (v2: 业绩感知)
   ranging  + low_vol   → KDJ      (摆动交易)
   unknown              → MACD     (默认稳健)
 
-v2 新增:
-  - strategy_performance 表追踪每策略每市场状态的实盘表现
-  - 轮动时融合 regime fit_score + actual performance → 综合决策
-  - record_outcome() 在每次平仓后更新业绩数据
+v3 新增:
+  - 回测数据预加载，作为初始策略评分基线
+  - 融合: fit_score + backtest_score * (1-w) + live_perf_score * w
+  - w = min(live_trades / 20, 1.0) — 实盘交易越多，实盘权重越高
 """
 
 import os
+import json
 import sqlite3
 import logging
 logger = logging.getLogger(__name__)
@@ -41,7 +42,6 @@ REGIME_STRATEGY_MAP = {
 }
 FALLBACK_STRATEGY = ("MACD", "市场状态未知，回退到MACD", {})
 
-# 策略适配度评分表（基于 market_regime.STRATEGY_RECOMMENDATIONS 同步）
 _STRATEGY_FIT_SCORE = {
     ("DONCHIAN", "uptrend", "high"): 95,
     ("DONCHIAN", "uptrend", "medium"): 92,
@@ -72,7 +72,7 @@ _STRATEGY_FIT_SCORE = {
 
 
 class StrategyRotator:
-    """市场状态感知策略轮动器（v2: 业绩感知）"""
+    """市场状态感知策略轮动器（v3: 回测+业绩融合）"""
 
     def __init__(self, symbol: str = "", timeframe: str = "",
                  config_map: dict = None, stability: int = 2,
@@ -86,6 +86,90 @@ class StrategyRotator:
         self._stability_counter: int = 0
         self._min_stability: int = stability
         self._init_db()
+        self._bt_results = self._load_backtest_results()
+
+    # ---------- 回测数据加载 ----------
+
+    def _load_backtest_results(self) -> dict:
+        """从 backtest_results/ 加载所有回测数据"""
+        bt_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "backtest_results"
+        )
+        results = {}
+        if not os.path.isdir(bt_dir):
+            return results
+
+        strategy_alias = {
+            "RSIStrategy": "RSI", "SMAcrossStrategy": "SMA", "MACDStrategy": "MACD",
+            "BollingerBandsStrategy": "BOLLINGER", "KDJStrategy": "KDJ",
+            "ATRStopStrategy": "ATRSTOP", "DonchianChannelStrategy": "DONCHIAN",
+            "MultiFactorTrendStrategy": "MULTIFACTOR",
+        }
+
+        for fname in sorted(os.listdir(bt_dir)):
+            if not fname.endswith('.json'):
+                continue
+            try:
+                with open(os.path.join(bt_dir, fname)) as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                sym = item.get("symbol", "")
+                strat_raw = item.get("strategy", "")
+                tf = item.get("timeframe", "")
+                if not sym or not strat_raw or not tf:
+                    continue
+                alias = strategy_alias.get(strat_raw, strat_raw)
+                # Ignore custom BNB strategy names (they get mapped via BNB prefix)
+                # Store under the standard alias
+                key = (sym, alias, tf)
+                # Later files override earlier ones (they're sorted by name ~ time)
+                results[key] = {
+                    "return_pct": item.get("total_return_pct", 0),
+                    "win_rate": item.get("win_rate_pct", 0) / 100.0 if item.get("win_rate_pct", 0) > 1 else item.get("win_rate_pct", 0),
+                    "profit_factor": item.get("profit_factor", 0),
+                    "sharpe": item.get("sharpe_ratio", 0),
+                    "max_dd": item.get("max_drawdown_pct", 0),
+                    "trades": item.get("total_trades", 0),
+                }
+        return results
+
+    def _get_backtest_score(self, strategy: str) -> int:
+        """根据回测数据评分: -25 ~ +25"""
+        key = (self.symbol, strategy.upper(), self.timeframe)
+        bt = self._bt_results.get(key)
+        if not bt or bt["trades"] < 5:
+            return 0
+
+        score = 0
+        ret = bt["return_pct"]
+        pf = bt["profit_factor"]
+        wr = bt["win_rate"]
+
+        if ret > 80:       score += 20
+        elif ret > 40:     score += 15
+        elif ret > 15:     score += 10
+        elif ret > 0:      score += 5
+        elif ret < -50:    score -= 25
+        elif ret < -20:    score -= 15
+        elif ret < -5:     score -= 5
+
+        if pf > 2.0:       score += 10
+        elif pf > 1.5:     score += 5
+        elif pf < 0.5:     score -= 10
+
+        if wr > 0.6:       score += 5
+        elif wr < 0.3:     score -= 5
+
+        if bt["trades"] < 20:
+            score = int(score * 0.5)
+
+        return max(-25, min(25, score))
 
     # ---------- 数据库 ----------
 
@@ -118,9 +202,6 @@ class StrategyRotator:
 
     def record_outcome(self, strategy: str, regime_trend: str,
                        regime_volatility: str, pnl_pct: float):
-        """
-        每次平仓后调用，更新该策略在当前市场状态下的表现。
-        """
         if not self.symbol or not self.timeframe:
             return
         try:
@@ -130,7 +211,6 @@ class StrategyRotator:
                 "WHERE symbol=? AND timeframe=? AND strategy=? AND regime_trend=? AND regime_volatility=?",
                 (self.symbol, self.timeframe, strategy, regime_trend, regime_volatility)
             ).fetchone()
-
             if existing:
                 total, wins, total_pnl = existing
                 total += 1
@@ -141,9 +221,7 @@ class StrategyRotator:
                 total = 1
                 wins = 1 if pnl_pct > 0 else 0
                 total_pnl = pnl_pct
-
             profit_factor = 1.0
-            # 从 trades 表计算更准确的盈亏比
             loss_sum = conn.execute(
                 "SELECT COALESCE(SUM(ABS(pnl_pct)), 0) FROM trades WHERE symbol=? AND pnl_pct<0 AND exit_reason IS NOT NULL",
                 (self.symbol,)
@@ -154,9 +232,7 @@ class StrategyRotator:
             ).fetchone()[0]
             if loss_sum > 0:
                 profit_factor = round(win_sum / loss_sum, 2)
-
             avg_pnl = round(total_pnl / total, 2)
-
             conn.execute(
                 "INSERT OR REPLACE INTO strategy_performance "
                 "(symbol, timeframe, strategy, regime_trend, regime_volatility, "
@@ -167,25 +243,20 @@ class StrategyRotator:
             )
             conn.commit()
             conn.close()
-            logger.debug(f"[策略轮动] {self.symbol} {strategy} @ {regime_trend}/{regime_volatility}: "
-                        f"{total}笔 胜率={wins/total:.0%} PF={profit_factor}")
         except Exception as e:
-            logger.debug(f"[策略轮动] record_outcome 异常: {e}")
+            logger.debug(f"[策略轮动] record_outcome exception: {e}")
 
     # ---------- 业绩查询 ----------
 
     def _get_performance(self, strategy: str, trend: str, volatility: str) -> dict:
-        """查询某策略在某市场状态下的实盘表现"""
         try:
             conn = sqlite3.connect(self.db_path)
-            # 优先精确匹配
             row = conn.execute(
                 "SELECT total_trades, wins, total_pnl_pct, profit_factor, avg_pnl_pct "
                 "FROM strategy_performance "
                 "WHERE symbol=? AND timeframe=? AND strategy=? AND regime_trend=? AND regime_volatility=?",
                 (self.symbol, self.timeframe, strategy, trend, volatility)
             ).fetchone()
-            # 回退：跨 regime 查找（回测数据可能存储在不同 regime 下）
             if not row:
                 row = conn.execute(
                     "SELECT total_trades, wins, total_pnl_pct, profit_factor, avg_pnl_pct "
@@ -206,57 +277,62 @@ class StrategyRotator:
             pass
         return {}
 
-    def _apply_performance_penalty(self, strategy: str, fit_score: int,
-                                    trend: str, volatility: str) -> int:
+    # ---------- 综合评分 (v3: 回测+实盘融合) ----------
+
+    def _compute_combined_score(self, strategy: str, fit_score: int,
+                                 trend: str, volatility: str) -> int:
         """
-        根据实盘表现在 fit_score 上加调整分。
-        表现差 → 降权；表现好 → 加权重。
+        融合评分 = fit_score + backtest_adj * (1-w) + live_adj * w
+        w = min(live_trades / 20, 1.0)
         """
         perf = self._get_performance(strategy, trend, volatility)
-        if not perf:
-            return fit_score  # 无实盘数据，保持原分
+        live_trades = perf.get("total_trades", 0)
+        w = min(live_trades / 20.0, 1.0)
 
-        trades = perf["total_trades"]
-        if trades < 3:
-            return fit_score  # 样本太小，不调整
+        # 回测评分
+        bt_score = self._get_backtest_score(strategy)
 
-        pf = perf["profit_factor"]
-        wr = perf["win_rate"]
-        avg_pnl = perf["avg_pnl_pct"]
+        # 实盘评分 (same logic as before)
+        live_score = 0
+        if live_trades >= 3:
+            pf = perf["profit_factor"]
+            wr = perf["win_rate"]
+            avg_pnl = perf["avg_pnl_pct"]
+            total_pnl = perf["total_pnl_pct"]
+            if total_pnl < -50.0 and live_trades >= 10:
+                live_score -= 60
+            elif total_pnl < -20.0 and live_trades >= 10:
+                live_score -= 40
+            elif total_pnl < -5.0 and live_trades >= 10:
+                live_score -= 20
+            if pf < 0.3 or avg_pnl < -3.0:
+                live_score -= 40
+            elif pf < 0.5 or wr < 0.25:
+                live_score -= 25
+            elif pf < 0.8 or wr < 0.35:
+                live_score -= 10
+            if pf > 2.0 or wr > 0.6:
+                live_score += 15
+            elif pf > 1.2 and wr > 0.45:
+                live_score += 5
 
-        adjustment = 0
+        # 融合
+        combined = int(fit_score + bt_score * (1 - w) + live_score * w)
+        combined = max(0, min(100, combined))
 
-        # 总收益极端负值 → 重度惩罚（覆盖单个 per-trade 平均值不足的问题）
-        total_pnl = perf["total_pnl_pct"]
-        if total_pnl < -50.0 and trades >= 10:
-            adjustment -= 60
-        elif total_pnl < -20.0 and trades >= 10:
-            adjustment -= 40
-        elif total_pnl < -5.0 and trades >= 10:
-            adjustment -= 20
-
-        # 强负面信号：盈亏比极差或大幅亏损
-        if pf < 0.3 or avg_pnl < -3.0:
-            adjustment -= 40
-        elif pf < 0.5 or wr < 0.25:
-            adjustment -= 25
-        elif pf < 0.8 or wr < 0.35:
-            adjustment -= 10
-
-        # 正面信号：表现优秀
-        if pf > 2.0 or wr > 0.6:
-            adjustment += 15
-        elif pf > 1.2 and wr > 0.45:
-            adjustment += 5
-
-        new_score = max(0, min(100, fit_score + adjustment))
-        if adjustment != 0:
+        if live_trades == 0 and bt_score != 0:
             logger.info(
                 f"[策略轮动] {self.symbol} {strategy} @ {trend}/{volatility}: "
-                f"fit={fit_score} + perf_adj={adjustment:+d} = {new_score} "
-                f"(trades={trades} wr={wr:.0%} pf={pf} avgPnl={avg_pnl}%)"
+                f"fit={fit_score} + bt={bt_score:+d} = {combined} (回测权重 100%)"
             )
-        return new_score
+        elif live_trades > 0:
+            logger.info(
+                f"[策略轮动] {self.symbol} {strategy} @ {trend}/{volatility}: "
+                f"fit={fit_score} + bt={bt_score:+d}*{1-w:.0%} + live={live_score:+d}*{w:.0%} = {combined} "
+                f"(trades={live_trades} wr={perf.get('win_rate',0):.0%} pf={perf.get('profit_factor',0)})"
+            )
+
+        return combined
 
     # ---------- 轮动核心 ----------
 
@@ -267,30 +343,25 @@ class StrategyRotator:
         key = (trend, vol)
         strategy_name, reason, kwargs = REGIME_STRATEGY_MAP.get(key, FALLBACK_STRATEGY)
 
-        # ── 业绩感知：检查推荐策略的实盘表现 ──
-        perf_adjusted_score = self._apply_performance_penalty(
-            strategy_name, 100, trend, vol)  # 基分 100 作为参考
+        # 用融合评分评估推荐策略
+        combined_score = self._compute_combined_score(strategy_name, 100, trend, vol)
 
-        # 如果推荐策略被大幅降权(<30)，尝试找替代
-        if perf_adjusted_score < 30:
-            alternatives = self._find_better_alternative(strategy_name, trend, vol)
-            if alternatives:
-                alt_strategy, alt_score, alt_reason = alternatives
-                logger.warning(
-                    f"[策略轮动] {self.symbol} {trend}+{vol}: "
-                    f"推荐{strategy_name}(业绩差，得分{perf_adjusted_score}) "
-                    f"→ 替代{alternatives[0]}(得分{alt_score})"
-                )
-                strategy_name = alt_strategy
-                reason = f"{reason} (业绩替代: {alt_reason})"
-                # 用集合安全检查（dict(REGIME_STRATEGY_MAP.values()) 对 3 元组会报错）
+        # 如果推荐策略得分过低，找更好的替代
+        if combined_score < 40:
+            best_alt = self._find_best_by_combined(trend, vol)
+            if best_alt and best_alt[0] != strategy_name:
+                alt_name, alt_score = best_alt
+                msg = (f"推荐{strategy_name}(融合得分{combined_score}) -> 替代{alt_name}(得分{alt_score})")
+                logger.warning(f"[策略轮动] {self.symbol} {trend}+{vol}: {msg}")
+                strategy_name = alt_name
+                reason = f"{reason} (回测替代: {alt_name})"
                 _strategy_names = {v[0] for v in REGIME_STRATEGY_MAP.values()}
                 kwargs = REGIME_STRATEGY_MAP.get(
                     next((k for k in REGIME_STRATEGY_MAP
-                          if REGIME_STRATEGY_MAP[k][0] == alt_strategy),
+                          if REGIME_STRATEGY_MAP[k][0] == alt_name),
                          ("", "", {})),
                     ({},)
-                )[2] if alt_strategy in _strategy_names else {}
+                )[2] if alt_name in _strategy_names else {}
 
         # 稳定期检查
         if key == self._last_regime_key:
@@ -298,97 +369,56 @@ class StrategyRotator:
         else:
             self._stability_counter = 0
         self._last_regime_key = key
+        self._last_strategy = strategy_name
 
-        if self._stability_counter < self._min_stability and self._last_strategy:
-            reason = f"待确认: {reason} ({self._stability_counter+1}/{self._min_stability})"
-            strategy_name = self._last_strategy
-            kwargs = {}
-
-        if self._stability_counter >= self._min_stability:
-            self._last_strategy = strategy_name
-
-        symbol_overrides = self.config_map.get(self.symbol, {})
-        strategy_overrides = symbol_overrides.get(strategy_name, {})
-        final_kwargs = {**kwargs, **strategy_overrides}
-
-        logger.info(f"[策略轮动] {self.symbol} {trend}+{vol} → {strategy_name} "
-                    f"({reason}) 置信度={confidence:.2f}")
         return {
             "strategy": strategy_name,
             "reason": reason,
-            "kwargs": final_kwargs,
-            "confidence": confidence,
-            "regime_trend": trend,
-            "regime_volatility": vol,
+            "kwargs": kwargs,
+            "regime": {"trend": trend, "volatility": vol},
+            "combined_score": combined_score,
         }
 
-    def _find_better_alternative(self, excluded: str, trend: str, volatility: str):
-        """在当前市场状态下，找除 excluded 外表现最好的策略"""
+    def _find_best_by_combined(self, trend: str, volatility: str) -> tuple:
+        """在所有候选策略中找融合得分最高的"""
         candidates = []
-        for st in ["DONCHIAN", "ATRSTOP", "BOLLINGER", "RSI", "SMA", "KDJ", "MACD"]:
-            if st == excluded:
-                continue
-            fit = self.score_fit(st, trend, volatility)
-            adj_fit = self._apply_performance_penalty(st, fit, trend, volatility)
-            if adj_fit >= 25:
-                candidates.append((st, adj_fit))
-
-        if candidates:
-            candidates.sort(key=lambda x: x[1], reverse=True)
-            best = candidates[0]
-            return (best[0], best[1], f"regime_fit={self.score_fit(best[0], trend, volatility)}")
-        return None
+        for (s_trend, s_vol), (name, _, _) in REGIME_STRATEGY_MAP.items():
+            if s_trend == trend and s_vol == volatility:
+                fit = _STRATEGY_FIT_SCORE.get((name, trend, volatility), 60)
+                combined = self._compute_combined_score(name, fit, trend, volatility)
+                candidates.append((name, combined))
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return candidates[0] if candidates else None
 
     def get_better_strategies(self, current_strategy: str, regime: dict, top_n: int = 3) -> list:
-        """
-        获取比当前策略更适合的策略推荐列表。
-        原方法，保持兼容；新增业绩调整。
-        """
         trend = (regime.get("trend") or "unknown").lower()
         vol = (regime.get("volatility") or "unknown").lower()
-        current_fit = self.score_fit(current_strategy, trend, vol)
-
-        candidates = []
-        for st in ["DONCHIAN", "ATRSTOP", "BOLLINGER", "RSI", "SMA", "KDJ", "MACD"]:
-            if st == current_strategy:
+        current_fit = _STRATEGY_FIT_SCORE.get(
+            (current_strategy.upper(), trend, vol), 60
+        )
+        current_combined = self._compute_combined_score(current_strategy, current_fit, trend, vol)
+        result = []
+        for (s_trend, s_vol), (name, reason, _) in REGIME_STRATEGY_MAP.items():
+            if name.upper() == current_strategy.upper():
                 continue
-            fit = self.score_fit(st, trend, volatility=vol)
-            adj_fit = self._apply_performance_penalty(st, fit, trend, vol)
-            if adj_fit > current_fit:
-                candidates.append({
-                    "strategy": st,
-                    "fit_score": adj_fit,
-                    "reason": f"市场适配度={fit}" + (f" 实盘调整后={adj_fit}" if adj_fit != fit else ""),
+            if s_trend != trend and s_trend != "unknown":
+                continue
+            fit = _STRATEGY_FIT_SCORE.get((name, trend, vol), 60)
+            combined = self._compute_combined_score(name, fit, trend, vol)
+            if combined > current_combined:
+                result.append({
+                    "strategy": name, "reason": reason,
+                    "fit_score": fit, "combined_score": combined,
                 })
-
-        candidates.sort(key=lambda x: x["fit_score"], reverse=True)
-        return candidates[:top_n]
-
-    def get_current_strategy(self) -> str:
-        return self._last_strategy or "MACD"
-
-    def reset(self):
-        self._last_strategy = ""
-        self._last_regime_key = ("", "")
-        self._stability_counter = 0
+        result.sort(key=lambda x: x["combined_score"], reverse=True)
+        return result[:top_n]
 
     def score_fit(self, strategy_name: str, trend: str, volatility: str) -> int:
         key = (strategy_name.upper(), trend.lower(), volatility.lower())
         if key in _STRATEGY_FIT_SCORE:
             return _STRATEGY_FIT_SCORE[key]
-        try:
-            from components.market_regime import recommend_strategies
-            recs = recommend_strategies(trend, volatility, top_n=10)
-            for rec in recs:
-                if rec["strategy"].upper() == strategy_name.upper():
-                    return rec["fit_score"]
-        except ImportError:
-            pass
+        # 跨regime fallback
+        for (s, t, v), score in _STRATEGY_FIT_SCORE.items():
+            if s == strategy_name.upper() and t == trend.lower():
+                return int(score * 0.5)
         return 30
-
-    def is_current_strategy_appropriate(self, regime: dict, threshold: int = 50) -> bool:
-        if not self._last_strategy:
-            return True
-        trend = (regime.get("trend") or "unknown").lower()
-        vol = (regime.get("volatility") or "unknown").lower()
-        return self.score_fit(self._last_strategy, trend, vol) >= threshold

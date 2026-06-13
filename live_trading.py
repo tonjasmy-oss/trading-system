@@ -532,6 +532,25 @@ class TradingAgent:
                 "trend_ema_period": self.trend_ema_period,
             }
 
+        # ── EVR 策略 (EMA-Volume-RSI 复合趋势策略 v2) ───────────────
+        elif strategy_type in ("EVR", "EVR_V2"):
+            logger.info(f"[{self.agent_id}] 初始化 EVR 策略 (stop=5%, tp=15%)")
+            from strategies_evr_v2 import EVRStrategyV2
+            return EVRStrategyV2(
+                config=StrategyConfig(
+                    symbol=self.symbol,
+                    timeframe=self.timeframe,
+                    stop_loss=0.05,
+                    take_profit=0.15,
+                    trade_direction="both",
+                    commission_pct=0.001,
+                    slippage_pct=0.0005,
+                ),
+                rsi_lower=35.0,
+                rsi_upper=75.0,
+                vol_multiplier=1.1,
+            )
+
         # ── 多因子趋势策略（MULTIFACTOR）─────────────────────────────
         elif strategy_type == "MULTIFACTOR":
             logger.info(f"[{self.agent_id}] 初始化多因子趋势策略")
@@ -806,7 +825,7 @@ class TradingAgent:
         except Exception:
             pass
 
-        # 回退：RSI 交叉 + 深度超卖双重判断
+        # 回退：RSI 交叉 + 深度超卖/超买双重判断
         if len(closes) < self.rsi_period + 2:
             return Signal.HOLD, current_rsi, prev_rsi
 
@@ -816,9 +835,13 @@ class TradingAgent:
         # RSI 交叉卖出：下穿超买线
         if (current_rsi <= self.overbought and current_rsi < prev_rsi and prev_rsi >= self.overbought):
             return Signal.SELL, current_rsi, prev_rsi
-        # 深度超卖兜底：RSI < 20 直接触发买入（避免持续阴跌中永远不买）
-        if current_rsi < 20.0 and current_rsi > prev_rsi:
+        # 深度超卖兜底：RSI < oversold 且止跌回升 → 直接买入（避免阴跌中永远不买）
+        # 阈值从硬编码 20 改为 self.oversold（默认28），与标的 Grid Search 最优值对齐
+        if current_rsi < self.oversold and current_rsi > prev_rsi:
             return Signal.BUY, current_rsi, prev_rsi
+        # 深度超买兜底：RSI > overbought 且开始回落 → 直接卖出/做空
+        if current_rsi > self.overbought and current_rsi < prev_rsi:
+            return Signal.SELL, current_rsi, prev_rsi
 
         return Signal.HOLD, current_rsi, prev_rsi
 
@@ -1355,7 +1378,7 @@ class TradingAgent:
                             result["rotation"] = pick
                     elif self._auto_rotate_enabled and better:
                         # 当当前策略适配度 < 40 且连续 HOLD > 10 次时，自动切换到最佳推荐
-                        if current_fit < 40 and self._hold_streak > 10:
+                        if current_fit < 40 and self._hold_streak > 5:
                             best = better[0]
                             logger.warning(
                                 f"[{self.agent_id}] ⚠️ 策略不适配: {self.strategy_name} 适配度={current_fit}, "

@@ -74,7 +74,8 @@ STRATEGY_CAPITAL_PCT = float(os.getenv("STRATEGY_CAPITAL_PCT", "1.0"))
 OPTIMAL_PARAMS = {
     "BTC/USDT": dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.040, take_profit=0.080),
     "ETH/USDT": dict(rsi_period=14, oversold=30.0, overbought=65.0, stop_loss=0.020, take_profit=0.040),
-    "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040),
+    "SOL/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.040,
+                      channel_period=25, trend_ema_period=10),  # Donchian 2h 参数补充 (2026-06-07)
     "SUI/USDT":  dict(rsi_period=10, oversold=28.0, overbought=65.0, stop_loss=0.03, take_profit=0.05,
                       channel_period=30, trend_ema_period=10),  # Donchian 2h Grid Search 2026-05-22
     "XAUT/USDT": dict(rsi_period=14, oversold=28.0, overbought=65.0, stop_loss=0.015, take_profit=0.030,
@@ -128,7 +129,7 @@ AGENT_CHECK_INTERVAL = int(os.getenv("AGENT_CHECK_INTERVAL", "60"))
 # 示例: BTC/USDT:SWARM:crypto_trading_desk:binance,ETH/USDT:FACTOR:binance
 AGENT_SYMBOLS = os.getenv(
     "AGENT_SYMBOLS",
-    "BTC/USDT:VOTE:binance,ETH/USDT:SWARM:derivatives_strategy_desk:binance,SOL/USDT:SWARM:commodity_research_team:binance:2h,SUI/USDT:SWARM:sector_rotation_team:binance:2h,XAUT/USDT:SWARM:portfolio_review_board:gateio:4h"
+    "BTC/USDT:EVR:binance:4h,ETH/USDT:SWARM:derivatives_strategy_desk:binance,SOL/USDT:SWARM:commodity_research_team:binance:2h,SUI/USDT:SWARM:sector_rotation_team:binance:2h,XAUT/USDT:SWARM:portfolio_review_board:gateio:4h"
 )
 
 # ============================================================
